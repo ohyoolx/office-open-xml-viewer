@@ -717,10 +717,11 @@ export interface ImageAnchor {
   /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). `"oneCell"` instructs the
    *  renderer to use `nativeExtCx`/`nativeExtCy` as the size and ignore the
    *  `to` anchor (Excel's "Move but don't size with cells"). Absent ⇒ default
-   *  `"twoCell"`. */
+   *  `"twoCell"`. Also set to `"oneCell"` for one-cell pictures. */
   editAs?: string;
-  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU — the picture's saved
-   *  size. Authoritative when `editAs === "oneCell"`. 0 = unavailable. */
+  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU, or anchor-level
+   *  `<xdr:ext>` for a one-cell picture without child xfrm. The saved size
+   *  is authoritative when `editAs === "oneCell"`. 0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
   /** Zip path of the blip inside the package (e.g. `xl/media/image1.png`). The

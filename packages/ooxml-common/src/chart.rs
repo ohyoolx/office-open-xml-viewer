@@ -12101,6 +12101,37 @@ pub fn parse_chart_part_with_references_style_parts_and_images(
                 .copied()
         })
     };
+    // ECMA-376 §21.2.2.31 crossAx identifies the crossing axis by ID, while
+    // §21.2.2.33 crosses=max places it at the far end. Two categorical value
+    // axes can therefore be resolved even when axPos is the same: the category
+    // names the primary, both value axes cross that category, and the other
+    // value axis explicitly crosses at max. Require this complete topology;
+    // neither XML order nor same-side position alone chooses a numeric scale.
+    let crossed_value_pair = (|| {
+        if real_cat_ax_nodes.len() != 1 || val_ax_nodes.len() != 2 {
+            return None;
+        }
+        let cross_id = |axis| {
+            child(axis, "crossAx")
+                .and_then(|node| attr(&node, "val"))
+                .and_then(|value| parse_chart_axis_id_value(&value))
+        };
+        let category = real_cat_ax?;
+        let category_id = ax_id_of(&category)?;
+        let primary = axis_by_id(cross_id(category).as_ref())?;
+        let secondary = val_ax_nodes.iter().copied().find(|axis| *axis != primary)?;
+        if ax_pos(&primary) != ax_pos(&secondary)
+            || ax_id_of(&primary)? == ax_id_of(&secondary)?
+            || cross_id(primary).as_ref() != Some(&category_id)
+            || cross_id(secondary).as_ref() != Some(&category_id)
+            || extract_axis_crosses(primary).0.as_deref() == Some("max")
+            || extract_axis_crosses(secondary).0.as_deref() != Some("max")
+        {
+            return None;
+        }
+        Some((primary, secondary))
+    })();
+    let val_ax = crossed_value_pair.map(|(primary, _)| primary).or(val_ax);
     let secondary_real_cat_ax = real_cat_ax_nodes
         .iter()
         .find(|axis| Some(**axis) != real_cat_ax)
@@ -12125,6 +12156,7 @@ pub fn parse_chart_part_with_references_style_parts_and_images(
             .and_then(|ids| ids.get(1))
             .or_else(|| combo_scatter_axis_ids.get(1)),
     )
+    .or_else(|| crossed_value_pair.map(|(_, secondary)| secondary))
     .or_else(|| {
         if !is_scatter_axes && val_ax_nodes.len() >= 2 {
             val_ax_nodes
@@ -12245,8 +12277,8 @@ pub fn parse_chart_part_with_references_style_parts_and_images(
     }
     // Axis position is not a normative primary/secondary tie-breaker. If two
     // axes of the same schema kind occupy the same side, preserve their IDs
-    // but leave group ownership unresolved until an Office-observed rule is
-    // available. Assigning them by XML/group encounter order silently routes
+    // but leave group ownership unresolved unless the explicit crossing topology
+    // above resolves them. Assigning them by XML/group encounter order routes
     // otherwise valid data through an arbitrary scale.
     let mut axes_by_kind_and_position: BTreeMap<(String, Option<String>), Vec<String>> =
         BTreeMap::new();
@@ -12264,6 +12296,13 @@ pub fn parse_chart_part_with_references_style_parts_and_images(
         .filter(|ids| ids.len() > 1)
         .flatten()
         .collect();
+    if let Some((primary, secondary)) = crossed_value_pair {
+        for axis in [primary, secondary] {
+            if let Some(id) = ax_id_of(&axis) {
+                ambiguous_axis_ids.remove(&id);
+            }
+        }
+    }
     let mut axis_id_counts = BTreeMap::<String, usize>::new();
     for axis in &plot_axis_nodes {
         if let Some(id) = ax_id_of(axis) {
@@ -18053,6 +18092,52 @@ Subtitle</a:t></a:r></a:p>
             );
             assert_eq!(roles[role].line_width_emu, Some(22222));
             assert_eq!(roles[role].line_paint_authored, Some(true));
+        }
+    }
+
+    #[test]
+    fn combo_same_side_axes_resolve_from_category_crossing() {
+        let primary = r#"<c:valAx><c:axId val="20"/><c:scaling><c:max val="100"/></c:scaling><c:axPos val="l"/><c:crossAx val="10"/></c:valAx>"#;
+        let secondary = r#"<c:valAx><c:axId val="30"/><c:scaling><c:max val="2"/></c:scaling><c:axPos val="l"/><c:crossAx val="10"/><c:crosses val="max"/></c:valAx>"#;
+        for axes in [
+            format!("{primary}{secondary}"),
+            format!("{secondary}{primary}"),
+        ] {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="{C_NS}"><c:chart><c:plotArea>
+              <c:barChart><c:barDir val="col"/><c:grouping val="stacked"/>
+                <c:ser><c:idx val="0"/><c:val><c:numLit><c:ptCount val="1"/><c:pt idx="0"><c:v>50</c:v></c:pt></c:numLit></c:val></c:ser>
+                <c:axId val="10"/><c:axId val="20"/>
+              </c:barChart>
+              <c:lineChart><c:grouping val="standard"/>
+                <c:ser><c:idx val="1"/><c:val><c:numLit><c:ptCount val="1"/><c:pt idx="0"><c:v>1.5</c:v></c:pt></c:numLit></c:val></c:ser>
+                <c:axId val="10"/><c:axId val="30"/>
+              </c:lineChart>
+              <c:catAx><c:axId val="10"/><c:axPos val="l"/><c:crossAx val="20"/></c:catAx>
+              {axes}
+            </c:plotArea></c:chart></c:chartSpace>"#
+            );
+            let document = chart_space_of(&xml);
+            let model = parse_chart_part(document.root_element(), &FixtureResolver).unwrap();
+            let groups = model.plot_groups.as_ref().unwrap();
+            assert_eq!(groups[0].value_axis, "primary");
+            assert_eq!(groups[1].value_axis, "secondary");
+            assert!(groups.iter().all(|g| g.category_axis == "primary"));
+            assert_eq!(model.val_max, Some(100.0));
+            assert_eq!(model.secondary_val_axis.as_ref().unwrap().max, Some(2.0));
+            assert_eq!(model.series[0].use_secondary_axis, None);
+            assert_eq!(model.series[1].use_secondary_axis, Some(true));
+
+            // Position alone must still not choose a scale when the category
+            // does not identify its crossing value axis.
+            let ambiguous = xml.replace("<c:crossAx val=\"20\"/>", "");
+            let document = chart_space_of(&ambiguous);
+            let model = parse_chart_part(document.root_element(), &FixtureResolver).unwrap();
+            assert!(model
+                .plot_groups
+                .unwrap()
+                .iter()
+                .all(|g| g.value_axis == "unresolved"));
         }
     }
 
