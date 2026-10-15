@@ -97,8 +97,8 @@ pub(crate) fn xdr_node_hidden(node: &roxmltree::Node) -> bool {
     false
 }
 
-/// Parse `<xdr:twoCellAnchor>` elements from a drawing XML and resolve
-/// embedded pictures into data URLs. `drawing_dir` is the folder that
+/// Parse two-cell pictures and one-cell pictures without a child transform,
+/// resolving embedded pictures to ZIP paths. `drawing_dir` is the folder that
 /// contains `drawing_path` so relative `Target`s resolve correctly.
 pub(crate) fn parse_drawing_anchors(
     drawing_xml: &str,
@@ -115,7 +115,26 @@ pub(crate) fn parse_drawing_anchors(
     let mut anchors: Vec<ImageAnchor> = Vec::new();
 
     for anchor in doc.descendants() {
-        if anchor.tag_name().name() != "twoCellAnchor" || !is_xdr_ns(anchor.tag_name().namespace())
+        let one_cell = anchor.tag_name().name() == "oneCellAnchor";
+        if (!one_cell && anchor.tag_name().name() != "twoCellAnchor")
+            || !is_xdr_ns(anchor.tag_name().namespace())
+        {
+            continue;
+        }
+        // ECMA-376 §20.5.2.24: oneCellAnchor supplies from + ext; the picture's
+        // CT_ShapeProperties/xfrm is optional. In the 0.88 model, transformed
+        // one-cell pictures already belong to the shape path (including their
+        // rotation/flip). Only acquire the otherwise-dropped, untransformed
+        // pictures here, so each picture retains exactly one paint owner.
+        if one_cell
+            && anchor
+                .children()
+                .filter(|n| n.tag_name().name() == "pic")
+                .flat_map(|pic| pic.children().filter(|n| n.tag_name().name() == "spPr"))
+                .any(|sp| {
+                    sp.children()
+                        .any(|n| n.tag_name().name() == "xfrm" && is_a_ns(n.tag_name().namespace()))
+                })
         {
             continue;
         }
@@ -139,13 +158,29 @@ pub(crate) fn parse_drawing_anchors(
         // "twoCell" (default), "oneCell", "absolute". With "oneCell" Excel
         // preserves the picture's saved size from <xdr:spPr><a:xfrm><a:ext>
         // regardless of cell resizing.
-        let edit_as = anchor.attribute("editAs").map(|s| s.to_string());
+        let edit_as = if one_cell {
+            Some("oneCell".to_string())
+        } else {
+            anchor.attribute("editAs").map(|s| s.to_string())
+        };
 
         for child in anchor.children() {
             if !child.is_element() {
                 continue;
             }
             match child.tag_name().name() {
+                // Reuse the 0.88 fixed-extent carrier for the authoritative
+                // anchor size (§20.5.2.14); there is no child xfrm on this path.
+                "ext" if one_cell && is_xdr_ns(child.tag_name().namespace()) => {
+                    native_ext_cx = child
+                        .attribute("cx")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    native_ext_cy = child
+                        .attribute("cy")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                }
                 "from" | "to" => {
                     let is_from = child.tag_name().name() == "from";
                     let mut col: u32 = 0;
@@ -1687,7 +1722,8 @@ pub(crate) fn parse_shape_anchors(
             // second time as an uncropped full-image shape, overwriting the
             // cropped anchor draw (the sample-27 regression). So a `twoCellAnchor`
             // pic is owned solely by `ws.images`; we only keep a standalone pic
-            // for `oneCellAnchor`, which `parse_drawing_anchors` does not handle.
+            // for transformed `oneCellAnchor` pictures. Untransformed one-cell
+            // pictures use `ws.images` and are skipped below at the xfrm check.
             t == "sp" || (t == "pic" && anchor_tag == "oneCellAnchor")
         }) {
             // §20.1.2.2.8 — a hidden stand-alone shape/pic is not rendered.
@@ -3052,9 +3088,8 @@ mod style_lnref_tests {
         assert_eq!(color.as_deref(), Some("#FF0000"), "sp still captured");
     }
 
-    /// A `oneCellAnchor` pic is NOT handled by `parse_drawing_anchors` (which only
-    /// scans `twoCellAnchor`), so the shape path must keep capturing it — else the
-    /// image is dropped entirely. Its `<a:srcRect>` crop must also be surfaced on
+    /// A transformed `oneCellAnchor` pic remains owned by the shape path.
+    /// Its `<a:srcRect>` crop must also be surfaced on
     /// the `ShapeGeom::Image` so the renderer can crop it like a top-level anchor.
     #[test]
     fn standalone_onecellanchor_pic_is_still_captured_with_crop() {
@@ -3579,6 +3614,55 @@ mod blip_svg_tests {
         let anchors = parse_drawing_anchors(&xml, rels, "xl/drawings", &mut archive, &[]);
         assert_eq!(anchors.len(), 1, "exactly one picture anchor expected");
         anchors.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn one_cell_picture_without_child_transform_uses_anchor_extent() {
+        let mut rels = HashMap::new();
+        rels.insert("rId1".to_string(), "/xl/media/image1.png".to_string());
+        let xml = r#"<wsDr xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <oneCellAnchor>
+            <from><col>2</col><colOff>19050</colOff><row>3</row><rowOff>9525</rowOff></from>
+            <ext cx="1905000" cy="952500"/>
+            <pic><nvPicPr><cNvPr id="1" name="Picture"/></nvPicPr>
+              <blipFill><a:blip r:embed="rId1"/><a:srcRect l="10000"/></blipFill>
+              <spPr><a:prstGeom prst="rect"/></spPr>
+            </pic><clientData/>
+          </oneCellAnchor></wsDr>"#;
+        let data = build_media_zip(PNG_1X1, SVG);
+        let mut archive = crate::XlsxZip::new(Cursor::new(data)).unwrap();
+        let anchors = parse_drawing_anchors(xml, &rels, "xl/drawings", &mut archive, &[]);
+        assert_eq!(anchors.len(), 1);
+        let a = &anchors[0];
+        assert_eq!(
+            (a.from_col, a.from_col_off, a.from_row, a.from_row_off),
+            (2, 19050, 3, 9525)
+        );
+        assert_eq!((a.native_ext_cx, a.native_ext_cy), (1905000, 952500));
+        assert_eq!(a.edit_as.as_deref(), Some("oneCell"));
+        assert_eq!(a.image_path, "xl/media/image1.png");
+        assert_eq!(a.mime_type, "image/png");
+        assert_eq!(a.src_rect.as_ref().unwrap().l, 0.1);
+        assert!(parse_shape_anchors(xml, &[], &ThemeFormatScheme::default(), &rels).is_empty());
+
+        let hidden = xml.replace("name=\"Picture\"", "name=\"Picture\" hidden=\"1\"");
+        assert!(parse_drawing_anchors(&hidden, &rels, "xl/drawings", &mut archive, &[]).is_empty());
+
+        // Pictures with an authored child transform keep their existing shape
+        // owner, which also preserves rotation/flip; do not paint them twice.
+        let transformed = xml.replace(
+            "<spPr>",
+            "<spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"1905000\" cy=\"952500\"/></a:xfrm>",
+        );
+        assert!(
+            parse_drawing_anchors(&transformed, &rels, "xl/drawings", &mut archive, &[]).is_empty()
+        );
+        assert_eq!(
+            parse_shape_anchors(&transformed, &[], &ThemeFormatScheme::default(), &rels).len(),
+            1
+        );
     }
 
     /// §20.1.2.2.8 — a `<xdr:pic>` whose `<xdr:cNvPr hidden="1">` marks it hidden

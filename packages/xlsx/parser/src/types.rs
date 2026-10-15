@@ -1212,9 +1212,11 @@ pub struct ImageAnchor {
     /// (default), `"oneCell"`, `"absolute"`. With `"oneCell"`, Excel preserves
     /// the picture's native EMU size (below) when cells are resized; with
     /// `"twoCell"`, the from/to anchor rect IS the rendered size.
+    /// Also set to `"oneCell"` for one-cell pictures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_as: Option<String>,
-    /// `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU. The picture's saved
+    /// `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU, or the anchor-level
+    /// `<xdr:ext>` for a oneCellAnchor picture without child xfrm. The saved
     /// size at insert/edit time. Used as the authoritative size when
     /// `editAs == "oneCell"`. 0 = absent / use from/to rect.
     pub native_ext_cx: i64,
