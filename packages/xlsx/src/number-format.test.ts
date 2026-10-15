@@ -41,6 +41,37 @@ function numCell(n: number): Cell {
 /** Format a number with a custom format code, as Excel would render it. */
 const fmt = (n: number, code: string) => formatCellValue(numCell(n), styles(code));
 
+describe('custom time formats (§18.8.30)', () => {
+  const afternoon = (15 * 3600 + 8 * 60 + 45) / 86400;
+
+  it.each([
+    ['hh:mm:ss', '15:08:45'],
+    ['h:mm', '15:08'],
+    ['mm:ss', '08:45'],
+    ['HH:MM:SS', '15:08:45'],
+    ['h:mm:ss AM/PM', '3:08:45 PM'],
+    ['[$-409]hh:mm:ss', '15:08:45'],
+  ])('renders %s as time rather than literal text', (code, expected) => {
+    expect(fmt(afternoon, code)).toBe(expected);
+  });
+
+  it('pads midnight and wraps clock hours without wrapping elapsed hours', () => {
+    expect(fmt(0, 'hh:mm:ss')).toBe('00:00:00');
+    expect(fmt(1.625, 'hh:mm:ss')).toBe('15:00:00');
+    expect(fmt(1.625, '[h]:mm:ss')).toBe('39:00:00');
+  });
+
+  it.each([
+    ['0" hours"', '3 hours'],
+    ['0\\h', '3h'],
+    ['0\\s', '3s'],
+    ['0_h', '3 '],
+    ['0*s', '3s'],
+  ])('keeps literal time letters in numeric format %s', (code, expected) => {
+    expect(fmt(3, code)).toBe(expected);
+  });
+});
+
 describe('number formats — integers & decimals', () => {
   it('plain integer', () => {
     expect(fmt(5, '0')).toBe('5');
