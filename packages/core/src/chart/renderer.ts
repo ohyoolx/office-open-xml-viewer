@@ -12207,7 +12207,7 @@ function renderPieChart(
   );
   const cx2 = frame.center.cx;
   const cy2 = frame.center.cy;
-  const outerR = Math.min(pw, ph) * 0.42;
+  let outerR = Math.min(pw, ph) * 0.42;
 
   // §21.2.2.52 firstSliceAng: the first slice begins `firstSliceAngle` degrees
   // clockwise from 12 o'clock. Canvas 0 rad points right (+x) and its angles
@@ -12230,8 +12230,6 @@ function renderPieChart(
   const pointOverridesBySeries = new Map(
     rings.map(series => [series, indexPointOverrides(series.dataPointOverrides)] as const),
   );
-  const innerR = outerR * (holePct / 100);
-  const ringBand = (outerR - innerR) / rings.length;
 
   // Explosion offset for slice `i` of series `ser`: move the slice out from the
   // center along its mid-angle by `explosion`% of the outer radius. §21.2.2.61
@@ -12264,6 +12262,23 @@ function renderPieChart(
   const dLblFont = chartFontFamily(
     chart, richDef.fontFace ?? chart.dataLabelFontFace, 'minor',
   );
+
+  // Automatic outEnd labels must fit inside the chart clip while remaining
+  // outside the pie. Reserve their measured boxes before painting the slices.
+  // This is a layout constraint, not an Office geometry approximation; keep
+  // authored plot-area/manual label positions and already-fitting radii intact.
+  if (hasRichLabels && !chart.plotAreaManualLayout) {
+    ctx.save();
+    const labels = drawPieRichLabels(
+      ctx, chart, richDef, s, cats, vals, total,
+      cx2, cy2, outerR, outerR * holePct / 100, startAngle, dLblFont, ptToPx,
+      plotLeft, plotTop, pw, ph, x, y, w, h, shapeRotationDeg, true,
+    );
+    ctx.restore();
+    outerR = fitPieRadiusToOutsideLabels(outerR, cx2, cy2, labels, r);
+  }
+  const innerR = outerR * (holePct / 100);
+  const ringBand = (outerR - innerR) / rings.length;
 
   for (let ring = 0; ring < rings.length; ring++) {
     const rs = rings[ring];
@@ -12396,7 +12411,8 @@ function drawPieRichLabels(
   plotX: number, plotY: number, plotW: number, plotH: number,
   chartX: number, chartY: number, chartW: number, chartH: number,
   shapeRotationDeg: number,
-): void {
+  measureOutsideOnly = false,
+): PieOutsideLabel[] {
   const overrides = s.dataLabelOverrides ?? [];
   const overridesByIndex = indexPointOverrides(overrides);
   const dataLabelLegendKey = createDataLabelLegendKeyResolver(
@@ -12422,7 +12438,7 @@ function drawPieRichLabels(
   // Boxed labels have their own paint/collision pass, but only those points are
   // dispatched to it. A per-point spPr must not turn every sibling into a
   // callout or change the sibling's authored radial position.
-  if (calloutIndices.size > 0) {
+  if (!measureOutsideOnly && calloutIndices.size > 0) {
     drawPieCalloutLabels(
       ctx, chart, def, s, cats, vals, total, cx2, cy2, outerR, innerR, startAngle,
       font, ptToPx, plotX, plotW, plotY, plotH, chartX, chartY, chartW, chartH,
@@ -12451,6 +12467,8 @@ function drawPieRichLabels(
     // can carry `text: ""` with white/percent-only flag overrides, so we
     // key off the explicit `deleted` flag, never the empty text.
     if (dataLabelIsDeleted(def, ov)) continue;
+    if (measureOutsideOnly && (ov?.manualLayout
+      || (ov?.position ?? def.position ?? 'bestFit') !== 'outEnd')) continue;
     const showCatName = ov?.showCatName ?? def.showCatName;
     const showSerName = ov?.showSerName ?? def.showSerName;
     const showVal     = ov?.showVal ?? def.showVal;
@@ -12607,7 +12625,10 @@ function drawPieRichLabels(
     );
   }
 
-  drawPieOutsideLabels(ctx, outsideLabels, chartX, chartY, chartW, chartH);
+  if (!measureOutsideOnly) {
+    drawPieOutsideLabels(ctx, outsideLabels, chartX, chartY, chartW, chartH);
+  }
+  return outsideLabels;
 }
 
 /** Plain `<c:dLblPos val="outEnd">` label block. */
@@ -12628,6 +12649,38 @@ interface PieOutsideLabel {
   font: string;
   cxBox: number;
   cyBox: number;
+}
+
+/** Largest radius allowed by the measured outside labels' chart-edge bounds.
+ * Keep their slice-midpoint rays and existing clearance; do not move labels
+ * onto the pie or invent leader lines to conceal clipping. */
+function fitPieRadiusToOutsideLabels(
+  radius: number, cx: number, cy: number, labels: PieOutsideLabel[], bounds: ChartRect,
+): number {
+  for (const label of labels) {
+    const dx = label.cxBox - cx, dy = label.cyBox - cy;
+    const distance = Math.hypot(dx, dy);
+    if (distance === 0) continue;
+    const ux = dx / distance, uy = dy / distance;
+    const maxX = ux > 0 ? bounds.x + bounds.w - cx : cx - bounds.x;
+    const maxY = uy > 0 ? bounds.y + bounds.h - cy : cy - bounds.y;
+    const allowedDistance = Math.min(
+      ux === 0 ? Infinity : (maxX - label.boxW / 2) / Math.abs(ux),
+      uy === 0 ? Infinity : (maxY - label.boxH / 2) / Math.abs(uy),
+    );
+    if (allowedDistance >= distance) continue;
+    const insets = dataLabelInsets(label.textStyle, label.ptToPx);
+    const visible = rotatedDataLabelSize(
+      label.unrotatedW - insets.left - insets.right,
+      label.unrotatedH - insets.top - insets.bottom,
+      label.textStyle.textRotation, label.textStyle.textVerticalMode,
+    );
+    radius = Math.min(radius, Math.max(0, pointToRectDistance(
+      0, 0, ux * Math.max(0, allowedDistance), uy * Math.max(0, allowedDistance),
+      visible.w / 2, visible.h / 2,
+    ) - label.fontPx * 0.5));
+  }
+  return radius;
 }
 
 function pointToRectDistance(

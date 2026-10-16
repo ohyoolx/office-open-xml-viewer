@@ -365,6 +365,37 @@ describe('pie / doughnut ctr data-label radius (§21.2.2.48, PowerPoint layout)'
     }
   });
 
+  it('fits percentage value labels inside a narrow chart without covering the pie', () => {
+    const rec = recordingCtx();
+    const rect = { x: 40, y: 30, w: 200, h: 320 };
+    renderChart(rec.ctx, baseModel({
+      chartType: 'pie',
+      categories: ['A', 'B', 'C', 'D'],
+      series: [series({
+        values: [0.58, 0.32, 0.06, 0.04],
+        seriesDataLabels: {
+          showVal: true, showCatName: false, showSerName: false, showPercent: false,
+          position: 'outEnd', formatCode: '0%', fontSizeHpt: 1800,
+        },
+      })],
+    }), rect, 1);
+    const labels = rec.texts.filter(t => /^\d+%$/.test(t.text));
+    expect(labels.map(t => t.text)).toEqual(['58%', '32%', '6%', '4%']);
+    const { cx, cy, outerR } = pieGeometry(rec.arcs);
+    for (const label of labels) {
+      const fontPx = Number(/([\d.]+)px/.exec(label.font)?.[1]);
+      const halfW = label.text.length * fontPx * 0.6 / 2;
+      const halfH = fontPx / 2;
+      expect(label.x - halfW).toBeGreaterThanOrEqual(rect.x - 1e-6);
+      expect(label.x + halfW).toBeLessThanOrEqual(rect.x + rect.w + 1e-6);
+      expect(label.y - halfH).toBeGreaterThanOrEqual(rect.y - 1e-6);
+      expect(label.y + halfH).toBeLessThanOrEqual(rect.y + rect.h + 1e-6);
+      const dx = Math.max(Math.abs(label.x - cx) - halfW, 0);
+      const dy = Math.max(Math.abs(label.y - cy) - halfH, 0);
+      expect(Math.hypot(dx, dy)).toBeGreaterThanOrEqual(outerR);
+    }
+  });
+
   it('still pushes outEnd pie labels OUTSIDE the rim', () => {
     const rec = recordingCtx();
     renderChart(rec.ctx, pieModel('pie', 'outEnd'), RECT, 1);
