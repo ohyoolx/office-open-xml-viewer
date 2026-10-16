@@ -16121,7 +16121,7 @@ describe('#738 — explicit majorUnit honored on every value axis (§21.2.2.103)
     expect(new Set(coarse).size).toBeLessThan(new Set(auto).size);
   });
 
-  it('radar: majorUnit widens the ring step (fewer radial ticks)', () => {
+  it('radar: authored majorUnit overrides the automatic ring step', () => {
     const auto = valTickNumbers({
       chartType: 'radar', categories: ['A', 'B', 'C', 'D'],
       series: [series({ name: 'S', values: [20, 60, 80, 100] })],
@@ -16132,8 +16132,8 @@ describe('#738 — explicit majorUnit honored on every value axis (§21.2.2.103)
       valAxisMajorUnit: 70,
     });
     // Radar skips the center 0-label, so labels are the ring values.
-    expect(new Set(coarse).size).toBeLessThan(new Set(auto).size);
-    expect(coarse).toContain(70);
+    expect(auto).not.toContain(70);
+    expect(coarse).toEqual([70, 140]);
   });
 
   it('secondary (combo) axis: majorUnit widens its independent step', () => {

@@ -200,6 +200,22 @@ describe('valueAxisScale (shared linear compatibility policy)', () => {
 });
 
 describe('planLinearValueAxis (bounded automatic value-axis policy)', () => {
+  it('fits automatic ticks to the resolved span while preserving authored bounds and units', () => {
+    const options = {
+      dataMin: 12, dataMax: 16,
+      explicitMin: -5, explicitMax: 25,
+      axisLenPt: 96, minMajorSpacingPt: 24,
+    };
+    const auto = planLinearValueAxis(options);
+    expect([auto.min, auto.max]).toEqual([-5, 25]);
+    expect(auto.majorTicks).toEqual([-5, 5, 15, 25]);
+    const authored = planLinearValueAxis({ ...options, majorUnit: 2 });
+    expect(authored.majorUnit).toBe(2);
+    expect(authored.majorTicks).toContain(-3);
+    expect(planLinearValueAxis({ ...options, axisLenPt: 960 }).majorTicks.length)
+      .toBeGreaterThan(auto.majorTicks.length);
+  });
+
   it('matches the observed ordinary auto units used by column, stacked, combo and scatter axes', () => {
     expect(planLinearValueAxis({ dataMin: 0, dataMax: 420, axisLenPt: 180 }).majorUnit).toBe(50);
     expect(planLinearValueAxis({ dataMin: 0, dataMax: 1440, axisLenPt: 180 }).majorUnit).toBe(200);

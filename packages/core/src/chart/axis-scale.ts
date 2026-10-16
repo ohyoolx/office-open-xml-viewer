@@ -123,6 +123,8 @@ export interface LinearValueAxisOptions {
   explicitMin?: number | null;
   explicitMax?: number | null;
   axisLenPt?: number;
+  /** Optional rendered-label clearance for automatic linear ticks, in points. */
+  minMajorSpacingPt?: number;
   /** Physical direction of the numeric axis. Omitted keeps the legacy policy. */
   axisOrientation?: 'vertical' | 'horizontal';
   majorUnit?: number | null;
@@ -276,9 +278,8 @@ export function planLinearValueAxis(options: LinearValueAxisOptions): LinearValu
     // the 1/2/5 ladder from roughly ten intervals.  Using the plot length here
     // made ordinary vertical charts collapse to only three or four labelled
     // intervals (for example 0..600 by 200 instead of 0..600 by 100).  Physical
-    // size remains relevant only for the separately observed explicit-bounds
-    // rule below; the fully automatic compact policy is intentionally one
-    // shared ten-interval rule across chart families.
+    // size also informs the explicit-bounds rule below. Renderers can coarsen
+    // this baseline via minMajorSpacingPt when the labels would be crowded.
     autoMajor = ceilingNiceStep(hi / 10 - lo / 10);
     autoMin = Math.floor(lo / autoMajor) * autoMajor;
     autoMax = Math.ceil(hi / autoMajor) * autoMajor;
@@ -343,6 +344,17 @@ export function planLinearValueAxis(options: LinearValueAxisOptions): LinearValu
     }
   }
   let majorUnit = authoredMajor ?? automaticMajor;
+  // OOXML leaves an omitted majorUnit application-defined (§21.2.2.103).
+  // A renderer may request enough physical space for its labels. Coarsen on
+  // the resolved axis span (including zero anchoring), not the data span;
+  // leave authored bounds and units intact. This is a readability policy,
+  // not an attempt to reproduce an undocumented Office auto-scale algorithm.
+  const spacing = positiveUnit(options.minMajorSpacingPt);
+  const length = positiveUnit(options.axisLenPt);
+  if (authoredMajor == null && spacing != null && length != null && max > min) {
+    const intervals = Math.max(1, Math.floor(length / spacing));
+    majorUnit = Math.max(majorUnit, ceilingNiceStep(spanQuotient(min, max, intervals)));
+  }
   // An automatic unit may be coarsened to keep explicit wide bounds safe.
   if (authoredMajor == null && tickCount(min, max, majorUnit) > MAX_AXIS_TICKS) {
     majorUnit = ceilingNiceStep(max / (MAX_AXIS_TICKS - 1) - min / (MAX_AXIS_TICKS - 1));

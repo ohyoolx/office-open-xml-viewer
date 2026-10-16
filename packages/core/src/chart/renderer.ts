@@ -13527,32 +13527,39 @@ function renderRadarChart(
   if (dataMax === 0) dataMax = 1;
   const needsMinorTicks = chart.valAxisMinorTickMark != null
     && chart.valAxisMinorTickMark !== 'none';
-  // An explicit `<c:valAx><c:majorUnit>` (§21.2.2.103) overrides the automatic
-  // ring step. Omission uses the radar-specific radial density observed across
-  // small/ordinary/large boundary charts, then the shared bounded planner.
+  const valAxPx = axisLabelPx(chart.valAxisFontSizeHpt, h, ptToPx);
+  // Reserve one label height of clearance between automatic radial labels.
+  // Resolve the full scale first: a narrow data range can still produce a
+  // zero-anchored axis. Using only the data span here creates dozens of rings.
   const radarLog = chart.valAxisLogBase != null
     && Number.isFinite(chart.valAxisLogBase)
     && chart.valAxisLogBase >= 2;
-  const radarMajorUnit = chart.valAxisMajorUnit ?? (radarLog
-    ? null
-    : automaticRadarMajorUnit(
-        chart.valMin ?? dataMin,
-        chart.valMax ?? dataMax,
-        rd / ptToPx,
-      ));
-  const radarAxisPlan = planNumericValueAxis({
+  const radarOptions = {
     dataMin,
     dataMax,
     explicitMin: chart.valMin,
     explicitMax: chart.valMax,
     axisLenPt: rd / ptToPx,
-    axisOrientation: 'vertical',
-    majorUnit: radarMajorUnit,
+    axisOrientation: 'vertical' as const,
+    minMajorSpacingPt: 2 * valAxPx / ptToPx,
+    majorUnit: chart.valAxisMajorUnit,
     minorUnit: chart.valAxisMinorUnit,
     needMinor: chart.valAxisMinorGridlines === true || needsMinorTicks,
     logBase: chart.valAxisLogBase,
     reversed: valAxisReversed(chart),
-  });
+  };
+  let radarAxisPlan = planNumericValueAxis(radarOptions);
+  if (chart.valAxisMajorUnit == null && !radarLog) {
+    radarAxisPlan = planNumericValueAxis({
+      ...radarOptions,
+      explicitMin: radarAxisPlan.min,
+      explicitMax: radarAxisPlan.max,
+      majorUnit: Math.max(
+        radarAxisPlan.majorUnit,
+        automaticRadarMajorUnit(radarAxisPlan.min, radarAxisPlan.max, rd / ptToPx),
+      ),
+    });
+  }
   const radarFrac = (value: number): number => clamp(radarAxisPlan.fraction(value), 0, 1);
 
   const angle0 = -Math.PI / 2;
@@ -13605,7 +13612,6 @@ function renderRadarChart(
   // caller hides the axis, and skip the 0-label at the center to avoid
   // overlapping the origin point.
   if (!chart.valAxisHidden) {
-    const valAxPx = axisLabelPx(chart.valAxisFontSizeHpt, h, ptToPx);
     ctx.font = chartFontCss(
       valAxPx,
       chartFontFamily(chart, chart.valAxisFontFace, 'minor'),
@@ -13669,7 +13675,12 @@ function renderRadarChart(
   const plotRightX = cx2 + pw / 2;
   if (!chart.catAxisHidden && catLabelsVisible(chart)) for (let i = 0; i < n; i++) {
     const a = spoke(i);
-    const radialLabelOffset = categoryLabelOffsetPx(12, chart.catAxisLabelOffsetPercent);
+    // Scale the default clearance with the chart, just like the axis fonts;
+    // a fixed pixel gap makes the top category collide with the outer tick.
+    const radialLabelOffset = categoryLabelOffsetPx(
+      Math.max(12 * ptToPx, (radarCatFontPx + valAxPx) / 2),
+      chart.catAxisLabelOffsetPercent,
+    );
     const lx = cx2 + Math.cos(a) * (rd + radialLabelOffset);
     const ly = cy2 + Math.sin(a) * (rd + radialLabelOffset);
     const authoredAlignment = chart.catAxisLabelAlignment;
@@ -14555,6 +14566,9 @@ function renderScatterChart(
   if (chart.valMax != null) yMax = chart.valMax;
   const yNeedsMinor = chart.valAxisMinorGridlines === true
     || (chart.valAxisMinorTickMark != null && chart.valAxisMinorTickMark !== 'none');
+  const yTickFontPx = chart.valAxisFontSizeHpt != null
+    ? yAxLabelFontPx
+    : Math.max(8, Math.min(11, ph / 20));
   const yAxisPlan = planNumericValueAxis({
     dataMin: yMin,
     dataMax: yMax,
@@ -14562,6 +14576,7 @@ function renderScatterChart(
     explicitMax: chart.valMax,
     axisLenPt: ph / ptToPx,
     axisOrientation: 'vertical',
+    minMajorSpacingPt: 2 * yTickFontPx / ptToPx,
     majorUnit: chart.valAxisMajorUnit,
     minorUnit: chart.valAxisMinorUnit,
     needMinor: yNeedsMinor,
@@ -14614,6 +14629,7 @@ function renderScatterChart(
         explicitMax: secondaryY.max,
         axisLenPt: ph / ptToPx,
         axisOrientation: 'vertical',
+        minMajorSpacingPt: 2 * (chartTextFontSizePx(secondaryY.fontSizeHpt, ptToPx) ?? yAxLabelFontPx) / ptToPx,
         majorUnit: secondaryY.majorUnit,
         minorUnit: secondaryY.minorUnit,
         needMinor: secondaryY.minorGridlines === true
@@ -14658,9 +14674,6 @@ function renderScatterChart(
   // special-case, so it strokes every gridline in the resolved color/width.
   const grid = valGridStroke(chart, ptToPx);
   if (!chart.valAxisHidden) {
-    const yTickFontPx = chart.valAxisFontSizeHpt != null
-      ? axisLabelPx(chart.valAxisFontSizeHpt, h, ptToPx)
-      : Math.max(8, Math.min(11, ph / 20));
     const yTickGap = chart.valAxisFontSizeHpt != null
       ? valueTickLabelGapPx(yTickFontPx)
       : 4;
