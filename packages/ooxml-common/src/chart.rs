@@ -10490,13 +10490,15 @@ fn parse_data_labels_node_with_paint_policy(
     (series_out, overrides)
 }
 
-/// Parse the subset of CT_DLbls that Office permits on a chart-group parent.
-/// MS-OE376 §2.1.1476 excludes collection delete, point dLbl, leader lines,
-/// number/text/shape formatting and txPr at this level. Keeping this parser
-/// separate prevents invalid group content from being deep-parsed or cloned
-/// into every owned series.
+/// Parse supported CT_DLbls defaults on a chart-group parent.
+/// ISO/IEC 29500 CT_DLbls permits numFmt on chart groups as well as series.
+/// Preserve that explicit format as a lower-precedence series default. The
+/// older MS-OE376 §2.1.1476 authoring restriction must not discard a stored
+/// format (including General). Other group paint/point content stays excluded;
+/// this path does not deep-parse or clone that content into every series.
 fn parse_chart_group_data_labels(d_lbls: Node) -> Option<ChartSeriesDataLabels> {
     let position_node = child(d_lbls, "dLblPos");
+    let format_node = child(d_lbls, "numFmt");
     let separator_node = child(d_lbls, "separator");
     let flag_names = [
         "showVal",
@@ -10507,6 +10509,7 @@ fn parse_chart_group_data_labels(d_lbls: Node) -> Option<ChartSeriesDataLabels> 
         "showLegendKey",
     ];
     let has_authored_semantics = position_node.is_some()
+        || format_node.is_some()
         || separator_node.is_some()
         || flag_names.iter().any(|name| child(d_lbls, name).is_some());
     if !has_authored_semantics {
@@ -10520,6 +10523,9 @@ fn parse_chart_group_data_labels(d_lbls: Node) -> Option<ChartSeriesDataLabels> 
         show_bubble_size: bool_child(d_lbls, "showBubbleSize").unwrap_or(false),
         show_legend_key: bool_child(d_lbls, "showLegendKey").unwrap_or(false),
         position: position_node.and_then(|node| attr(&node, "val")),
+        format_code: format_node
+            .and_then(|node| node.attribute("formatCode"))
+            .map(|code| code.chars().take(MAX_DATA_LABEL_RICH_SCALARS).collect()),
         separator: separator_node.map(|node| {
             node.text()
                 .unwrap_or("")
@@ -12472,28 +12478,30 @@ pub fn parse_chart_part_with_references_style_parts_and_images(
             Some((group.id(), defaults, owned_series))
         })
         .collect::<Vec<_>>();
-    // Projection into series is intentionally bounded chart-wide. A separator
-    // is arbitrary text, so multiplying it across many groups/series must not
-    // amplify a small XML source into unbounded wire/JSON memory. Refuse every
-    // group separator atomically when their combined projection exceeds the
-    // shared chart-point resource ceiling; semantic show flags remain intact.
-    let separators_fit =
+    // Projection into series is intentionally bounded chart-wide. Format codes
+    // and separators are arbitrary text; projecting them into series must not
+    // amplify a small XML source into unbounded wire/JSON memory. Refuse both
+    // atomically above the chart-point ceiling; semantic show flags remain intact.
+    let label_text_fits =
         chart_group_separator_projection_within_budget(parsed_group_data_labels.iter().map(
             |(_, defaults, owned_series)| {
                 (
                     defaults
                         .as_ref()
-                        .and_then(|item| item.separator.as_ref())
-                        .map(|separator| separator.chars().count())
+                        .map(|item| {
+                            item.separator.as_ref().map_or(0, |s| s.chars().count())
+                                + item.format_code.as_ref().map_or(0, |s| s.chars().count())
+                        })
                         .unwrap_or(0),
                     *owned_series,
                 )
             },
         ));
-    if !separators_fit {
+    if !label_text_fits {
         for (_, defaults, _) in &mut parsed_group_data_labels {
             if let Some(defaults) = defaults.as_mut() {
                 defaults.separator = None;
+                defaults.format_code = None;
             }
         }
     }
@@ -16595,6 +16603,47 @@ Subtitle</a:t></a:r></a:p>
     }
 
     #[test]
+    fn group_number_format_is_inherited_without_leaking_or_overriding_series() {
+        let xml = format!(
+            r#"<c:chartSpace xmlns:c="{C_NS}"><c:chart><c:plotArea>
+          <c:pieChart><c:ser><c:idx val="0"/><c:val><c:numLit><c:pt idx="0"><c:v>0.75</c:v></c:pt></c:numLit></c:val></c:ser>
+            <c:dLbls><c:numFmt formatCode="0%" sourceLinked="0"/><c:showVal/><c:showPercent val="0"/></c:dLbls>
+          </c:pieChart>
+          <c:lineChart><c:ser><c:idx val="1"/><c:val><c:numLit><c:pt idx="0"><c:v>0.25</c:v></c:pt></c:numLit></c:val></c:ser></c:lineChart>
+        </c:plotArea></c:chart></c:chartSpace>"#
+        );
+        let doc = chart_space_of(&xml);
+        let model = parse_chart_part(doc.root_element(), &FixtureResolver).unwrap();
+        let labels = model.series[0].series_data_labels.as_ref().unwrap();
+        assert_eq!(labels.format_code.as_deref(), Some("0%"));
+        assert!(labels.show_val && !labels.show_percent);
+        assert_eq!(
+            model.series[1]
+                .series_data_labels
+                .as_ref()
+                .unwrap()
+                .format_code,
+            None
+        );
+        let xml = xml.replacen(
+            "</c:ser>",
+            "<c:dLbls><c:numFmt formatCode=\"General\"/></c:dLbls></c:ser>",
+            1,
+        );
+        let doc = chart_space_of(&xml);
+        let model = parse_chart_part(doc.root_element(), &FixtureResolver).unwrap();
+        assert_eq!(
+            model.series[0]
+                .series_data_labels
+                .as_ref()
+                .unwrap()
+                .format_code
+                .as_deref(),
+            Some("General")
+        );
+    }
+
+    #[test]
     fn classic_chart_group_labels_merge_property_wise_into_owned_series() {
         let xml = format!(
             r#"<c:chartSpace xmlns:c="{C_NS}" xmlns:a="{A_NS}"><c:chart><c:plotArea>
@@ -16742,6 +16791,20 @@ Subtitle</a:t></a:r></a:p>
                 .map(|value| value.chars().count()),
             Some(MAX_DATA_LABEL_RICH_SCALARS),
         );
+
+        // Format strings share the separator projection budget; even a short
+        // code crosses the ceiling when separators already occupy it exactly.
+        let format_overflow_xml =
+            exact_xml.replace("<c:showVal/>", "<c:showVal/><c:numFmt formatCode=\"0%\"/>");
+        let format_overflow = parse_chart_part(
+            chart_space_of(&format_overflow_xml).root_element(),
+            &FixtureResolver,
+        )
+        .unwrap();
+        assert!(format_overflow.series.iter().all(|series| series
+            .series_data_labels
+            .as_ref()
+            .is_some_and(|labels| labels.separator.is_none() && labels.format_code.is_none())));
 
         let overflow_groups = format!("{exact_groups}{}", group(256, 1, "x"));
         let overflow_xml = format!(
