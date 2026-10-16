@@ -1980,30 +1980,6 @@ fillText "Profile" 332,29.114 fs=#333 font=bold 14.700000000000001px Calibri, Ar
 set strokeStyle=#e0e0e0
 set lineWidth=0.5
 beginPath
-moveTo 292,213.6415
-lineTo 301.4235,220.4881
-lineTo 297.8241,231.5661
-lineTo 286.1759,231.5661
-lineTo 282.5765,220.4881
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
-moveTo 292,203.733
-lineTo 310.8471,217.4262
-lineTo 303.6481,239.5823
-lineTo 280.3519,239.5823
-lineTo 273.1529,217.4262
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
-moveTo 292,193.8245
-lineTo 320.2706,214.3643
-lineTo 309.4722,247.5984
-lineTo 274.5278,247.5984
-lineTo 263.7294,214.3643
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
 moveTo 292,183.916
 lineTo 329.6942,211.3024
 lineTo 315.2963,255.6146
@@ -2012,59 +1988,11 @@ lineTo 254.3058,211.3024
 closePath
 stroke ss=#e0e0e0 lw=0.5 dash=
 beginPath
-moveTo 292,174.0075
-lineTo 339.1177,208.2405
-lineTo 321.1204,263.6307
-lineTo 262.8796,263.6307
-lineTo 244.8823,208.2405
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
-moveTo 292,164.099
-lineTo 348.5413,205.1786
-lineTo 326.9444,271.6469
-lineTo 257.0556,271.6469
-lineTo 235.4587,205.1786
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
-moveTo 292,154.1905
-lineTo 357.9648,202.1167
-lineTo 332.7685,279.663
-lineTo 251.2315,279.663
-lineTo 226.0352,202.1167
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
 moveTo 292,144.282
 lineTo 367.3883,199.0548
 lineTo 338.5926,287.6792
 lineTo 245.4074,287.6792
 lineTo 216.6117,199.0548
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
-moveTo 292,134.3735
-lineTo 376.8119,195.9929
-lineTo 344.4166,295.6953
-lineTo 239.5834,295.6953
-lineTo 207.1881,195.9929
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
-moveTo 292,124.465
-lineTo 386.2354,192.9311
-lineTo 350.2407,303.7114
-lineTo 233.7593,303.7114
-lineTo 197.7646,192.9311
-closePath
-stroke ss=#e0e0e0 lw=0.5 dash=
-beginPath
-moveTo 292,114.5565
-lineTo 395.659,189.8692
-lineTo 356.0648,311.7276
-lineTo 227.9352,311.7276
-lineTo 188.341,189.8692
 closePath
 stroke ss=#e0e0e0 lw=0.5 dash=
 beginPath
@@ -2104,39 +2032,6 @@ set strokeStyle=#aaa
 set lineWidth=1
 setLineDash
 beginPath
-moveTo 285.7,213.6415
-lineTo 292,213.6415
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "0.5" 289,213.6415 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
-moveTo 285.7,203.733
-lineTo 292,203.733
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "1" 289,203.733 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
-moveTo 285.7,193.8245
-lineTo 292,193.8245
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "1.5" 289,193.8245 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
 moveTo 285.7,183.916
 lineTo 292,183.916
 stroke ss=#aaa lw=1 dash=
@@ -2144,39 +2039,6 @@ set strokeStyle=#bbb
 set lineWidth=0.5
 setLineDash
 fillText "2" 289,183.916 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
-moveTo 285.7,174.0075
-lineTo 292,174.0075
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "2.5" 289,174.0075 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
-moveTo 285.7,164.099
-lineTo 292,164.099
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "3" 289,164.099 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
-moveTo 285.7,154.1905
-lineTo 292,154.1905
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "3.5" 289,154.1905 fs=#555 font=16.2px sans-serif al=right bl=middle
 set strokeStyle=#aaa
 set lineWidth=1
 setLineDash
@@ -2192,39 +2054,6 @@ set strokeStyle=#aaa
 set lineWidth=1
 setLineDash
 beginPath
-moveTo 285.7,134.3735
-lineTo 292,134.3735
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "4.5" 289,134.3735 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
-moveTo 285.7,124.465
-lineTo 292,124.465
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "5" 289,124.465 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
-moveTo 285.7,114.5565
-lineTo 292,114.5565
-stroke ss=#aaa lw=1 dash=
-set strokeStyle=#bbb
-set lineWidth=0.5
-setLineDash
-fillText "5.5" 289,114.5565 fs=#555 font=16.2px sans-serif al=right bl=middle
-set strokeStyle=#aaa
-set lineWidth=1
-setLineDash
-beginPath
 moveTo 285.7,104.648
 lineTo 292,104.648
 stroke ss=#aaa lw=1 dash=
@@ -2235,13 +2064,13 @@ fillText "6" 289,104.648 fs=#555 font=16.2px sans-serif al=right bl=middle
 set font=11px sans-serif
 set fillStyle=#444
 set textAlign=center
-fillText "A" 292,92.648 fs=#444 font=11px sans-serif al=center bl=middle
+fillText "A" 292,91.048 fs=#444 font=11px sans-serif al=center bl=middle
 set textAlign=left
-fillText "B" 416.4952,183.0991 fs=#444 font=11px sans-serif al=left bl=middle
-fillText "C" 368.9423,329.4519 fs=#444 font=11px sans-serif al=left bl=middle
+fillText "B" 418.0169,182.6046 fs=#444 font=11px sans-serif al=left bl=middle
+fillText "C" 369.8827,330.7464 fs=#444 font=11px sans-serif al=left bl=middle
 set textAlign=right
-fillText "D" 215.0577,329.4519 fs=#444 font=11px sans-serif al=right bl=middle
-fillText "E" 167.5048,183.0991 fs=#444 font=11px sans-serif al=right bl=middle
+fillText "D" 214.1173,330.7464 fs=#444 font=11px sans-serif al=right bl=middle
+fillText "E" 165.9831,182.6046 fs=#444 font=11px sans-serif al=right bl=middle
 beginPath
 moveTo 292,144.282
 lineTo 348.5413,205.1786

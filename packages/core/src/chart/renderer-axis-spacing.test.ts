@@ -87,6 +87,48 @@ function model(chartType: 'line' | 'area' | 'stackedArea'): ChartModel {
 const RECT: ChartRect = { x: 0, y: 0, w: 640, h: 360 };
 
 describe('Office cartesian tick-label spacing', () => {
+  it('scales radar category clearance with the value-label font', () => {
+    const rec = recordingContext();
+    renderChart(rec.ctx, {
+      ...model('line'), chartType: 'radar',
+      categories: ['A', 'B', 'C', 'D'],
+      series: [series({ values: [12, 16, 13, 15] })],
+      valAxisMajorUnit: 20,
+      catAxisFontSizeHpt: 1800, valAxisFontSizeHpt: 1800,
+    }, { x: 0, y: 0, w: 640, h: 300 }, 2);
+    const outer = rec.labels.find(label => label.text === '20');
+    const category = rec.labels.find(label => label.text === 'A');
+    expect(outer).toBeDefined();
+    expect(category).toBeDefined();
+    expect((outer?.y ?? 0) - (category?.y ?? 0)).toBeGreaterThanOrEqual(36);
+  });
+
+  for (const chartType of ['radar', 'bubble'] as const) {
+    it(`${chartType} keeps automatic value labels readable in a compact plot`, () => {
+      const chart: ChartModel = {
+        ...model('line'), chartType,
+        valMin: null, valMax: null,
+        categories: chartType === 'radar' ? ['A', 'B', 'C', 'D'] : ['1', '2', '3', '4'],
+        series: [series({ values: [12, 16, 13, 15], bubbleSizes: [1, 2, 3, 4] })],
+      };
+      const rec = recordingContext();
+      renderChart(rec.ctx, chart, { x: 0, y: 0, w: 320, h: 150 }, 1);
+      const ticks = rec.labels.filter(label => label.align === 'right' && /^\d/.test(label.text));
+      expect(ticks.length).toBeGreaterThan(0);
+      expect(ticks.length).toBeLessThanOrEqual(5);
+      const positions = ticks.map(label => label.y).sort((a, b) => a - b);
+      for (let i = 1; i < positions.length; i++) {
+        expect(positions[i] - positions[i - 1]).toBeGreaterThanOrEqual(24);
+      }
+
+      const authored = recordingContext();
+      renderChart(authored.ctx, { ...chart, valAxisMajorUnit: 2 }, { x: 0, y: 0, w: 320, h: 150 }, 1);
+      const authoredTicks = authored.labels.filter(label => label.align === 'right' && /^\d/.test(label.text));
+      expect(authoredTicks.map(label => Number(label.text))).toContain(2);
+      expect(authoredTicks.length).toBeGreaterThan(ticks.length);
+    });
+  }
+
   for (const chartType of ['line', 'area', 'stackedArea'] as const) {
     it(`${chartType} honors the category-axis stroke and the 12pt label clearances`, () => {
       const rec = recordingContext();
