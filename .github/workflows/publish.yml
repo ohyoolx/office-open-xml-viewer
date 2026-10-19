@@ -17,6 +17,9 @@ permissions:
 
 jobs:
   publish:
+    # The maintained fork publishes @jiyu/ooxml to its private registry locally.
+    # Never reuse the upstream public-npm credentials or tag publication job.
+    if: github.repository == 'yukiyokotani/office-open-xml-viewer'
     runs-on: ubuntu-latest
 
     steps:
