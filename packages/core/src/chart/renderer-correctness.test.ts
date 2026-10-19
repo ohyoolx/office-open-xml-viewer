@@ -16814,6 +16814,48 @@ function rotateRecordingCtx(): { ctx: CanvasRenderingContext2D; rotates: number[
   return { ctx: new Proxy(state, handler) as unknown as CanvasRenderingContext2D, rotates, texts };
 }
 
+describe('automatic category label angles', () => {
+  const categories = Array.from({ length: 12 }, (_, i) => `2031-${String(i + 1).padStart(2, '0')}`);
+  it.each(['line', 'clusteredBar', 'stackedArea', 'combo'] as const)(
+    'keeps dense %s category labels intact and rotates them diagonally', chartType => {
+      const rec = recordingCtx();
+      renderChart(rec.ctx, baseModel({
+        chartType: chartType === 'combo' ? 'stackedBar' : chartType,
+        categories,
+        series: [series({ values: categories.map((_, i) => i + 1) }),
+          ...(chartType === 'combo' ? [series({ seriesType: 'line', values: categories.map(() => 6) })] : [])],
+      }), { x: 0, y: 0, w: 460, h: 280 }, 1);
+      const labels = rec.texts.filter(text => categories.includes(text.text));
+      expect(labels.map(text => text.text)).toEqual(categories);
+      // The diagonal endpoints must stay within the chart, not merely rotate
+      // successfully while being clipped by the owning worksheet/slide frame.
+      expect(rec.translations).toHaveLength(12);
+      labels.forEach((label, index) => {
+        const pivot = rec.translations[index];
+        const fontPx = Number(/([\d.]+)px/.exec(label.font ?? '')?.[1]);
+        const extent = ((label.width ?? 0) + fontPx / 2) / Math.SQRT2;
+        expect(pivot.x - extent).toBeGreaterThanOrEqual(0);
+        expect(pivot.y + extent).toBeLessThanOrEqual(280);
+      });
+      expect(rec.rotations.filter(angle => Math.abs(angle + Math.PI / 4) < 1e-6)).toHaveLength(12);
+    },
+  );
+
+  it('retains authored horizontal labels and sparse automatic labels', () => {
+    for (const override of [
+      { catAxisLabelRotation: 0 },
+      { catAxisTickLabelSkip: 4 },
+      { categories: categories.map((value, index) => index % 4 === 0 ? value : '') },
+    ]) {
+      const rec = rotateRecordingCtx();
+      renderChart(rec.ctx, baseModel({ chartType: 'line', categories,
+        series: [series({ values: categories.map(() => 1) })], ...override,
+      }), { x: 0, y: 0, w: 460, h: 280 }, 1);
+      expect(rec.rotates).toHaveLength(0);
+    }
+  });
+});
+
 describe('CH6 — category-axis label rotation + tickLblPos (commit 2)', () => {
   const colModel = (over: Partial<ChartModel>): ChartModel => baseModel({
     chartType: 'clusteredBar',

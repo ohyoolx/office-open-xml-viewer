@@ -10,6 +10,8 @@ set fillStyle=#333
 set textAlign=center
 set textBaseline=top
 fillText "Area" 332,29.114 fs=#333 font=bold 14.700000000000001px Calibri, Arial, sans-serif al=center bl=top
+set font=11px sans-serif
+set font=bold 14.700000000000001px Calibri, Arial, sans-serif
 set strokeStyle=#aaa
 beginPath
 moveTo 88.8,312.95
@@ -520,6 +522,8 @@ set fillStyle=#333
 set textAlign=center
 set textBaseline=top
 fillText "Quarterly" 332,29.114 fs=#333 font=bold 14.700000000000001px Calibri, Arial, sans-serif al=center bl=top
+set font=11px sans-serif
+set font=bold 14.700000000000001px Calibri, Arial, sans-serif
 save
 set font=11px sans-serif
 restore
@@ -958,6 +962,8 @@ set fillStyle=#333
 set textAlign=center
 set textBaseline=top
 fillText "Combo" 332,29.114 fs=#333 font=bold 14.700000000000001px Calibri, Arial, sans-serif al=center bl=top
+set font=11px sans-serif
+set font=bold 14.700000000000001px Calibri, Arial, sans-serif
 save
 set font=11px sans-serif
 restore
@@ -1295,6 +1301,8 @@ exports[`renderChart draw-call signature (characterization) > is stable for: lin
 save
 set font=10.5px sans-serif
 restore
+set font=16.2px sans-serif
+set font=10.5px sans-serif
 set font=bold 14.700000000000001px Calibri, Arial, sans-serif
 set fillStyle=#333
 set textAlign=center
@@ -2421,6 +2429,8 @@ exports[`renderChart draw-call signature (characterization) > is stable for: sta
 save
 set font=10.5px sans-serif
 restore
+set font=11px sans-serif
+set font=10.5px sans-serif
 set strokeStyle=#aaa
 beginPath
 moveTo 88.8,335.45
@@ -2666,6 +2676,8 @@ set fillStyle=#333
 set textAlign=center
 set textBaseline=top
 fillText "Stacked" 332,29.114 fs=#333 font=bold 14.700000000000001px Calibri, Arial, sans-serif al=center bl=top
+set font=11px sans-serif
+set font=bold 14.700000000000001px Calibri, Arial, sans-serif
 save
 set font=11px sans-serif
 restore
@@ -2852,6 +2864,8 @@ exports[`renderChart draw-call signature (characterization) > is stable for: sta
 save
 set font=10.5px sans-serif
 restore
+set font=11px sans-serif
+set font=10.5px sans-serif
 set font=11px sans-serif
 set font=10.5px sans-serif
 save
@@ -3048,6 +3062,8 @@ restore"
 
 exports[`renderChart draw-call signature (characterization) > is stable for: stackedLine+midCat 1`] = `
 "save
+set font=16.2px sans-serif
+set font=10px sans-serif
 set font=16.2px sans-serif
 set textBaseline=middle
 set strokeStyle=#aaa

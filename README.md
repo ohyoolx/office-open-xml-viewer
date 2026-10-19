@@ -1,6 +1,6 @@
 > [!NOTE]
 > This fork maintains `@jiyu/ooxml` on `jiyu/0.88.x`, with versions such as
-> `0.88.0-jiyu.1`. It publishes to the private registry in `publishConfig`;
+> `0.88.0-jiyu.2`. It publishes to the private registry in `publishConfig`;
 > the upstream public-npm publishing workflow is disabled in this fork.
 > For a release, use Node 24 and the pinned pnpm version, run
 > `pnpm install --frozen-lockfile`, `pnpm build:wasm`, `pnpm typecheck`,
@@ -8,7 +8,7 @@
 > resulting `npm pack` tarball in a consumer, then publish that same tarball
 > with `npm publish <tarball> --tag jiyu`. Keep registry credentials in local
 > npm configuration. Existing consumers can retain their import paths with
-> the dependency alias `"@silurus/ooxml": "npm:@jiyu/ooxml@0.88.0-jiyu.1"`.
+> the dependency alias `"@silurus/ooxml": "npm:@jiyu/ooxml@0.88.0-jiyu.2"`.
 
 > [!NOTE]
 > **This entire codebase — Rust parsers, TypeScript renderers, tests, and tooling — is implemented by AI coding agents, primarily [Claude](https://claude.ai) and [Codex](https://openai.com/codex/)**, through iterative prompting. No human-written application code exists in this repository.

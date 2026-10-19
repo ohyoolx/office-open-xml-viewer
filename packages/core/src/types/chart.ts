@@ -1445,7 +1445,7 @@ export interface ChartModel {
   /**
    * `<c:catAx><c:txPr><a:bodyPr rot>` (DrawingML `ST_Angle`, 60000ths of a
    * degree) — category tick-label rotation. e.g. -2700000 = -45°. null/undefined
-   * /0 ⇒ horizontal labels (byte-stable).
+   * ⇒ automatic layout where supported; 0 explicitly requests horizontal labels.
    */
   catAxisLabelRotation?: number | null;
   /** Group-owned decorations for classic line-chart groups. */
