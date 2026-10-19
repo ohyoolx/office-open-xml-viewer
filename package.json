@@ -1,6 +1,6 @@
 {
-  "name": "@silurus/ooxml",
-  "version": "0.88.0",
+  "name": "@jiyu/ooxml",
+  "version": "0.88.0-jiyu.1",
   "description": "Browser-based OOXML viewer (docx/xlsx/pptx) — Rust/WASM parser + Canvas renderer",
   "license": "MIT",
   "author": "Yuki Yokotani <silurus.dev@gmail.com>",
@@ -21,15 +21,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yukiyokotani/office-open-xml-viewer.git"
+    "url": "git+https://github.com/ohyoolx/office-open-xml-viewer.git"
   },
-  "homepage": "https://ooxml.silurus.dev",
+  "homepage": "https://github.com/ohyoolx/office-open-xml-viewer",
   "bugs": {
-    "url": "https://github.com/yukiyokotani/office-open-xml-viewer/issues"
+    "url": "https://github.com/ohyoolx/office-open-xml-viewer/issues"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "registry": "http://npm.test.jiyusys.com/"
   },
   "type": "module",
   "sideEffects": false,
