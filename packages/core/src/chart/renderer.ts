@@ -3181,6 +3181,75 @@ function catLabelRotationRad(chart: ChartModel): number {
   return (rot / 60000) * (Math.PI / 180);
 }
 
+/** Readability policy for automatic ordinal X axes, shared by column/combo,
+ * line and area renderers in all three document formats. OOXML specifies the
+ * authored txPr rotation and tickLblSkip, but not an automatic collision
+ * algorithm. Measure the actual formatted, non-empty labels with the paint
+ * font; prefer -45 degrees when horizontal neighbours collide. Use -90 when
+ * diagonal text would escape the left frame or neighbouring text strips touch.
+ * This is a library layout policy, not a claim to reproduce Office auto-layout.
+ * Calendar axes, multi-level labels and authored plot rectangles retain their
+ * existing layout. Explicit rotation (including zero/sentinels) always wins.
+ */
+function automaticCategoryLabelLayout(
+  ctx: CanvasRenderingContext2D, chart: ChartModel, categories: readonly string[],
+  fontPx: number, plotX: number, plotWidth: number, plotHeight: number, chartX: number,
+  enabled: boolean,
+): { rotation: number; extraHeight: number; maxWidth: number } {
+  const unchanged = { rotation: catLabelRotationRad(chart), extraHeight: 0, maxWidth: Infinity };
+  if (!enabled || chart.catAxisLabelRotation != null || chart.catAxisIsDate
+    || chart.plotAreaManualLayout != null || (chart.categoryLevels?.length ?? 0) > 1
+    || chart.catAxisHidden || !catLabelsVisible(chart)
+    || categories.length < 2) return unchanged;
+  const interval = Math.max(1, Math.floor(chart.catAxisTickLabelSkip ?? 1));
+  const previousFont = ctx.font;
+  ctx.font = chartFontCss(fontPx, chartFontFamily(chart, chart.catAxisFontFace, 'minor'),
+    chart.catAxisFontBold ?? false, chart.catAxisFontItalic ?? false);
+  let previousX = 0;
+  let previousWidth = 0;
+  let previousTolerance = 0;
+  let hasPrevious = false;
+  let collision = false;
+  let minSpacing = Infinity;
+  let leftSpace = Infinity;
+  let maxWidth = 0;
+  for (let i = 0; i < categories.length; i += interval) {
+    const text = formatCategoryLabel(categories[i], chart.catAxisFormatCode, chart.date1904);
+    if (!text) continue;
+    const width = ctx.measureText(text).width;
+    const tolerance = numericCategoryMetricTolerance(text, fontPx);
+    const anchor = categoryLabelAnchorFraction(i, categories.length, isCrossBetween(chart),
+      catAxisReversed(chart), chart.catAxisLabelAlignment);
+    const labelX = plotX + anchor.fraction * plotWidth;
+    // Include half an em of breathing room between the measured text boxes.
+    if (hasPrevious) {
+      const spacing = Math.abs(labelX - previousX);
+      minSpacing = Math.min(minSpacing, spacing);
+      const clearance = tolerance > 0 && previousTolerance > 0
+        ? -(tolerance + previousTolerance) / 2 : fontPx / 2;
+      collision ||= spacing < (width + previousWidth) / 2 + clearance;
+    }
+    hasPrevious = true;
+    previousX = labelX;
+    previousWidth = width;
+    previousTolerance = tolerance;
+    maxWidth = Math.max(maxWidth, width);
+    leftSpace = Math.min(leftSpace, labelX - chartX);
+  }
+  ctx.font = previousFont;
+  if (!collision) return unchanged;
+  const rotation = minSpacing / Math.SQRT2 < fontPx
+    || (maxWidth + fontPx / 2) / Math.SQRT2 > leftSpace
+    ? -Math.PI / 2 : -Math.PI / 4;
+  const sin = Math.abs(Math.sin(rotation));
+  const cos = Math.abs(Math.cos(rotation));
+  // Keep at least half the data plot even for extremely long labels. Elide only
+  // beyond this measured vertical budget; reserve the same height we paint.
+  const budget = Math.max(fontPx, (plotHeight / 2 - fontPx * cos / 2) / sin);
+  const height = Math.min(maxWidth, budget) * sin + fontPx * cos / 2;
+  return { rotation, extraHeight: Math.max(0, height - fontPx), maxWidth: budget };
+}
+
 /** Draw a category label at `(x, y)` with optional rotation. `rotRad === 0`
  *  keeps the exact non-rotated draw the callers used before (byte-stable):
  *  `ctx.fillText(text, x, y)` with the caller's current align/baseline. When
@@ -4651,7 +4720,12 @@ export function renderBarChart(
   // An authored inner plot rectangle already leaves its own label band; for an
   // automatic/outer layout, move the plot bottom up by the additional wrapped
   // lines so they remain inside the chart frame.
-  const catLabelRotation = catLabelRotationRad(chart);
+  const autoCatLabels = automaticCategoryLabelLayout(
+    ctx, chart, cats, chart.catAxisFontSizeHpt != null ? catAxFontPx : Math.max(8, Math.min(11, pw / n * 0.5)),
+    px0, pw, ph, x, !hasDataTable && !isH,
+  );
+  ph -= autoCatLabels.extraHeight;
+  const catLabelRotation = autoCatLabels.rotation;
   const wrappedColumnCategories: string[][] = [];
   let wrappedCategoryExtraH = 0;
   if (!hasDataTable && !isH && !dateAxisPlan && !chart.catAxisHidden && catLabelsVisible(chart) && catLabelRotation === 0) {
@@ -5645,6 +5719,7 @@ export function renderBarChart(
       }));
     for (const entry of labelEntries) {
       const { raw } = entry;
+      if (entry.categoryIndex >= 0 && entry.categoryIndex % Math.max(1, Math.floor(chart.catAxisTickLabelSkip ?? 1)) !== 0) continue;
       if (!isH) {
         const anchor = entry.fraction != null || entry.categoryIndex < 0
           ? { fraction: entry.fraction ?? 0.5, textAlign: 'center' as CanvasTextAlign }
@@ -5659,7 +5734,8 @@ export function renderBarChart(
         ctx.textAlign = anchor.textAlign; ctx.textBaseline = 'top';
         // Rotation elides against a longer diagonal budget. Horizontal labels
         // use the measured word-wrap computed from this category slot.
-        const budget = rotRad === 0 ? catSlotMaxPx : ph * 0.4;
+        const budget = Number.isFinite(autoCatLabels.maxWidth)
+          ? autoCatLabels.maxWidth : rotRad === 0 ? catSlotMaxPx : ph * 0.4;
         const gap = categoryLabelOffsetPx(
           chart.catAxisFontSizeHpt != null
             ? categoryTickLabelGapPx(drawnCatTickFontPx)
@@ -8450,6 +8526,11 @@ export function renderLineChart(
   }
   const { px0, py0, pw } = lineFrame.plotRect;
   let { ph } = lineFrame.plotRect;
+  const autoCatLabels = automaticCategoryLabelLayout(
+    ctx, chart, cats, catAxFontPx,
+    px0, pw, ph, x, !hasDataTable,
+  );
+  ph -= autoCatLabels.extraHeight;
   drawChartTitleForLayout(
     ctx, chart,
     chart.titleManualLayout || !chart.titleRichRuns?.length ? x : px0, y,
@@ -8858,7 +8939,7 @@ export function renderLineChart(
     }
     const showLabels = !hasDataTable && catLabelsVisible(chart);
     const labelInterval = Math.max(1, Math.floor(chart.catAxisTickLabelSkip ?? 1));
-    const rotRad = catLabelRotationRad(chart);
+    const rotRad = autoCatLabels.rotation;
     const labelEntries = dateAxisPlan
       ? dateAxisPlan.majorTicks.map(tick => ({
         label: formatCategoryLabel(String(tick.serial), chart.catAxisFormatCode, chart.date1904),
@@ -8901,7 +8982,7 @@ export function renderLineChart(
       const labelAxisY = labelPosition === 'nextTo'
         ? primaryCategoryAxisY
         : labelPosition === 'high' ? py0 : py0 + ph;
-      drawRotatedCatLabel(ctx, label, tx, labelAxisY + gap, rotRad);
+      drawRotatedCatLabel(ctx, elideToWidth(ctx, label, autoCatLabels.maxWidth), tx, labelAxisY + gap, rotRad);
     }
   }
 
@@ -11344,6 +11425,11 @@ function renderAreaChart(
   });
   const { px0, py0, pw } = areaFrame.plotRect;
   let { ph } = areaFrame.plotRect;
+  const autoCatLabels = automaticCategoryLabelLayout(
+    ctx, chart, cats, chart.catAxisFontSizeHpt != null ? catAxFontPx : Math.max(8, Math.min(11, pw / n * 0.8)),
+    px0, pw, ph, x, !hasDataTable,
+  );
+  ph -= autoCatLabels.extraHeight;
   if (pw <= 0 || ph <= 0) return;
 
   const dataTableLayout = hasDataTable
@@ -11921,7 +12007,8 @@ function renderAreaChart(
       const labelAxisY = labelPosition === 'nextTo'
         ? primaryCategoryAxisY
         : labelPosition === 'high' ? py0 : py0 + ph;
-      ctx.fillText(label, anchor ? px0 + anchor.fraction * pw : entry.x, labelAxisY + gap);
+      drawRotatedCatLabel(ctx, elideToWidth(ctx, label, autoCatLabels.maxWidth),
+        anchor ? px0 + anchor.fraction * pw : entry.x, labelAxisY + gap, autoCatLabels.rotation);
     }
   }
 
