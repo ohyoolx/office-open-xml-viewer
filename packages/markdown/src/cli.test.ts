@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -22,12 +24,44 @@ const wasm = fileURLToPath(new URL('packages/docx/src/wasm/docx_parser_bg.wasm',
 
 const ready = existsSync(sample) && existsSync(wasm);
 
+// Each case spawns real `node` processes that load and initialise the parser
+// WASM (the non-OOXML case spawns three in sequence, ~1.6 s on an idle
+// machine). Process start-up dominates and stretches badly on loaded CI
+// runners, where the default 5 s budget has timed out.
+const CLI_TIMEOUT_MS = 30_000;
+
 describe('ooxml-md CLI', () => {
   it.skipIf(!ready)('prints markdown to stdout for a .docx', () => {
     const out = execFileSync('node', [bin, sample], { encoding: 'utf8' });
     expect(out.length).toBeGreaterThan(0);
     expect(out).toContain('CANOPY');
-  });
+  }, CLI_TIMEOUT_MS);
+
+  const parsersReady = ['docx', 'xlsx', 'pptx'].every((format) =>
+    existsSync(fileURLToPath(new URL(`packages/${format}/src/wasm/${format}_parser_bg.wasm`, root))));
+
+  it.skipIf(!parsersReady)('exits 3 with a readable message for non-OOXML input', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ooxml-md-'));
+    try {
+      for (const extension of ['docx', 'xlsx', 'pptx']) {
+        const file = join(directory, `garbage.${extension}`);
+        writeFileSync(file, new Uint8Array([1, 2, 3]));
+        let code = 0;
+        let stderr = '';
+        try {
+          execFileSync('node', [bin, file], { encoding: 'utf8', stdio: 'pipe' });
+        } catch (err) {
+          const e = err as { status: number; stderr: string };
+          code = e.status;
+          stderr = e.stderr;
+        }
+        expect(code, extension).toBe(3);
+        expect(stderr, extension).toContain('is not an Office Open XML document');
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, CLI_TIMEOUT_MS);
 
   it('prints usage and exits non-zero with no arguments', () => {
     let code = 0;

@@ -25,6 +25,7 @@ import type {
   DocxPagePoint,
   DocxSelectionSourceLocator,
 } from './selection-context.js';
+import { safeUtf16Prefix } from '@silurus/ooxml-core/internal/utf16-prefix';
 
 export interface DocxElementContextOptions {
   readonly maxTextCharacters?: number;
@@ -42,16 +43,6 @@ export interface SelectedDocxElementContextOptions extends DocxElementContextOpt
 
 export const MAX_DOCX_ELEMENT_TEXT_CHARACTERS = MAX_CHART_CONTEXT_TEXT_CHARACTERS;
 const DEFAULT_DOCX_ELEMENT_TEXT_CHARACTERS = 16_384;
-
-function safeUtf16Prefix(value: string, maxCodeUnits: number): string {
-  let end = Math.min(value.length, maxCodeUnits);
-  if (end > 0 && end < value.length) {
-    const previous = value.charCodeAt(end - 1);
-    const next = value.charCodeAt(end);
-    if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end--;
-  }
-  return value.slice(0, end);
-}
 
 function boundedText(parts: Iterable<string>, maxTextCharacters: number): {
   readonly text?: string;
@@ -80,7 +71,7 @@ function* nodeText(node: DeepReadonly<PaintNode>): Iterable<string> {
   if (node.kind === 'paragraph') {
     for (const line of node.lines) {
       const text = line.placements.flatMap((placement) =>
-        placement.kind === 'text' ? [placement.text] : []).join('');
+        placement.kind === 'text' && !placement.optionalHyphenGlyph ? [placement.text] : []).join('');
       if (text) yield text;
     }
     return;
@@ -93,7 +84,11 @@ function* nodeText(node: DeepReadonly<PaintNode>): Iterable<string> {
     }
     return;
   }
-  if (node.kind === 'note' || node.kind === 'textbox') {
+  if (node.kind === 'note') {
+    if (node.leading?.paragraph) yield* nodeText(node.leading.paragraph);
+    for (const block of node.story.blocks) yield* nodeText(block);
+    if (node.trailing?.paragraph) yield* nodeText(node.trailing.paragraph);
+  } else if (node.kind === 'textbox') {
     for (const block of node.story.blocks) yield* nodeText(block);
   }
 }

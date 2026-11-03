@@ -3,7 +3,7 @@ import wasm from 'vite-plugin-wasm';
 import { resolve } from 'path';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { wasmAssetUrl } from '../../vite.config';
+import { legacyBundleBoundary, wasmAssetUrl } from '../../vite.config';
 
 const dirname =
   typeof __dirname !== 'undefined'
@@ -11,13 +11,19 @@ const dirname =
     : path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
-  plugins: [wasm()],
+  define: { __OOXML_MODEL_SOURCES__: 'true' },
+  // Library assets (parser WASM, workers) must resolve from the importing
+  // module's URL, never from the hosting page's origin root, as in the root
+  // build. Without it Vite 8.3 emits root-absolute "/<asset>" references.
+  base: './',
+  plugins: [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
   resolve: {
     alias: {
       '@ooxml-test-three-d-renderer': resolve(dirname, '../../src/three-d.ts'),
       '@ooxml-test-region-map-renderer': resolve(dirname, '../../src/region-map.ts'),
       '@ooxml-test-math-renderer': resolve(dirname, '../../src/math.ts'),
       '@ooxml-test-tiff-renderer': resolve(dirname, '../../src/tiff.ts'),
+      '@ooxml-test-chart-ex-renderer': resolve(dirname, '../../src/chart-ex.ts'),
     },
   },
   server: {
@@ -46,9 +52,11 @@ export default defineConfig({
   },
   worker: {
     format: 'es',
-    plugins: () => [wasmAssetUrl(), wasm()],
+    plugins: () => [wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
-      output: { assetFileNames: '[name][extname]' },
+      // Inline parser workers run from Blob URLs: keep their dynamic analysis
+      // in one module rather than emitting unresolvable relative imports.
+      output: { assetFileNames: '[name][extname]', codeSplitting: false },
     },
   },
 });

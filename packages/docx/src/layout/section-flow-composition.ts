@@ -25,6 +25,8 @@ function numberedParagraph(
   session: BodyLayoutSession,
 ): Readonly<{ paragraph: ParagraphLayout; counterEnd: number }> {
   let counter = counterStart;
+  // §17.6.8 counts physical lines. Acquisition has already united their gap
+  // placements, so the same retained entry owns exactly one counter/baseline.
   const lineNumbers = paragraph.lines.map((line, lineIndex): LineNumberLayout => {
     const counterValue = counter++;
     const text = String(counterValue);
@@ -124,6 +126,7 @@ export function composeCanonicalSectionFlow(
             node,
             counter,
             Math.max(1, numbering.countBy),
+            // `word-default-line-number-distance`
             wordLineNumberDistancePt(numbering.distance),
             session,
           );

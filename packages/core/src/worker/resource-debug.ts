@@ -19,6 +19,8 @@ export interface OoxmlResourceMetricsSessionOptions {
   readonly mode: OoxmlResourceMetrics['mode'];
   readonly scope?: OoxmlResourceMetrics['scope'];
   readonly policy: Readonly<NormalizedOoxmlResourcePolicy>;
+  /** Content-free, resolved limits supplied by the owning format adapter. */
+  readonly formatLimits?: Readonly<Record<string, Readonly<Record<string, number>>>>;
   readonly now?: () => number;
   readonly onMetrics?: (report: OoxmlResourceMetrics) => void;
   /** Emit the human-readable console card in addition to `onMetrics`. */
@@ -33,7 +35,7 @@ export const OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS = 1_000;
  * previous snapshot as current. */
 export async function readLatestOoxmlResourceMetrics(
   session: OoxmlResourceMetricsSession,
-  probe: (timeoutMs: number) => Promise<OoxmlResourceUsageSnapshot>,
+  probe: (timeoutMs: number) => Promise<OoxmlResourceUsageSnapshot | undefined>,
 ): Promise<OoxmlResourceMetrics> {
   session.observeUsage(await probe(OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS));
   const report = session.current();
@@ -67,6 +69,9 @@ export class OoxmlResourceMetricsSession {
       maxArchiveEntryBytes: options.policy.maxArchiveEntryBytes,
       maxTotalInflatedBytes: options.policy.maxTotalInflatedBytes,
       maxArchiveEntries: options.policy.maxArchiveEntries,
+      ...Object.fromEntries(Object.entries(options.formatLimits ?? {}).map(([key, limits]) => [
+        key, Object.freeze({ ...limits }),
+      ])),
     });
     this.mode = options.mode;
   }

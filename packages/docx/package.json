@@ -1,7 +1,7 @@
 {
   "name": "@silurus/ooxml-docx",
   "private": true,
-  "version": "0.88.0",
+  "version": "0.89.7-jiyu.1",
   "description": "DOCX parser and Canvas renderer (internal workspace package of @silurus/ooxml)",
   "license": "MIT",
   "author": "Yuki Yokotani <silurus.dev@gmail.com>",
@@ -27,17 +27,16 @@
     },
     "./wasm": "./src/wasm/docx_parser.js",
     "./wasm-binary": "./src/wasm/docx_parser_bg.wasm",
-    "./internal/session": "./src/internal/session.ts"
+    "./internal/session": "./src/internal/session.ts",
+    "./internal/parser-errors": "./src/internal/parser-errors.ts",
+    "./internal/model-source-session": "./src/internal/model-source-session.ts"
   },
   "files": [
     "dist",
     "src"
   ],
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --build && vite build && tsc -p tsconfig.declarations.json",
-    "build:ci": "vite build && tsc -p tsconfig.declarations.json",
-    "preview": "vite preview",
+    "build": "tsc --build ../core && vite build && node ../../scripts/build-model-source-sidecars.mjs docx && tsc -p tsconfig.declarations.json",
     "wasm": "cd parser && wasm-pack build --target web --out-dir ../src/wasm && node ../../../scripts/append-wasm-reinit.mjs ../src/wasm/docx_parser.js",
     "typecheck": "tsc --noEmit",
     "vrt": "VRT_MODE=regression playwright test --config playwright.config.ts --project=chrome",
@@ -50,15 +49,15 @@
     "conformance": "playwright test --config playwright.config.ts conformance.spec.ts"
   },
   "devDependencies": {
-    "@playwright/test": "^1.59.1",
+    "@playwright/test": "^1.64.1",
     "@types/node": "^25.6.0",
     "@types/pngjs": "^6.0.5",
     "pixelmatch": "^7.1.0",
-    "playwright": "^1.59.1",
+    "playwright": "^1.64.1",
     "pngjs": "^7.0.0",
+    "skia-canvas": "^2.0.0",
     "typescript": "^7.0.2",
-    "vite": "^6.3.5",
-    "vite-plugin-top-level-await": "^1.6.0",
+    "vite": "^8.0.8",
     "vite-plugin-wasm": "^3.6.0"
   },
   "dependencies": {

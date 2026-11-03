@@ -1,3 +1,4 @@
+import { OoxmlDecodedImageLimitError, isOoxmlDecodedImageLimitError } from './pixel-budget.js';
 // ── EMF (Enhanced Metafile) player ───────────────────────────────────────────
 //
 // Browsers cannot decode EMF via `createImageBitmap`, so the renderer falls back
@@ -41,22 +42,40 @@
 // CREATEDIBPATTERNBRUSHPT (→ average solid color), EXTCREATEFONTINDIRECTW,
 // POLYLINE16/POLYGON16/POLYBEZIER16/POLYLINETO16/POLYBEZIERTO16 (+ their 32-bit
 // twins), POLYPOLYGON16/POLYPOLYLINE16 (+ 32-bit twins), MOVETOEX, LINETO,
-// RECTANGLE, ELLIPSE, SETPOLYFILLMODE, EXTTEXTOUTW, SETTEXTCOLOR, SETTEXTALIGN,
-// SETBKMODE, BITBLT, STRETCHDIBITS (minimal DIB decoder), EOF.
-// GDI path brackets are handled: BEGINPATH/ENDPATH/CLOSEFIGURE accumulate
-// geometry for FILLPATH/STROKEPATH/STROKEANDFILLPATH or SELECTCLIPPATH (the
-// clip remains scoped by SAVEDC/RESTOREDC).
-// Ignored (no-op, skipped by nSize): GDICOMMENT (may hold EMF+, out of scope),
-// SETICMMODE, SETMITERLIMIT, SETROP2, SETSTRETCHBLTMODE, INTERSECTCLIPRECT,
-// and any unrecognized iType.
+// RECTANGLE, ROUNDRECT, ELLIPSE, ARC, ARCTO, ANGLEARC, CHORD, PIE,
+// SETARCDIRECTION, SETPOLYFILLMODE, EXTTEXTOUTW, SETTEXTCOLOR, SETTEXTALIGN,
+// SETBKMODE, BITBLT (DIB source, or PATCOPY/BLACKNESS/WHITENESS/D without
+// one), STRETCHDIBITS (minimal DIB decoder), EOF.
+// BEGINPATH/ENDPATH/CLOSEFIGURE retain line/polygon/cubic/rectangle/arc/ellipse
+// geometry in the device context's own path (EmfPath), apart from ordinary
+// drawing; FILLPATH/STROKEPATH/STROKEANDFILLPATH paint it, FLATTENPATH keeps
+// it, ABORTPATH discards it, and SAVEDC/RESTOREDC save and restore it. Clipping: SELECTCLIPPATH (AND/COPY),
+// INTERSECTCLIPRECT, EXCLUDECLIPRECT and EXTSELECTCLIPRGN (AND/COPY/DIFF and
+// the default-clip reset), scoped by SAVEDC/RESTOREDC; a clip record inside an
+// open path bracket, or after ENDPATH while the closed path awaits the record
+// that consumes it, clips without touching the path's figures.
+// Content the player cannot reproduce (text variants other than EXTTEXTOUTW,
+// POLYDRAW, region painting, flood fill, other blits, gradient fill, glyph
+// paths, WIDENPATH, arcs under a reflected mapping, EMF+-only content that
+// fails validation, damaged or malformed records) is collected into the
+// playback's report. `renderEmfToBitmap` returns it with the bitmap
+// (`EmfRasterResult`), and `decodeRasterOrMetafile` applies the caller's
+// `IncompleteMetafilePolicy`: reject the picture, or keep the partial drawing
+// with the report attached. Around a gap, playback draws exactly what it drew
+// before the gap was detected, so the compatibility policy changes no output;
+// playback has no global side effect. State records without a visible effect
+// (SETICMMODE, SETMITERLIMIT, SETROP2, SETSTRETCHBLTMODE, SETMETARGN, palettes,
+// dual-mode EMF+ comments) and unrecognized iTypes are skipped by nSize.
 //
 // Shared across the docx, pptx and xlsx renderers via
 // {@link ./raster-or-metafile.ts}#decodeRasterOrMetafile, which sniffs the bytes and routes
 // true EMF here.
 
+import { decodeMetafileSymbolText } from '../fonts/metafile-symbol-encoding.js';
 import { decodeDib, blitDibToCtx, type DecodedDib } from './dib.js';
 import { colorRefToCss, isEmf } from './wmf.js';
 import { createAuxCanvas } from '../canvas/aux-canvas.js';
+import { EmfPlusPlayer, scanEmfPlus } from './emf-plus.js';
 
 // EMF record type codes ([MS-EMF] 2.1.1 EMR enumeration; the subset we act on,
 // others are skipped by nSize).
@@ -90,17 +109,28 @@ const EMR = {
   CREATEPEN: 38,
   CREATEBRUSHINDIRECT: 39,
   DELETEOBJECT: 40,
+  ANGLEARC: 41,
   ELLIPSE: 42,
   RECTANGLE: 43,
+  ROUNDRECT: 44,
+  ARC: 45,
+  CHORD: 46,
+  PIE: 47,
   LINETO: 54,
+  ARCTO: 55,
+  POLYDRAW: 56,
   BEGINPATH: 59,
   ENDPATH: 60,
   CLOSEFIGURE: 61,
   FILLPATH: 62,
   STROKEANDFILLPATH: 63,
   STROKEPATH: 64,
+  FLATTENPATH: 65,
+  WIDENPATH: 66,
   SELECTCLIPPATH: 67,
+  ABORTPATH: 68,
   EXTCREATEFONTINDIRECTW: 82,
+  EXTTEXTOUTA: 83,
   EXTTEXTOUTW: 84,
   POLYBEZIER16: 85,
   POLYGON16: 86,
@@ -109,12 +139,69 @@ const EMR = {
   POLYLINETO16: 89,
   POLYPOLYLINE16: 90,
   POLYPOLYGON16: 91,
+  POLYDRAW16: 92,
   CREATEMONOBRUSH: 93,
   CREATEDIBPATTERNBRUSHPT: 94,
   EXTCREATEPEN: 95,
+  POLYTEXTOUTA: 96,
+  POLYTEXTOUTW: 97,
+  SMALLTEXTOUT: 108,
   BITBLT: 76,
   STRETCHDIBITS: 81,
+  SETPIXELV: 15,
+  OFFSETCLIPRGN: 26,
+  SETMETARGN: 28,
+  EXCLUDECLIPRECT: 29,
+  INTERSECTCLIPRECT: 30,
+  EXTFLOODFILL: 53,
+  SETARCDIRECTION: 57,
+  GDICOMMENT: 70,
+  FILLRGN: 71,
+  FRAMERGN: 72,
+  INVERTRGN: 73,
+  PAINTRGN: 74,
+  EXTSELECTCLIPRGN: 75,
+  STRETCHBLT: 77,
+  MASKBLT: 78,
+  PLGBLT: 79,
+  SETDIBITSTODEVICE: 80,
+  ALPHABLEND: 114,
+  TRANSPARENTBLT: 116,
+  GRADIENTFILL: 118,
 } as const;
+
+/** Names of drawing records this player cannot draw ([MS-EMF] 2.1.1), used to
+ *  report — never silently drop — content that a playback leaves out. */
+const UNSUPPORTED_DRAWING: Readonly<Record<number, string>> = {
+  [EMR.POLYDRAW]: 'EMR_POLYDRAW',
+  [EMR.POLYDRAW16]: 'EMR_POLYDRAW16',
+  [EMR.EXTTEXTOUTA]: 'EMR_EXTTEXTOUTA',
+  [EMR.POLYTEXTOUTA]: 'EMR_POLYTEXTOUTA',
+  [EMR.POLYTEXTOUTW]: 'EMR_POLYTEXTOUTW',
+  [EMR.SMALLTEXTOUT]: 'EMR_SMALLTEXTOUT',
+  [EMR.SETPIXELV]: 'EMR_SETPIXELV',
+  [EMR.EXTFLOODFILL]: 'EMR_EXTFLOODFILL',
+  [EMR.FILLRGN]: 'EMR_FILLRGN',
+  [EMR.FRAMERGN]: 'EMR_FRAMERGN',
+  [EMR.INVERTRGN]: 'EMR_INVERTRGN',
+  [EMR.PAINTRGN]: 'EMR_PAINTRGN',
+  [EMR.STRETCHBLT]: 'EMR_STRETCHBLT',
+  [EMR.MASKBLT]: 'EMR_MASKBLT',
+  [EMR.PLGBLT]: 'EMR_PLGBLT',
+  [EMR.SETDIBITSTODEVICE]: 'EMR_SETDIBITSTODEVICE',
+  [EMR.ALPHABLEND]: 'EMR_ALPHABLEND',
+  [EMR.TRANSPARENTBLT]: 'EMR_TRANSPARENTBLT',
+  [EMR.GRADIENTFILL]: 'EMR_GRADIENTFILL',
+};
+
+// ArcDirection enumeration ([MS-EMF] 2.1.2).
+const AD_COUNTERCLOCKWISE = 1;
+const AD_CLOCKWISE = 2;
+
+// RegionMode enumeration ([MS-EMF] 2.1.29).
+const RGN_AND = 1;
+const RGN_DIFF = 4;
+const RGN_COPY = 5;
 
 // Stock object handle ids ([MS-EMF] 2.1.31 StockObject) — high bit 0x80000000
 // set in a SELECTOBJECT handle.
@@ -164,6 +251,7 @@ interface Brush {
 }
 interface Font {
   kind: 'font';
+  charset: number; // LOGFONT CharSet; SYMBOL_CHARSET uses a private font encoding
   height: number; // |lfHeight|, logical units
   weight: number; // lfWeight (400 normal, 700 bold)
   italic: boolean;
@@ -209,7 +297,7 @@ class EmfCursor {
   private p: number;
   constructor(
     private readonly dv: DataView,
-    start: number,
+    private readonly start: number,
     private readonly end: number, // exclusive
   ) {
     this.p = start;
@@ -218,27 +306,44 @@ class EmfCursor {
     return this.p;
   }
   set pos(v: number) {
+    if (!Number.isInteger(v) || v < this.start || v > this.end) throw new RangeError('Invalid EMF cursor position');
     this.p = v;
   }
   get remaining(): number {
     return this.end - this.p;
   }
+  private require(size: number): void {
+    // MS-EMF 2.3: every field belongs to this record, even when the backing
+    // DataView also contains the next record. Truncation is content damage,
+    // never evidence of geometry that would cross a resource ceiling.
+    if (!Number.isInteger(size) || size < 0 || this.remaining < size) throw new RangeError('Truncated EMF record');
+  }
+  u16(): number {
+    this.require(2);
+    const v = this.dv.getUint16(this.p, true);
+    this.p += 2;
+    return v;
+  }
   i16(): number {
+    this.require(2);
     const v = this.dv.getInt16(this.p, true);
     this.p += 2;
     return v;
   }
   i32(): number {
+    this.require(4);
     const v = this.dv.getInt32(this.p, true);
     this.p += 4;
     return v;
   }
   u32(): number {
+    this.require(4);
     const v = this.dv.getUint32(this.p, true);
     this.p += 4;
     return v;
   }
   f32(): number {
+    this.require(4);
     const v = this.dv.getFloat32(this.p, true);
     this.p += 4;
     return v;
@@ -255,6 +360,7 @@ class EmfCursor {
     };
   }
   skip(n: number): void {
+    this.require(n);
     this.p += n;
   }
 }
@@ -302,10 +408,25 @@ interface PlayState {
   curY: number;
   stack: SavedDc[]; // SAVEDC/RESTOREDC graphics-state stack
   drew: boolean;
-  inPath: boolean; // between BEGINPATH and ENDPATH — geometry builds a path, no draw
-  pathCommandCount: number;
+  // The device context's path ([MS-EMF] 2.3.10), kept apart from the Canvas
+  // current path that ordinary drawing records use (see EmfPath).
+  path: EmfPath;
+  inPath: boolean; // between BEGINPATH and ENDPATH — geometry builds `path`, no draw
+  // A bracket closed by ENDPATH whose path no FILLPATH, STROKEPATH,
+  // STROKEANDFILLPATH, SELECTCLIPPATH or ABORTPATH has consumed yet.
+  pathHeld: boolean;
   pathDiscarded: boolean;
+  // Path commands held by every live PathBuffer: the current path's and the
+  // prefixes SAVEDC snapshots still reach, each buffer counted once.
+  pathRetained: number;
   maxPathCommands: number;
+  arcDirection: number; // EMR_SETARCDIRECTION ArcDirection; default AD_COUNTERCLOCKWISE
+  // Clipping state. Each DC level owns exactly one outstanding canvas save
+  // (the playback base or the SAVEDC save), so a clip reset at the current
+  // level is a restore+save — exact only when no outer level is clipped.
+  clipped: boolean; // any clip active at the current level (incl. inherited)
+  outerClipped: boolean; // a clip inherited from an enclosing level
+  unsupported: Set<string>; // records that drew nothing although they draw content
 }
 
 /**
@@ -313,6 +434,11 @@ interface PlayState {
  * every previously admitted single geometry record: POLYPOLYGON may contain up
  * to 0x200000 points in at most 0x10000 closed sub-paths. The cumulative bound
  * prevents many individually valid records from multiplying that retained work.
+ *
+ * The same bound covers everything the device context retains, not only the
+ * open bracket: the current path plus every prefix a SAVEDC snapshot keeps
+ * (see PathBuffer). Repeated SAVEDC therefore cannot hold more path data than
+ * one maximal path, which is what the playback kept before paths were saved.
  */
 const MAX_EMF_PATH_COMMANDS = 0x200000 + 0x10000;
 
@@ -321,17 +447,148 @@ interface EmfReplayLimits {
   maxPathCommands?: number;
 }
 
+/**
+ * The path of the playback device context ([MS-EMF] 2.3.10 path bracket
+ * records; GDI path semantics as exercised by Wine's gdi32 path tests).
+ *
+ * GDI keeps one path per device context, separate from ordinary drawing:
+ *   - BEGINPATH discards any previous path and opens a new one; drawing
+ *     records until ENDPATH add figures to it instead of painting.
+ *   - ENDPATH closes the bracket; the path is then held in the DC. Drawing
+ *     records outside a bracket paint immediately and never touch it.
+ *   - FILLPATH, STROKEPATH, STROKEANDFILLPATH and SELECTCLIPPATH consume the
+ *     held path; FLATTENPATH and WIDENPATH transform it and keep it held.
+ *     All of them fail, leaving the path as it is, while the bracket is still
+ *     open or when no path is held. ABORTPATH discards an open or held path.
+ *   - SAVEDC saves the path with the rest of the DC state and RESTOREDC
+ *     brings it back, including whether the bracket was open ([MS-EMF] 2.3.11
+ *     state records EMR_SAVEDC / EMR_RESTOREDC restore the saved DC).
+ *
+ * Canvas has a single current path, which ordinary drawing resets, and
+ * save()/restore() do not preserve it (HTML Canvas 2D). The DC path is
+ * therefore recorded here in target pixels and traced onto the context only
+ * by the record that consumes it.
+ *
+ * The commands live in a PathBuffer that SAVEDC snapshots share instead of
+ * copying (see PathBuffer for how unreachable data is released).
+ */
+class EmfPath implements Sink {
+  buf: PathBuffer = newPathBuffer();
+  moveTo(x: number, y: number): void {
+    this.buf.ops.push(PATH_MOVE, x, y);
+  }
+  lineTo(x: number, y: number): void {
+    this.buf.ops.push(PATH_LINE, x, y);
+  }
+  bezierCurveTo(x1: number, y1: number, x2: number, y2: number, x: number, y: number): void {
+    this.buf.ops.push(PATH_CUBIC, x1, y1, x2, y2, x, y);
+  }
+  closePath(): void {
+    this.buf.ops.push(PATH_CLOSE);
+  }
+}
+
+/**
+ * Recorded path commands shared by the current path and SAVEDC snapshots.
+ *
+ * A buffer is only appended to while it is the current path. SAVEDC records
+ * the buffer's extent in `saved` (and in its SavedDc) rather than copying it;
+ * extents on one buffer are pushed in order and never decrease, so the last
+ * one is the longest prefix any snapshot reaches. When the current path
+ * leaves a buffer (a record discards the path, or RESTOREDC selects another
+ * one) or a snapshot is popped, the buffer is cut back to that last extent,
+ * or emptied when no snapshot is left, so no snapshot keeps the tail appended
+ * after it was taken. `commands` counts the budgeted commands the buffer
+ * holds and is charged to PlayState.pathRetained.
+ */
+interface PathBuffer {
+  ops: number[];
+  commands: number;
+  saved: { length: number; commands: number }[];
+}
+
+function newPathBuffer(): PathBuffer {
+  return { ops: [], commands: 0, saved: [] };
+}
+
+/** Cut a buffer that is no longer the current path back to what its
+ *  remaining snapshots reach. Idempotent. */
+function releasePathBuffer(s: PlayState, buf: PathBuffer): void {
+  const keep = buf.saved[buf.saved.length - 1] ?? { length: 0, commands: 0 };
+  if (buf.ops.length <= keep.length && buf.commands <= keep.commands) return;
+  s.pathRetained -= buf.commands - keep.commands;
+  buf.commands = keep.commands;
+  // Shrinking the length lets the engine trim the backing store.
+  buf.ops.length = keep.length;
+}
+const PATH_MOVE = 0;
+const PATH_LINE = 1;
+const PATH_CUBIC = 2;
+const PATH_CLOSE = 3;
+
+/** Trace recorded path commands onto a fresh Canvas current path. */
+function tracePath(ctx: AnyCtx, ops: readonly number[]): void {
+  ctx.beginPath();
+  for (let i = 0; i < ops.length;) {
+    switch (ops[i]) {
+      case PATH_MOVE:
+        ctx.moveTo(ops[i + 1], ops[i + 2]);
+        i += 3;
+        break;
+      case PATH_LINE:
+        ctx.lineTo(ops[i + 1], ops[i + 2]);
+        i += 3;
+        break;
+      case PATH_CUBIC:
+        ctx.bezierCurveTo(ops[i + 1], ops[i + 2], ops[i + 3], ops[i + 4], ops[i + 5], ops[i + 6]);
+        i += 7;
+        break;
+      default:
+        ctx.closePath();
+        i += 1;
+    }
+  }
+}
+
+/** Where a geometry record's figure goes: the DC path inside a bracket,
+ *  otherwise the Canvas current path it paints at once. */
+function geometrySink(s: PlayState): Sink {
+  return s.inPath ? s.path : s.ctx;
+}
+
+/** Give the current path a fresh, empty buffer and release the old one. */
+function replacePathBuffer(s: PlayState): void {
+  const old = s.path.buf;
+  s.path.buf = newPathBuffer();
+  releasePathBuffer(s, old);
+}
+
+/** Drop the DC path (open or held) and start from an empty one. */
+function discardPath(s: PlayState): void {
+  replacePathBuffer(s);
+  s.inPath = false;
+  s.pathHeld = false;
+  s.pathDiscarded = false;
+}
+
+/** Charge `additional` commands to the open bracket before they are recorded.
+ *  Past MAX_EMF_PATH_COMMANDS for everything the DC retains, the bracket is
+ *  rejected. This is a resource ceiling, independent of the caller's
+ *  incomplete-metafile compatibility policy. */
 function reservePathCommands(s: PlayState, additional: number): boolean {
   if (!s.inPath) return true;
   if (s.pathDiscarded) return false;
-  const next = s.pathCommandCount + additional;
+  const next = s.pathRetained + additional;
   if (!Number.isSafeInteger(next) || additional < 0 || next > s.maxPathCommands) {
-    // Never leave a paintable prefix of an over-budget attacker-controlled path.
-    s.ctx.beginPath();
+    replacePathBuffer(s);
     s.pathDiscarded = true;
-    return false;
+    throw new OoxmlDecodedImageLimitError(
+      'metafile-path-commands', s.maxPathCommands,
+      Number.isSafeInteger(next) && next > s.maxPathCommands ? next : Number.MAX_SAFE_INTEGER,
+    );
   }
-  s.pathCommandCount = next;
+  s.pathRetained = next;
+  s.path.buf.commands += additional;
   return true;
 }
 
@@ -361,6 +618,17 @@ interface SavedDc {
   fillRule: CanvasFillRule;
   curX: number;
   curY: number;
+  arcDirection: number;
+  clipped: boolean;
+  outerClipped: boolean;
+  // The DC path (see PathBuffer): the shared buffer and its extent at
+  // SAVEDC, and the bracket state that goes with it.
+  pathBuf: PathBuffer;
+  pathLength: number;
+  pathCommands: number;
+  inPath: boolean;
+  pathHeld: boolean;
+  pathDiscarded: boolean;
 }
 
 // ── coordinate pipeline ─────────────────────────────────────────────────────
@@ -607,29 +875,47 @@ type PointReader = (c: EmfCursor) => [number, number];
 const readPoint16: PointReader = (c) => [c.i16(), c.i16()];
 const readPoint32: PointReader = (c) => [c.i32(), c.i32()];
 
+// Existing per-record work/allocation ceilings are library policy, not MS-EMF
+// count restrictions. An oversized declaration is only proof when its complete
+// payload is present; otherwise keep the old malformed-record fallback.
+const MAX_EMF_RECORD_POINTS = 0x100000;
+const MAX_EMF_POLYPOLY_POINTS = 0x200000;
+const MAX_EMF_RECORD_POLYGONS = 0x10000;
+const MAX_EMF_REGION_RECTANGLES = 0x10000;
+const MAX_EMF_TEXT_UNITS = 0x10000;
+
+function admitRecordPoints(c: EmfCursor, count: number, rp: PointReader): boolean {
+  if (count <= MAX_EMF_RECORD_POINTS) return true;
+  if (readablePointCount(c, count, rp) !== count) return false;
+  throw new OoxmlDecodedImageLimitError('metafile-record-points', MAX_EMF_RECORD_POINTS, count);
+}
+
 // ── poly drawing ────────────────────────────────────────────────────────────
 
 /** EMR_POLYLINE(16): open path stroked with the current pen. */
 function strokePolyline(s: PlayState, c: EmfCursor, rp: PointReader): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16); // RECTL rclBounds — drawing uses world transform, not bounds
   const count = c.u32();
-  if (count < 2 || count > 0x100000) return;
+  if (count < 2) return;
+  if (!admitRecordPoints(c, count, rp)) return;
   if (!s.inPath && (!s.curPen || s.curPen.stroke == null)) {
-    // still drop current position to the last point for ...TO continuity callers
+    // No geometry to paint. Per-record admission still precedes this no-op:
+    // a fully supplied oversized record must not depend on selected DC state.
     return;
   }
   const { ctx } = s;
+  const sink = geometrySink(s);
   const appendPath = reservePathCommands(s, readablePointCount(c, count, rp));
   if (!s.inPath) ctx.beginPath();
   let lx = 0;
   let ly = 0;
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     const [xl, yl] = rp(c);
     const [px, py] = toPx(s, xl, yl);
     if (appendPath) {
-      if (i === 0) ctx.moveTo(px, py);
-      else ctx.lineTo(px, py);
+      if (i === 0) sink.moveTo(px, py);
+      else sink.lineTo(px, py);
     }
     lx = xl;
     ly = yl;
@@ -647,9 +933,10 @@ function strokePolyline(s: PlayState, c: EmfCursor, rp: PointReader): void {
 /** EMR_POLYLINETO(16): like POLYLINE but the implicit first point is the
  *  current position; updates current position. */
 function strokePolylineTo(s: PlayState, c: EmfCursor, rp: PointReader): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16);
   const count = c.u32();
-  if (count < 1 || count > 0x100000) return;
+  if (count < 1 || !admitRecordPoints(c, count, rp)) return;
   const { ctx } = s;
   const draw = s.inPath || (s.curPen != null && s.curPen.stroke != null);
   const appendPath = !s.inPath || reservePathCommands(s, readablePointCount(c, count, rp));
@@ -660,12 +947,11 @@ function strokePolylineTo(s: PlayState, c: EmfCursor, rp: PointReader): void {
       ctx.moveTo(px0, py0);
     }
   }
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     const [xl, yl] = rp(c);
     if (draw && appendPath) {
       const [px, py] = toPx(s, xl, yl);
-      ctx.lineTo(px, py);
+      geometrySink(s).lineTo(px, py);
     }
     s.curX = xl;
     s.curY = yl;
@@ -680,24 +966,27 @@ function strokePolylineTo(s: PlayState, c: EmfCursor, rp: PointReader): void {
 
 /** EMR_POLYGON(16): closed path filled (brush) + stroked (pen). */
 function fillStrokePolygon(s: PlayState, c: EmfCursor, rp: PointReader): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16);
   const count = c.u32();
-  if (count < 2 || count > 0x100000) return;
+  if (count < 2 || !admitRecordPoints(c, count, rp)) return;
   const { ctx } = s;
-  const appendPath = reservePathCommands(s, readablePointCount(c, count, rp) + 1);
+  const sink = geometrySink(s);
+  const readableCount = readablePointCount(c, count, rp);
+  // No first point means no figure and no closePath command to retain.
+  const appendPath = reservePathCommands(s, readableCount > 0 ? readableCount + 1 : 0);
   if (!s.inPath) ctx.beginPath();
   let started = false;
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     const [xl, yl] = rp(c);
     const [px, py] = toPx(s, xl, yl);
     if (!started) {
-      if (appendPath) ctx.moveTo(px, py);
+      if (appendPath) sink.moveTo(px, py);
       started = true;
-    } else if (appendPath) ctx.lineTo(px, py);
+    } else if (appendPath) sink.lineTo(px, py);
   }
   if (!started) return;
-  if (appendPath) ctx.closePath();
+  if (appendPath) sink.closePath();
   if (s.inPath) return; // path bracket: defer fill/stroke
   if (s.curBrush && s.curBrush.fill != null) {
     ctx.fillStyle = s.curBrush.fill;
@@ -720,11 +1009,15 @@ function strokePolyBezier(
   rp: PointReader,
   isTo: boolean,
 ): void {
+  if (c.remaining < 20) return; // incomplete bounds/count header is malformed
   c.skip(16);
   const count = c.u32();
-  if (count < 1 || count > 0x100000) return;
+  if (count < 1 || !admitRecordPoints(c, count, rp)) return;
   const readableCount = readablePointCount(c, count, rp);
-  const appendPath = !s.inPath || reservePathCommands(s, readableCount);
+  const startPoints = isTo ? 0 : 1;
+  const commands = readableCount < startPoints + 3
+    ? 0 : startPoints + Math.floor((readableCount - startPoints) / 3);
+  const appendPath = !s.inPath || reservePathCommands(s, commands);
   if (s.inPath && !appendPath) {
     for (let i = 0; i < readableCount; i++) {
       const [xl, yl] = rp(c);
@@ -734,8 +1027,7 @@ function strokePolyBezier(
     return;
   }
   const pts: Array<[number, number]> = [];
-  for (let i = 0; i < count; i++) {
-    if (c.remaining < 4) break;
+  for (let i = 0, readable = readablePointCount(c, count, rp); i < readable; i++) {
     pts.push(rp(c));
   }
   if (pts.length < (isTo ? 3 : 4)) {
@@ -747,10 +1039,11 @@ function strokePolyBezier(
   }
   const draw = s.inPath || (s.curPen != null && s.curPen.stroke != null);
   const { ctx } = s;
+  const sink = geometrySink(s);
   if (draw) {
     if (!s.inPath) ctx.beginPath();
     const start = isTo ? toPx(s, s.curX, s.curY) : toPx(s, pts[0][0], pts[0][1]);
-    if (!isTo || !s.inPath) ctx.moveTo(start[0], start[1]);
+    if (!isTo || !s.inPath) sink.moveTo(start[0], start[1]);
   }
   let i = isTo ? 0 : 1;
   for (; i + 2 < pts.length + (isTo ? 1 : 0); i += 3) {
@@ -762,7 +1055,7 @@ function strokePolyBezier(
       const p1 = toPx(s, c1[0], c1[1]);
       const p2 = toPx(s, c2[0], c2[1]);
       const pe = toPx(s, end[0], end[1]);
-      ctx.bezierCurveTo(p1[0], p1[1], p2[0], p2[1], pe[0], pe[1]);
+      sink.bezierCurveTo(p1[0], p1[1], p2[0], p2[1], pe[0], pe[1]);
     }
     s.curX = end[0];
     s.curY = end[1];
@@ -784,43 +1077,67 @@ function fillStrokePolyPoly(
   rp: PointReader,
   isPolygon: boolean,
 ): void {
+  if (c.remaining < 24) return; // incomplete bounds/count header is malformed
   c.skip(16); // RECTL rclBounds
   const numPolys = c.u32();
   const totalPoints = c.u32();
-  if (numPolys <= 0 || numPolys > 0x10000) return;
-  if (totalPoints <= 0 || totalPoints > 0x200000) return;
-  const counts: number[] = [];
+  if (numPolys === 0 || numPolys > Math.floor(c.remaining / 4)) return;
+  const countsStart = c.pos;
   let countedPoints = 0;
   for (let i = 0; i < numPolys; i++) {
-    if (c.remaining < 4) return;
-    const count = c.u32();
-    countedPoints += count;
-    if (!Number.isSafeInteger(countedPoints) || countedPoints > 0x200000) return;
-    counts.push(count);
+    countedPoints += c.u32();
+    if (countedPoints > totalPoints) return; // inconsistent, with arithmetic bounded by u32 totals
   }
   if (countedPoints !== totalPoints) return;
+  const readableCount = readablePointCount(c, totalPoints, rp);
+  if (numPolys > MAX_EMF_RECORD_POLYGONS || totalPoints > MAX_EMF_POLYPOLY_POINTS) {
+    // Validate both count tables and actual payload before classifying a
+    // resource crossing; never allocate an oversized counts/points array.
+    if (readableCount !== totalPoints) return;
+    if (numPolys > MAX_EMF_RECORD_POLYGONS) {
+      throw new OoxmlDecodedImageLimitError('metafile-record-polygons', MAX_EMF_RECORD_POLYGONS, numPolys);
+    }
+    throw new OoxmlDecodedImageLimitError('metafile-record-points', MAX_EMF_POLYPOLY_POINTS, totalPoints);
+  }
+  // Empty sub-polygons paint nothing, but a complete count table still
+  // proves its polygon-count crossing. Do not let zero total points bypass
+  // admission; inconsistent or truncated tables already returned above.
+  if (totalPoints === 0) return;
+  const pointsStart = c.pos;
+  c.pos = countsStart;
+  const counts: number[] = [];
+  let remainingPoints = readableCount;
+  let commands = 0;
+  for (let i = 0; i < numPolys; i++) {
+    const count = c.u32();
+    const readable = Math.min(count, remainingPoints);
+    remainingPoints -= readable;
+    counts.push(count);
+    // Counts below two are skipped. A truncated nonempty polygon retains its
+    // readable prefix and closing command, but an empty one appends nothing.
+    if (count >= 2 && readable > 0) commands += readable + (isPolygon ? 1 : 0);
+  }
+  c.pos = pointsStart;
   const { ctx } = s;
-  const appendPath = reservePathCommands(
-    s,
-    readablePointCount(c, totalPoints, rp) + (isPolygon ? numPolys : 0),
-  );
-  if (!s.inPath) ctx.beginPath(); // in a path bracket: accumulate, don't reset
+  const appendPath = reservePathCommands(s, commands);
+  const sink = geometrySink(s);
+  if (!s.inPath) ctx.beginPath(); // in a path bracket: accumulate in the DC path
   let any = false;
   for (const cnt of counts) {
-    if (cnt < 2) {
-      for (let i = 0; i < cnt && c.remaining >= 4; i++) rp(c);
+    const readable = readablePointCount(c, cnt, rp);
+    if (cnt < 2 || readable === 0) {
+      for (let i = 0; i < readable; i++) rp(c);
       continue;
     }
-    for (let i = 0; i < cnt; i++) {
-      if (c.remaining < 4) break;
+    for (let i = 0; i < readable; i++) {
       const [xl, yl] = rp(c);
       if (appendPath) {
         const [px, py] = toPx(s, xl, yl);
-        if (i === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
+        if (i === 0) sink.moveTo(px, py);
+        else sink.lineTo(px, py);
       }
     }
-    if (isPolygon && appendPath) ctx.closePath();
+    if (isPolygon && appendPath) sink.closePath();
     any = true;
   }
   if (!any || s.inPath) return; // path bracket: geometry added, defer fill/stroke
@@ -844,14 +1161,15 @@ function fillStrokeRect(s: PlayState, l: number, t: number, r: number, b: number
   const c1 = toPx(s, r, t);
   const c2 = toPx(s, r, b);
   const c3 = toPx(s, l, b);
+  const sink = geometrySink(s);
   const appendPath = reservePathCommands(s, 5);
   if (!s.inPath) ctx.beginPath();
   if (appendPath) {
-    ctx.moveTo(c0[0], c0[1]);
-    ctx.lineTo(c1[0], c1[1]);
-    ctx.lineTo(c2[0], c2[1]);
-    ctx.lineTo(c3[0], c3[1]);
-    ctx.closePath();
+    sink.moveTo(c0[0], c0[1]);
+    sink.lineTo(c1[0], c1[1]);
+    sink.lineTo(c2[0], c2[1]);
+    sink.lineTo(c3[0], c3[1]);
+    sink.closePath();
   }
   if (s.inPath) return; // path bracket: defer fill/stroke
   if (s.curBrush && s.curBrush.fill != null) {
@@ -867,24 +1185,433 @@ function fillStrokeRect(s: PlayState, l: number, t: number, r: number, b: number
   }
 }
 
-/** Consume the current path with the selected brush and/or pen ([MS-EMF] 2.3.10). */
+/** EMR_FILLPATH / STROKEPATH / STROKEANDFILLPATH: consume the held DC path
+ *  with the selected brush and/or pen ([MS-EMF] 2.3.10). Without a held path
+ *  (none, or a bracket still open) GDI fails and the path stays as it is. */
 function paintSelectedPath(s: PlayState, fill: boolean, stroke: boolean): void {
-  if (!s.pathDiscarded && fill && s.curBrush?.fill != null) {
-    s.ctx.fillStyle = s.curBrush.fill;
-    s.ctx.fill(s.fillRule);
+  if (!s.pathHeld) return;
+  const paint = !s.pathDiscarded;
+  const ops = s.path.buf.ops;
+  // Trace before the path is discarded: releasing its buffer may cut it.
+  if (paint) tracePath(s.ctx, ops);
+  discardPath(s);
+  if (!paint) return;
+  const { ctx } = s;
+  if (fill && s.curBrush?.fill != null) {
+    ctx.fillStyle = s.curBrush.fill;
+    ctx.fill(s.fillRule);
     s.drew = true;
   }
-  if (!s.pathDiscarded && stroke && s.curPen?.stroke != null) {
-    s.ctx.strokeStyle = s.curPen.stroke;
-    s.ctx.lineWidth = deviceLineWidth(s, s.curPen.width);
-    s.ctx.stroke();
+  if (stroke && s.curPen?.stroke != null) {
+    ctx.strokeStyle = s.curPen.stroke;
+    ctx.lineWidth = deviceLineWidth(s, s.curPen.width);
+    ctx.stroke();
     s.drew = true;
   }
-  // EMR_FILLPATH / STROKEPATH / STROKEANDFILLPATH close the path bracket.
-  // Clear Canvas's persistent current path so later records cannot repaint it.
+  ctx.beginPath();
+}
+
+// ── elliptical arcs, pies, chords and rounded rectangles ([MS-EMF] 2.3.5) ─────
+//
+// Geometry is built as cubic Bézier segments in LOGICAL space and mapped point
+// by point through `toPx`. Every stage of that mapping is affine, so the curves
+// stay exact under world transforms, anisotropic window/viewport scaling and
+// rotation (a Canvas `ellipse` call would stay axis-aligned).
+//
+// Drawing direction (Win32 GDI `SetArcDirection` / `SetGraphicsMode`): the
+// default direction is counterclockwise. In GM_COMPATIBLE it applies in device
+// space, in GM_ADVANCED in logical space; the two agree unless the logical →
+// device mapping reflects an axis. The EMF records do not say which mode the
+// recording DC used, so a reflected mapping is reported unsupported rather than
+// guessed. "Counterclockwise" is visual on a y-down surface, i.e. a DECREASING
+// parametric angle measured with y pointing down.
+
+type LPoint = readonly [number, number];
+interface ArcGeometry {
+  start: LPoint;
+  curves: Array<readonly [LPoint, LPoint, LPoint]>;
+  end: LPoint;
+}
+
+/** Elliptical arc from parametric angle `theta0` over `sweep` radians, as at
+ *  most-90° cubic segments (the standard 4/3·tan(Δ/4) handle length). */
+function ellipseArc(
+  cx: number,
+  cy: number,
+  rx: number,
+  ry: number,
+  theta0: number,
+  sweep: number,
+): ArcGeometry {
+  const n = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 2) - 1e-9));
+  const d = sweep / n;
+  const k = (4 / 3) * Math.tan(d / 4);
+  const at = (a: number): LPoint => [cx + rx * Math.cos(a), cy + ry * Math.sin(a)];
+  const curves: Array<readonly [LPoint, LPoint, LPoint]> = [];
+  for (let i = 0; i < n; i++) {
+    const a0 = theta0 + i * d;
+    const a1 = a0 + d;
+    const [x0, y0] = at(a0);
+    const [x1, y1] = at(a1);
+    curves.push([
+      [x0 - k * rx * Math.sin(a0), y0 + k * ry * Math.cos(a0)],
+      [x1 + k * rx * Math.sin(a1), y1 - k * ry * Math.cos(a1)],
+      [x1, y1],
+    ]);
+  }
+  return { start: at(theta0), curves, end: at(theta0 + sweep) };
+}
+
+/** Signed sweep from `a0` to `a1` in the current drawing direction; equal
+ *  radials give a complete ellipse (Win32 `Arc` remarks). */
+function directedSweep(a0: number, a1: number, direction: number): number {
+  let sweep = a1 - a0;
+  if (direction === AD_CLOCKWISE) {
+    while (sweep <= 0) sweep += 2 * Math.PI;
+    while (sweep > 2 * Math.PI) sweep -= 2 * Math.PI;
+  } else {
+    while (sweep >= 0) sweep -= 2 * Math.PI;
+    while (sweep < -2 * Math.PI) sweep += 2 * Math.PI;
+  }
+  return sweep;
+}
+
+/** The arc of the ellipse inscribed in `box` between the radials from its
+ *  centre to `p0` and `p1` (Win32 `Arc`/`Chord`/`Pie`). Null for an empty box. */
+function radialArc(
+  box: readonly [number, number, number, number],
+  p0: LPoint,
+  p1: LPoint,
+  direction: number,
+): (ArcGeometry & { center: LPoint }) | null {
+  const [l, t, r, b] = box;
+  const rx = Math.abs(r - l) / 2;
+  const ry = Math.abs(b - t) / 2;
+  if (rx === 0 || ry === 0) return null;
+  const cx = (l + r) / 2;
+  const cy = (t + b) / 2;
+  // The radial through p meets the ellipse at parametric angle
+  // atan2((py−cy)/ry, (px−cx)/rx).
+  const a0 = Math.atan2((p0[1] - cy) / ry, (p0[0] - cx) / rx);
+  const a1 = Math.atan2((p1[1] - cy) / ry, (p1[0] - cx) / rx);
+  return { ...ellipseArc(cx, cy, rx, ry, a0, directedSweep(a0, a1, direction)), center: [cx, cy] };
+}
+
+/** True when the logical → target mapping reflects an axis (negative
+ *  determinant), where the arc drawing direction depends on the recording
+ *  graphics mode. */
+function mappingReflects(s: PlayState): boolean {
+  const [ox, oy] = toPx(s, 0, 0);
+  const [xx, xy] = toPx(s, 1, 0);
+  const [yx, yy] = toPx(s, 0, 1);
+  return (xx - ox) * (yy - oy) - (xy - oy) * (yx - ox) < 0;
+}
+
+type Sink = Pick<CanvasRenderingContext2D, 'moveTo' | 'lineTo' | 'bezierCurveTo' | 'closePath'>;
+
+function emitCurves(s: PlayState, sink: Sink, geometry: ArcGeometry): void {
+  for (const [c1, c2, end] of geometry.curves) {
+    const p1 = toPx(s, c1[0], c1[1]);
+    const p2 = toPx(s, c2[0], c2[1]);
+    const pe = toPx(s, end[0], end[1]);
+    sink.bezierCurveTo(p1[0], p1[1], p2[0], p2[1], pe[0], pe[1]);
+  }
+}
+
+/** Paint the figure just built on the context: fill with the brush when
+ *  `filled`, then stroke with the pen. */
+function paintFigure(s: PlayState, filled: boolean): void {
+  const { ctx } = s;
+  if (filled && s.curBrush && s.curBrush.fill != null) {
+    ctx.fillStyle = s.curBrush.fill;
+    ctx.fill(s.fillRule);
+    s.drew = true;
+  }
+  if (s.curPen && s.curPen.stroke != null) {
+    ctx.strokeStyle = s.curPen.stroke;
+    ctx.lineWidth = deviceLineWidth(s, s.curPen.width);
+    ctx.stroke();
+    s.drew = true;
+  }
+}
+
+/** Record a drawing record this playback leaves out. The picture's report
+ *  carries it (see {@link EmfRasterResult}); the rest of the picture, including
+ *  the open path bracket's other figures, plays exactly as it did before the
+ *  record was recognized, so a compatibility caller keeps its previous output
+ *  and a strict caller rejects the picture on the report. */
+function unsupportedDrawing(s: PlayState, name: string): void {
+  s.unsupported.add(name);
+}
+
+type ArcKind = 'arc' | 'arcTo' | 'chord' | 'pie';
+
+/** EMR_ARC(45) / EMR_ARCTO(55) / EMR_CHORD(46) / EMR_PIE(47): RECTL rclBox,
+ *  POINTL ptlStart, POINTL ptlEnd ([MS-EMF] drawing records; Win32 `Arc`,
+ *  `ArcTo`, `Chord`, `Pie`).
+ *  Arc is stroked and leaves the current position alone; ArcTo first draws a
+ *  line from the current position and moves it to the arc end; Chord closes
+ *  the arc with a chord and Pie with two radials, both filled and stroked. */
+function drawRadialArc(s: PlayState, c: EmfCursor, kind: ArcKind, name: string): void {
+  const box = [c.i32(), c.i32(), c.i32(), c.i32()] as const;
+  const p0: LPoint = [c.i32(), c.i32()];
+  const p1: LPoint = [c.i32(), c.i32()];
+  if (mappingReflects(s)) {
+    unsupportedDrawing(s, `${name} (reflected mapping)`);
+    return;
+  }
+  const geometry = radialArc(box, p0, p1, s.arcDirection);
+  if (!geometry) return; // an empty bounding box has no curve
+  // Inside a path bracket the geometry is appended to the DC path
+  // under the bracket's command budget. MS-EMF 2.3.5.2–4 / 2.3.5.15:
+  // ARC/ARCTO append one move/line, CHORD also closes, PIE also has a radial.
+  const extra = kind === 'pie' ? 3 : kind === 'chord' ? 2 : 1;
+  if (!reservePathCommands(s, geometry.curves.length + extra)) return;
+  const { ctx } = s;
+  const sink = geometrySink(s);
+  const start = toPx(s, geometry.start[0], geometry.start[1]);
+  if (!s.inPath) ctx.beginPath();
+  if (kind === 'arcTo') {
+    // In a path bracket a TO record continues the open figure, as the other
+    // ...TO records do; outside one it starts at the current position.
+    if (!s.inPath) ctx.moveTo(...toPx(s, s.curX, s.curY));
+    sink.lineTo(start[0], start[1]);
+  } else if (kind === 'pie') {
+    sink.moveTo(...toPx(s, geometry.center[0], geometry.center[1]));
+    sink.lineTo(start[0], start[1]);
+  } else {
+    sink.moveTo(start[0], start[1]);
+  }
+  emitCurves(s, sink, geometry);
+  if (kind === 'chord' || kind === 'pie') sink.closePath();
+  if (kind === 'arcTo') {
+    s.curX = geometry.end[0];
+    s.curY = geometry.end[1];
+  }
+  if (!s.inPath) paintFigure(s, kind === 'chord' || kind === 'pie');
+}
+
+/** EMR_ANGLEARC(41): POINTL ptlCenter, u32 nRadius, f32 eStartAngle,
+ *  f32 eSweepAngle ([MS-EMF] drawing record). Win32 `AngleArc`: a line from the
+ *  current position to the arc start, then a circular arc measured
+ *  counterclockwise from the x-axis (independent of the arc direction); the
+ *  current position moves to the arc end. A sweep beyond 360° retraces the
+ *  circle, which adds no stroked pixels, so it is bounded to one turn. */
+function drawAngleArc(s: PlayState, c: EmfCursor): void {
+  const cx = c.i32();
+  const cy = c.i32();
+  const radius = c.u32();
+  const startDeg = c.f32();
+  const sweepDeg = c.f32();
+  if (!Number.isFinite(startDeg) || !Number.isFinite(sweepDeg)) return;
+  if (mappingReflects(s)) {
+    unsupportedDrawing(s, 'EMR_ANGLEARC (reflected mapping)');
+    return;
+  }
+  if (s.inPath && Math.abs(sweepDeg) > 360) {
+    // A retraced circle changes even-odd path fills; not modelled.
+    unsupportedDrawing(s, 'EMR_ANGLEARC (multiple sweeps in a path)');
+    return;
+  }
+  const sweep = Math.max(-360, Math.min(360, sweepDeg));
+  // Counterclockwise on a y-down surface = decreasing parametric angle.
+  const theta0 = (-startDeg * Math.PI) / 180;
+  const geometry = ellipseArc(cx, cy, radius, radius, theta0, (-sweep * Math.PI) / 180);
+  // Zero sweep appends only the connecting line; no cubic is emitted below.
+  if (!reservePathCommands(s, (sweep === 0 ? 0 : geometry.curves.length) + 1)) return;
+  const { ctx } = s;
+  const sink = geometrySink(s);
+  const start = toPx(s, geometry.start[0], geometry.start[1]);
+  if (!s.inPath) {
+    ctx.beginPath();
+    ctx.moveTo(...toPx(s, s.curX, s.curY));
+  }
+  sink.lineTo(start[0], start[1]);
+  if (sweep !== 0) emitCurves(s, sink, geometry);
+  s.curX = geometry.end[0];
+  s.curY = geometry.end[1];
+  if (!s.inPath) paintFigure(s, false);
+}
+
+/** EMR_ROUNDRECT(44): RECTL rclBox, SIZEL szlCorner ([MS-EMF] drawing record) — the
+ *  corner ellipse's width and height, clamped to the box (Win32 `RoundRect`).
+ *  The outline follows the arc direction like `Rectangle`. */
+function drawRoundRect(s: PlayState, c: EmfCursor): void {
+  const l0 = c.i32();
+  const t0 = c.i32();
+  const r0 = c.i32();
+  const b0 = c.i32();
+  const cw = c.i32();
+  const ch = c.i32();
+  if (mappingReflects(s)) {
+    unsupportedDrawing(s, 'EMR_ROUNDRECT (reflected mapping)');
+    return;
+  }
+  const [l, r] = l0 <= r0 ? [l0, r0] : [r0, l0];
+  const [t, b] = t0 <= b0 ? [t0, b0] : [b0, t0];
+  const rx = Math.min(Math.abs(cw) / 2, (r - l) / 2);
+  const ry = Math.min(Math.abs(ch) / 2, (b - t) / 2);
+  // Four joining moves/lines and a close; curves only for nonzero corners.
+  const curved = rx > 0 && ry > 0;
+  if (!reservePathCommands(s, curved ? 9 : 5)) return;
+  const { ctx } = s;
+  const sink = geometrySink(s);
+  if (!s.inPath) ctx.beginPath();
+  // Clockwise (increasing angle, y-down) corner order: top-right, bottom-right,
+  // bottom-left, top-left; counterclockwise walks the same corners backwards.
+  const clockwise = s.arcDirection === AD_CLOCKWISE;
+  const corners: Array<[number, number, number]> = [
+    [r - rx, t + ry, -Math.PI / 2],
+    [r - rx, b - ry, 0],
+    [l + rx, b - ry, Math.PI / 2],
+    [l + rx, t + ry, Math.PI],
+  ];
+  const order = clockwise ? corners : [...corners].reverse();
+  order.forEach(([cx, cy, a], i) => {
+    const arc = clockwise
+      ? ellipseArc(cx, cy, rx, ry, a, Math.PI / 2)
+      : ellipseArc(cx, cy, rx, ry, a + Math.PI / 2, -Math.PI / 2);
+    const start = toPx(s, arc.start[0], arc.start[1]);
+    if (i === 0) sink.moveTo(start[0], start[1]);
+    else sink.lineTo(start[0], start[1]);
+    if (curved) emitCurves(s, sink, arc);
+  });
+  sink.closePath();
+  if (!s.inPath) paintFigure(s, true);
+}
+
+/** Intersect (or, with `exclude`, subtract) a logical rectangle from the clip
+ *  region: EMR_INTERSECTCLIPRECT(30) / EMR_EXCLUDECLIPRECT(29), RECTL rclClip
+ *  ([MS-EMF] clipping records). Scoped by the enclosing SAVEDC/RESTOREDC. */
+function clipRect(s: PlayState, c: EmfCursor, exclude: boolean): void {
+  const l = c.i32();
+  const t = c.i32();
+  const r = c.i32();
+  const b = c.i32();
+  const corners = [toPx(s, l, t), toPx(s, r, t), toPx(s, r, b), toPx(s, l, b)];
+  clipWith(s, exclude ? 'evenodd' : 'nonzero', (sink) => {
+    if (exclude) outerFrame(sink);
+    sink.moveTo(...corners[0]);
+    for (const corner of corners.slice(1)) sink.lineTo(...corner);
+    sink.closePath();
+  });
+}
+
+/**
+ * Intersect the clip with the region `build` traces. A clipping record acts
+ * on the device context's clip region at once and never on the path
+ * ([MS-EMF] 2.3.2 clipping records; the path bracket of 2.3.10 collects only
+ * drawing records), so a clip change inside an open BEGINPATH … ENDPATH
+ * bracket must leave the bracket's figures intact for the FILLPATH,
+ * STROKEPATH or SELECTCLIPPATH that closes it, and applies to that later
+ * painting. The same holds after ENDPATH: the closed path stays selected in
+ * the device context until one of those records (or ABORTPATH) consumes it.
+ * The DC path lives in its own EmfPath, so the region is simply traced on the
+ * Canvas current path and clipped.
+ */
+function clipWith(
+  s: PlayState,
+  rule: CanvasFillRule,
+  build: (sink: Sink) => void,
+): void {
   s.ctx.beginPath();
-  s.pathCommandCount = 0;
-  s.pathDiscarded = false;
+  build(s.ctx);
+  applyClip(s, rule);
+}
+
+function applyClip(s: PlayState, rule: CanvasFillRule): void {
+  try {
+    s.ctx.clip(rule);
+    s.clipped = true;
+  } catch {
+    /* a ctx without clip() (some mocks): leave unclipped */
+  }
+}
+
+/** Reset the clip region to the default ([MS-EMF] RGN_COPY with no region).
+ *  Canvas can only drop a clip by restoring a save, which is exact at this DC
+ *  level only when no enclosing level is clipped. */
+function resetClip(s: PlayState, name: string): boolean {
+  if (!s.clipped) return true;
+  if (s.outerClipped) {
+    s.unsupported.add(`${name} (reset of an inherited clip)`);
+    return false;
+  }
+  s.ctx.restore();
+  s.ctx.save();
+  s.clipped = false;
+  return true;
+}
+
+/** EMR_EXTSELECTCLIPRGN(75): u32 RgnDataSize, u32 RegionMode, RegionData
+ *  ([MS-EMF] clipping record); region rectangles are in device units. RGN_COPY with no
+ *  data restores the default clip; AND, COPY and DIFF with rectangle data are
+ *  applied; OR and XOR are reported unsupported. */
+function extSelectClipRgn(s: PlayState, c: EmfCursor): void {
+  const size = c.u32();
+  const mode = c.u32();
+  const name = 'EMR_EXTSELECTCLIPRGN';
+  if (mode === RGN_COPY && size === 0) {
+    resetClip(s, name);
+    return;
+  }
+  // RegionDataHeader: dwSize (32), iType (1), nCount,
+  // nRgnSize, rclBounds; then nCount RECTL.
+  if (size < 32 || c.remaining < size) throw new RangeError('Truncated EMF region');
+  c.u32();
+  c.u32();
+  const count = c.u32();
+  c.u32();
+  c.skip(16);
+  if (count > Math.floor((size - 32) / 16)) throw new RangeError('Invalid EMF region');
+  // MS-EMF 2.2.24 / 2.3.2.2: Count rectangles must fit RgnDataSize.
+  // The ceiling is library policy, applied only after those bytes are proven
+  // present, before allocation or any clip/mode fallback can hide a crossing.
+  if (count > MAX_EMF_REGION_RECTANGLES) {
+    throw new OoxmlDecodedImageLimitError('metafile-record-rectangles', MAX_EMF_REGION_RECTANGLES, count);
+  }
+  if (mode !== RGN_AND && mode !== RGN_COPY && mode !== RGN_DIFF) {
+    s.unsupported.add(`${name} (mode ${mode})`);
+    return;
+  }
+  if (mode === RGN_COPY && !resetClip(s, name)) return;
+  const dev = (x: number, y: number): [number, number] => [
+    ((x - s.left) * s.W) / s.boundsW,
+    ((y - s.top) * s.H) / s.boundsH,
+  ];
+  const rects: Array<[number, number, number, number]> = [];
+  for (let i = 0; i < count; i++) rects.push([c.i32(), c.i32(), c.i32(), c.i32()]);
+  const rect = (sink: Sink, [l, t, r, b]: [number, number, number, number]) => {
+    sink.moveTo(...dev(l, t));
+    sink.lineTo(...dev(r, t));
+    sink.lineTo(...dev(r, b));
+    sink.lineTo(...dev(l, b));
+    sink.closePath();
+  };
+  if (mode === RGN_DIFF) {
+    // Subtract each rectangle on its own, so overlapping rectangles stay exact.
+    for (const r of rects) {
+      clipWith(s, 'evenodd', (sink) => {
+        outerFrame(sink);
+        rect(sink, r);
+      });
+    }
+    return;
+  }
+  // Same-orientation rectangles under non-zero winding form their union.
+  clipWith(s, 'nonzero', (sink) => {
+    for (const r of rects) rect(sink, r);
+  });
+}
+
+/** A frame far outside any target raster; with a rectangle under even-odd
+ *  winding it leaves everything except that rectangle. */
+function outerFrame(ctx: Sink): void {
+  ctx.moveTo(-1e7, -1e7);
+  ctx.lineTo(1e7, -1e7);
+  ctx.lineTo(1e7, 1e7);
+  ctx.lineTo(-1e7, 1e7);
+  ctx.closePath();
 }
 
 // ── object creators ──────────────────────────────────────────────────────────
@@ -924,6 +1651,18 @@ function readCreateBrush(c: EmfCursor): [number, Brush] {
   return [ih, { kind: 'brush', fill }];
 }
 
+function decodeRecordDib(
+  c: EmfCursor, dv: DataView, recStart: number,
+  offBmi: number, cbBmi: number, offBits: number, cbBits: number,
+): DecodedDib | null {
+  // MS-EMF 2.3.1 / 2.3.7 bitmap offsets address data after the fixed fields,
+  // inside this record. Reject invalid ranges before the shared decoder can
+  // interpret header fields as a bitmap or classify a resource crossing.
+  const headerSize = c.pos - recStart;
+  if (offBmi < headerSize || offBits < headerSize) return null;
+  return decodeDib(dv, recStart + offBmi, cbBmi, recStart + offBits, cbBits);
+}
+
 /**
  * EMR_CREATEMONOBRUSH(93) / EMR_CREATEDIBPATTERNBRUSHPT(94): u32 ihObject,
  * u32 iUsage, u32 offBmi, u32 cbBmi, u32 offBits, u32 cbBits, then a DIB.
@@ -941,9 +1680,10 @@ function readDibPatternBrush(c: EmfCursor, dv: DataView, recStart: number): [num
   const cbBits = c.u32();
   let fill = '#808080';
   try {
-    const dib = decodeDib(dv, recStart + offBmi, cbBmi, recStart + offBits, cbBits);
+    const dib = decodeRecordDib(c, dv, recStart, offBmi, cbBmi, offBits, cbBits);
     if (dib) fill = dibAverageColor(dib);
-  } catch {
+  } catch (error) {
+    if (isOoxmlDecodedImageLimitError(error)) throw error;
     /* keep mid-gray fallback */
   }
   return [ih, { kind: 'brush', fill }];
@@ -952,6 +1692,9 @@ function readDibPatternBrush(c: EmfCursor, dv: DataView, recStart: number): [num
 /** EMR_EXTCREATEFONTINDIRECTW(82): u32 ihObject + LOGFONT (lfHeight,…,lfFaceName
  *  UTF-16 at LOGFONT offset 28). */
 function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, Font] {
+  // The handle and complete LOGFONTW (92 bytes) belong to this record. A short
+  // record cannot borrow charset/face fields from the next drawing operation.
+  if (c.remaining < 96) throw new RangeError('Truncated EMF LOGFONTW');
   const ih = c.u32();
   const lfBase = recStart + 12; // ihObject (4) after the 8-byte record header
   const lfHeight = dv.getInt32(lfBase, true);
@@ -960,6 +1703,7 @@ function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, 
   const lfEscapement = dv.getInt32(lfBase + 8, true);
   const lfWeight = dv.getInt32(lfBase + 16, true);
   const lfItalic = dv.getUint8(lfBase + 20);
+  const charset = dv.getUint8(lfBase + 23);
   // lfFaceName: UTF-16, up to 32 code units, at LOGFONT offset 28.
   let face = '';
   for (let i = 0; i < 32; i++) {
@@ -973,6 +1717,7 @@ function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, 
     ih,
     {
       kind: 'font',
+      charset,
       height: Math.abs(lfHeight),
       weight: lfWeight,
       italic: lfItalic !== 0,
@@ -982,9 +1727,11 @@ function readCreateFont(c: EmfCursor, dv: DataView, recStart: number): [number, 
   ];
 }
 
-// ── text — EMR_EXTTEXTOUTW(84) ([MS-EMF] 2.3.5.2) ────────────────────────────
+// ── text — EMR_EXTTEXTOUTW(84) ([MS-EMF] 2.3.5.8) ────────────────────────────
 
 function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): void {
+  const recEnd = c.pos + c.remaining;
+  if (c.remaining < 48) throw new RangeError('Truncated EMF text record');
   c.skip(16); // RECTL rclBounds (record offset 8..24)
   c.u32(); // iGraphicsMode
   c.f32(); // exScale
@@ -994,8 +1741,23 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   const refY = c.i32();
   const nChars = c.u32();
   const offString = c.u32(); // BYTE offset from RECORD START to UTF-16 string
-  c.u32(); // fOptions
-  if (nChars <= 0 || nChars > 0x10000) return;
+  const options = c.u32(); // fOptions
+  // MS-EMF 2.2.5 / 2.1.11: ETO_NO_RECT omits the optional 16-byte rectangle,
+  // moving offDx and the minimum string offset earlier in the record.
+  const headerSize = options & 0x100 ? 60 : 76;
+  if (recStart + headerSize > recEnd) throw new RangeError('Truncated EMF text header');
+  if (nChars === 0) return;
+  // MS-EMF 2.2.5 offsets address data inside the containing record. Do not
+  // normalize a truncated string using unrelated bytes from following records.
+  if (offString < headerSize || recStart + offString + nChars * 2 > recEnd) {
+    throw new RangeError('Truncated EMF text string');
+  }
+  // MS-EMF 2.2.5 / 2.3.5.8 defines UTF-16LE units, not a 64K format
+  // maximum. Only a complete string proves this library work-limit crossing;
+  // malformed offsets and truncated strings retain content fallback above.
+  if (nChars > MAX_EMF_TEXT_UNITS) {
+    throw new OoxmlDecodedImageLimitError('metafile-record-text-units', MAX_EMF_TEXT_UNITS, nChars);
+  }
   // Read nChars UTF-16LE code units at recStart + offString.
   let str = '';
   for (let i = 0; i < nChars; i++) {
@@ -1006,6 +1768,23 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   if (str.length === 0) return;
 
   const font = s.curFont;
+  let symbolNormalized = false;
+  if (font?.charset === 2 && /[\uf000-\uf0ff]/.test(str)) {
+    // MS-EMF 2.3.5.8 carries UTF-16. Windows symbol-font cmap entries occupy
+    // F000..F0FF (OpenType cmap, Windows encoding 0): normalize those private
+    // entries only, never ordinary Unicode
+    // text under an ANSI font. Unmapped repertoires retain compatibility drawing
+    // with an explicit incompleteness report, enabling strict callers to refuse.
+    const normalized = options === 0 ? decodeMetafileSymbolText(str, font.face, true) : null;
+    if (normalized === null) unsupportedDrawing(s, 'EMR_EXTTEXTOUTW (unsupported symbol encoding)');
+    else { str = normalized; symbolNormalized = true; }
+    // This player still draws a whole string in one Canvas call. MS-EMF 2.2.5
+    // Dx advances can change multi-character positions even after the encoding
+    // is correct; preserve compatibility drawing but expose that remaining gap.
+    if (symbolNormalized && nChars > 1 && dv.getUint32(recStart + headerSize - 4, true) !== 0) {
+      unsupportedDrawing(s, 'EMR_EXTTEXTOUTW (symbol character advances)');
+    }
+  }
   // Font height is in logical units: world→page (worldScaleY), page→device
   // (|pageScaleY|, 1 under MM_TEXT), then device→target (deviceScaleY).
   const px =
@@ -1020,7 +1799,7 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   ctx.fillStyle = s.textColor;
   const weight = font && font.weight >= 700 ? 'bold ' : '';
   const italic = font?.italic ? 'italic ' : '';
-  ctx.font = `${italic}${weight}${px}px ${font?.face || 'sans-serif'}`;
+  ctx.font = `${italic}${weight}${px}px ${symbolNormalized ? 'serif' : font?.face || 'sans-serif'}`;
 
   // SETTEXTALIGN: low 2 bits horizontal. TA_LEFT(0), TA_RIGHT(2), TA_CENTER(6).
   const horiz = s.textAlign & 0x6;
@@ -1057,6 +1836,7 @@ function drawText(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
  *  toPx). Skips gracefully on unsupported DIBs or missing OffscreenCanvas. */
 function blitDib(
   s: PlayState,
+  c: EmfCursor,
   dv: DataView,
   recStart: number,
   offBmi: number,
@@ -1068,9 +1848,12 @@ function blitDib(
   destR: number,
   destB: number,
 ): void {
-  if (cbBmi === 0 || cbBits === 0) return; // pattern-only blt → skip
-  const dib = decodeDib(dv, recStart + offBmi, cbBmi, recStart + offBits, cbBits);
-  if (!dib) return;
+  if (cbBmi === 0 || cbBits === 0) return; // no source bitmap (see doBitBlt)
+  const dib = decodeRecordDib(c, dv, recStart, offBmi, cbBmi, offBits, cbBits);
+  if (!dib) {
+    s.unsupported.add('EMF bitmap (DIB encoding)');
+    return;
+  }
   const [x0, y0] = toPx(s, destL, destT);
   const [x1, y1] = toPx(s, destR, destB);
   if (blitDibToCtx(s.ctx, dib, x0, y0, x1, y1)) s.drew = true;
@@ -1083,7 +1866,7 @@ function doBitBlt(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   const yDest = c.i32();
   const cxDest = c.i32();
   const cyDest = c.i32();
-  c.u32(); // bitBltRasterOp
+  const rop = c.u32(); // bitBltRasterOp
   c.i32(); // xSrc
   c.i32(); // ySrc
   c.skip(24); // XFORM xformSrc (6×f32)
@@ -1093,8 +1876,39 @@ function doBitBlt(s: PlayState, c: EmfCursor, dv: DataView, recStart: number): v
   const cbBmi = c.u32();
   const offBits = c.u32();
   const cbBits = c.u32();
+  if (cbBmi === 0 || cbBits === 0) {
+    // No source bitmap: the ternary raster operation paints the destination
+    // from the brush alone. PATCOPY copies the brush; BLACKNESS/WHITENESS fill
+    // with physical-palette black/white (Win32 BitBlt / PatBlt); the D
+    // operation (0x00AA0029) leaves the destination unchanged.
+    if (rop === 0x00aa0029) return;
+    const fill =
+      rop === 0x00f00021 ? s.curBrush?.fill ?? null
+        : rop === 0x00000042 ? '#000000'
+          : rop === 0x00ff0062 ? '#ffffff'
+            : undefined;
+    if (fill === undefined) {
+      s.unsupported.add(`EMR_BITBLT (raster operation 0x${rop.toString(16)})`);
+      return;
+    }
+    if (fill === null) return; // a hollow brush paints nothing
+    const corners = [
+      toPx(s, xDest, yDest),
+      toPx(s, xDest + cxDest, yDest),
+      toPx(s, xDest + cxDest, yDest + cyDest),
+      toPx(s, xDest, yDest + cyDest),
+    ];
+    s.ctx.beginPath();
+    s.ctx.moveTo(...corners[0]);
+    for (const corner of corners.slice(1)) s.ctx.lineTo(...corner);
+    s.ctx.closePath();
+    s.ctx.fillStyle = fill;
+    s.ctx.fill('nonzero');
+    s.drew = true;
+    return;
+  }
   blitDib(
-    s, dv, recStart, offBmi, cbBmi, offBits, cbBits,
+    s, c, dv, recStart, offBmi, cbBmi, offBits, cbBits,
     xDest, yDest, xDest + cxDest, yDest + cyDest,
   );
 }
@@ -1117,7 +1931,7 @@ function doStretchDibits(s: PlayState, c: EmfCursor, dv: DataView, recStart: num
   const cxDest = c.i32();
   const cyDest = c.i32();
   blitDib(
-    s, dv, recStart, offBmi, cbBmi, offBits, cbBits,
+    s, c, dv, recStart, offBmi, cbBmi, offBits, cbBits,
     xDest, yDest, xDest + cxDest, yDest + cyDest,
   );
 }
@@ -1135,20 +1949,34 @@ function doStretchDibits(s: PlayState, c: EmfCursor, dv: DataView, recStart: num
  * optional BITBLT/STRETCHDIBITS path, which needs a temp OffscreenCanvas and is
  * skipped gracefully when absent).
  */
-export function playEmf(bytes: Uint8Array, ctx: AnyCtx, W: number, H: number): boolean;
+export interface EmfPlaybackOptions {
+  /** Receives, once per playback, the content the picture was drawn without
+   *  (each entry once). `renderEmfToBitmap` always collects it into its
+   *  `EmfRasterResult`; direct `playEmf` callers opt in here. */
+  readonly onUnsupported?: (records: readonly string[]) => void;
+}
+
 export function playEmf(
   bytes: Uint8Array,
   ctx: AnyCtx,
   W: number,
   H: number,
-  limits: EmfReplayLimits = {},
+  options?: EmfPlaybackOptions,
+): boolean;
+export function playEmf(
+  bytes: Uint8Array,
+  ctx: AnyCtx,
+  W: number,
+  H: number,
+  options: EmfPlaybackOptions & EmfReplayLimits = {},
 ): boolean {
+  const limits: EmfReplayLimits = options;
   if (!isEmf(bytes)) return false;
   if (W <= 0 || H <= 0) return false;
 
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
-  const s: PlayState = {
+  const newState = (): PlayState => ({
     ctx,
     W,
     H,
@@ -1183,27 +2011,127 @@ export function playEmf(
     curY: 0,
     stack: [],
     drew: false,
+    path: new EmfPath(),
     inPath: false,
-    pathCommandCount: 0,
+    pathHeld: false,
     pathDiscarded: false,
+    pathRetained: 0,
     maxPathCommands: Number.isSafeInteger(limits.maxPathCommands)
       && (limits.maxPathCommands as number) > 0
       ? Math.min(limits.maxPathCommands as number, MAX_EMF_PATH_COMMANDS)
       : MAX_EMF_PATH_COMMANDS,
-  };
+    arcDirection: AD_COUNTERCLOCKWISE,
+    clipped: false,
+    outerClipped: false,
+    unsupported: new Set(),
+  });
 
+  // EMF+ ([MS-EMFPLUS]): play the EMF+ rendering instead of the GDI records
+  // when the metafile has one this player implements (see emf-plus.ts). An
+  // EMF+-only file whose stream fails validation has no complete alternative:
+  // its failures join the report and the GDI records play as they did before
+  // EMF+ support (a dual file's complete GDI rendering needs no report).
+  const scan = scanEmfPlus(bytes);
+  let s = newState();
+  if (!scan.play) {
+    if (!scan.dual) for (const failure of scan.failures) s.unsupported.add(failure);
+    replayRecords(s, null, false, dv, bytes);
+  } else {
+    const plus = new EmfPlusPlayer(s);
+    replayRecords(s, plus, scan.dual, dv, bytes);
+    // The dry run validates everything a record states, but drawing can still
+    // fail at run time (e.g. the helper surface of a bitmap blit is refused).
+    // A dual file's GDI records are the complete alternative the header
+    // asserts, so the partial EMF+ drawing is cleared (EmfPlusClear already
+    // owns the whole W×H target, [MS-EMFPLUS] 2.3.4.1) and the GDI rendering
+    // is played instead of a picture with a hole. The EMF+ rendering — the one
+    // an EMF+-aware player shows — was nevertheless not produced, and Excel
+    // writes dual-flagged files whose GDI part draws nothing (see
+    // emf-plus.ts), so the failure stays in the report either way: a strict
+    // caller rejects the picture, a compatibility caller keeps the GDI drawing
+    // with its report. An EMF+-only file keeps what drew and reports it.
+    if (plus.drawFailed && scan.dual) {
+      const lost = [...s.unsupported];
+      try {
+        ctx.clearRect(0, 0, W, H);
+      } catch {
+        /* a ctx without clearRect (some mocks) */
+      }
+      s = newState();
+      replayRecords(s, null, false, dv, bytes);
+      for (const failure of lost) s.unsupported.add(failure);
+    }
+  }
+  if (s.unsupported.size > 0) options.onUnsupported?.([...s.unsupported]);
+  return s.drew;
+}
+
+/** One pass over the record stream. `plus` plays the EMF+ rendering (GDI
+ *  records then draw only inside EmfPlusGetDC); `stopOnPlusFailure` ends the
+ *  pass at the first EMF+ drawing failure, when a GDI replay will replace it. */
+function replayRecords(
+  s: PlayState,
+  plus: EmfPlusPlayer | null,
+  stopOnPlusFailure: boolean,
+  dv: DataView,
+  bytes: Uint8Array,
+): void {
+  const ctx = s.ctx;
+  // The playback's own base save: every DC level owns one outstanding canvas
+  // save, so a clip reset can restore to it, and playback leaves the caller's
+  // context state (including clips) as it found it.
+  ctx.save();
+  try {
+    replayRecordStream(s, plus, stopOnPlusFailure, dv, bytes);
+  } finally {
+    // Unwind even on a resource failure; the caller may reuse the context.
+    for (let i = 0; i <= s.stack.length; i++) ctx.restore();
+  }
+}
+
+function replayRecordStream(
+  s: PlayState,
+  plus: EmfPlusPlayer | null,
+  stopOnPlusFailure: boolean,
+  fileView: DataView,
+  bytes: Uint8Array,
+): void {
+  const ctx = s.ctx;
   let pos = 0;
   while (pos + 8 <= bytes.length) {
-    const iType = dv.getUint32(pos, true);
-    const nSize = dv.getUint32(pos + 4, true);
+    const iType = fileView.getUint32(pos, true);
+    const nSize = fileView.getUint32(pos + 4, true);
     // Validate: nSize ≥ 8 (the iType+nSize header) and 4-aligned and in-bounds.
-    if (nSize < 8 || (nSize & 3) !== 0) break;
+    // A damaged record walk ends playback; what drew so far is kept and the
+    // damage is reported.
+    if (nSize < 8 || (nSize & 3) !== 0 || pos + nSize > bytes.length) {
+      s.unsupported.add('EMF record stream (truncated or invalid record size)');
+      break;
+    }
     const recEnd = pos + nSize;
-    if (recEnd > bytes.length) break; // truncated → partial render
     if (iType === EMR.EOF) break;
+
+    // Also bound direct header/DIB reads. Keep absolute offsets, but never
+    // let an offset or palette borrow bytes beyond this record (MS-EMF 2.3).
+    const dv = new DataView(fileView.buffer, fileView.byteOffset, recEnd);
 
     // A cursor over the data region (starts at record offset 8).
     const c = new EmfCursor(dv, pos + 8, recEnd);
+
+    if (plus && iType !== EMR.HEADER) {
+      if (iType === EMR.GDICOMMENT) {
+        plus.playComment(dv, pos, recEnd);
+        if (stopOnPlusFailure && plus.drawFailed) break;
+        pos = recEnd;
+        continue;
+      }
+      // In EMF+ playback the GDI records are the alternative rendering; only
+      // records inside an EmfPlusGetDC scope draw ([MS-EMFPLUS] 2.3.3.1).
+      if (!plus.gdiAllowed) {
+        pos = recEnd;
+        continue;
+      }
+    }
 
     // Never throw on a malformed record — just advance by nSize.
     try {
@@ -1213,10 +2141,10 @@ export function playEmf(
           // device units) @ record offset 8; rclFrame (the intended PICTURE
           // FRAME, in .01 mm) @ 24; szlDevice (reference device size, px) @ 72;
           // szlMillimeters (reference device size, mm) @ 80.
-          const bLeft = dv.getInt32(pos + 8, true);
-          const bTop = dv.getInt32(pos + 12, true);
-          const bRight = dv.getInt32(pos + 16, true);
-          const bBottom = dv.getInt32(pos + 20, true);
+          const bLeft = c.i32();
+          const bTop = c.i32();
+          const bRight = c.i32();
+          const bBottom = c.i32();
           // Default mapping: the ink bounds fill the target. Used when the frame
           // or reference device size is absent/degenerate (mirrors the
           // LibreOffice/POI fallback to the bounds rectangle).
@@ -1282,8 +2210,10 @@ export function playEmf(
         }
         case EMR.SETWINDOWORGEX: {
           // data: POINTL { i32 x, i32 y } ([MS-EMF] 2.3.11).
-          s.winOrgX = c.i32();
-          s.winOrgY = c.i32();
+          const x = c.i32();
+          const y = c.i32();
+          s.winOrgX = x;
+          s.winOrgY = y;
           break;
         }
         case EMR.SETWINDOWEXTEX: {
@@ -1295,8 +2225,10 @@ export function playEmf(
           break;
         }
         case EMR.SETVIEWPORTORGEX: {
-          s.vpOrgX = c.i32();
-          s.vpOrgY = c.i32();
+          const x = c.i32();
+          const y = c.i32();
+          s.vpOrgX = x;
+          s.vpOrgY = y;
           break;
         }
         case EMR.SETVIEWPORTEXTEX: {
@@ -1351,7 +2283,18 @@ export function playEmf(
             fillRule: s.fillRule,
             curX: s.curX,
             curY: s.curY,
+            arcDirection: s.arcDirection,
+            clipped: s.clipped,
+            outerClipped: s.outerClipped,
+            pathBuf: s.path.buf,
+            pathLength: s.path.buf.ops.length,
+            pathCommands: s.path.buf.commands,
+            inPath: s.inPath,
+            pathHeld: s.pathHeld,
+            pathDiscarded: s.pathDiscarded,
           });
+          s.path.buf.saved.push({ length: s.path.buf.ops.length, commands: s.path.buf.commands });
+          s.outerClipped = s.clipped;
           break;
         }
         case EMR.RESTOREDC: {
@@ -1360,9 +2303,15 @@ export function playEmf(
           const iRelative = c.i32();
           const times = Math.min(Math.abs(iRelative) || 1, s.stack.length);
           let saved: SavedDc | undefined;
+          // Buffers the popped snapshots leave behind, released below.
+          const left = new Set<PathBuffer>();
           for (let i = 0; i < times; i++) {
             saved = s.stack.pop();
             s.ctx.restore(); // unwind the matching canvas save (clip/state)
+            if (saved) {
+              saved.pathBuf.saved.pop();
+              left.add(saved.pathBuf);
+            }
           }
           if (saved) {
             s.wt = saved.wt;
@@ -1384,23 +2333,40 @@ export function playEmf(
             s.fillRule = saved.fillRule;
             s.curX = saved.curX;
             s.curY = saved.curY;
+            s.arcDirection = saved.arcDirection;
+            s.clipped = saved.clipped;
+            s.outerClipped = saved.outerClipped;
+            // The saved path comes back with its open/held/discarded state
+            // (see PathBuffer). Snapshots above this one were popped with it,
+            // so cutting the shared buffer back cannot change a live snapshot.
+            left.add(s.path.buf);
+            const buf = saved.pathBuf;
+            s.path.buf = buf;
+            left.delete(buf);
+            s.pathRetained -= buf.commands - saved.pathCommands;
+            buf.commands = saved.pathCommands;
+            buf.ops.length = saved.pathLength;
+            for (const other of left) releasePathBuffer(s, other);
+            s.inPath = saved.inPath;
+            s.pathHeld = saved.pathHeld;
+            s.pathDiscarded = saved.pathDiscarded;
           }
           break;
         }
         case EMR.BEGINPATH: {
-          // Start a path bracket ([MS-EMF] 2.3.10): subsequent geometry records
-          // build the path instead of drawing it, until ENDPATH.
-          s.ctx.beginPath();
+          // Start a path bracket ([MS-EMF] 2.3.10): any previous path is
+          // discarded, and geometry records build the new one instead of
+          // drawing, until ENDPATH.
+          discardPath(s);
           s.inPath = true;
-          s.pathCommandCount = 0;
-          s.pathDiscarded = false;
           break;
         }
         case EMR.CLOSEFIGURE: {
-          if (s.inPath && reservePathCommands(s, 1)) s.ctx.closePath();
+          if (s.inPath && reservePathCommands(s, 1)) s.path.closePath();
           break;
         }
         case EMR.ENDPATH: {
+          if (s.inPath) s.pathHeld = true;
           s.inPath = false;
           break;
         }
@@ -1416,23 +2382,71 @@ export function playEmf(
           paintSelectedPath(s, false, true);
           break;
         }
+        case EMR.ABORTPATH: {
+          // Close the bracket and discard its path ([MS-EMF] 2.3.10).
+          discardPath(s);
+          break;
+        }
+        case EMR.FLATTENPATH:
+          // Flattening only replaces the held path's curves by lines; it does
+          // not change the painted area beyond curve-approximation tolerance.
+          break;
+        case EMR.WIDENPATH:
+          // Not implemented: the held path keeps its unwidened figures (the
+          // playback before this record was recognized) and is reported.
+          // Without a held path GDI fails and nothing changes.
+          if (s.pathHeld) s.unsupported.add('EMR_WIDENPATH');
+          break;
         case EMR.SELECTCLIPPATH: {
+          // data: u32 RegionMode. AND intersects; COPY replaces the clip.
+          // OR/XOR/DIFF, and a COPY that cannot drop an inherited clip, are
+          // reported and intersect instead (the playback that predates the
+          // RegionMode operand).
+          const mode = c.remaining >= 4 ? c.u32() : RGN_AND;
+          // Without a held path (none, or a bracket still open) GDI fails
+          // and neither the clip nor the path changes.
+          if (!s.pathHeld) break;
+          if (mode !== RGN_AND && mode !== RGN_COPY) {
+            s.unsupported.add(`EMR_SELECTCLIPPATH (mode ${mode})`);
+          } else if (mode === RGN_COPY) {
+            resetClip(s, 'EMR_SELECTCLIPPATH');
+          }
           // Use the path just defined as the clip region (intersecting the
           // current clip — the common RGN_AND case, and what a following blit
           // relies on, e.g. sample-13 Fig.3 clips a bar-chart DIB to the bar
           // shapes so its background is masked out). Scoped by the enclosing
           // SAVEDC/RESTOREDC.
           if (!s.pathDiscarded) {
-            try {
-              s.ctx.clip(s.fillRule);
-            } catch {
-              /* a ctx without clip() (some mocks): leave unclipped */
-            }
+            tracePath(s.ctx, s.path.buf.ops);
+            applyClip(s, s.fillRule);
           }
-          s.pathCommandCount = 0;
-          s.pathDiscarded = false;
+          discardPath(s);
           break;
         }
+        case EMR.INTERSECTCLIPRECT:
+          clipRect(s, c, false);
+          break;
+        case EMR.EXCLUDECLIPRECT:
+          clipRect(s, c, true);
+          break;
+        case EMR.EXTSELECTCLIPRGN:
+          extSelectClipRgn(s, c);
+          break;
+        case EMR.OFFSETCLIPRGN:
+          // Moving a default (unclipped) region changes nothing.
+          if (s.clipped) s.unsupported.add('EMR_OFFSETCLIPRGN');
+          break;
+        case EMR.SETARCDIRECTION: {
+          const direction = c.u32();
+          if (direction === AD_COUNTERCLOCKWISE || direction === AD_CLOCKWISE) {
+            s.arcDirection = direction;
+          }
+          break;
+        }
+        case EMR.GDICOMMENT:
+          // Reached only when the GDI rendering is played: a dual-mode EMF+
+          // file whose EMF+ part is not implemented here, or no EMF+ at all.
+          break;
         case EMR.SELECTOBJECT: {
           const ih = c.u32();
           if ((ih & 0x80000000) !== 0) {
@@ -1525,20 +2539,21 @@ export function playEmf(
           fillStrokePolyPoly(s, c, readPoint32, false);
           break;
         case EMR.MOVETOEX: {
-          s.curX = c.i32();
-          s.curY = c.i32();
+          const x = c.i32();
+          const y = c.i32();
+          s.curX = x;
+          s.curY = y;
           if (s.inPath && reservePathCommands(s, 1)) {
             const [px, py] = toPx(s, s.curX, s.curY);
-            s.ctx.moveTo(px, py);
+            s.path.moveTo(px, py);
           }
           break;
         }
         case EMR.LINETO: {
           const xl = c.i32();
           const yl = c.i32();
-          if (s.inPath && reservePathCommands(s, 1)) {
-            const [px1, py1] = toPx(s, xl, yl);
-            s.ctx.lineTo(px1, py1);
+          if (s.inPath) {
+            if (reservePathCommands(s, 1)) s.path.lineTo(...toPx(s, xl, yl));
           } else if (s.curPen && s.curPen.stroke != null) {
             const [px0, py0] = toPx(s, s.curX, s.curY);
             const [px1, py1] = toPx(s, xl, yl);
@@ -1567,6 +2582,24 @@ export function playEmf(
           const top = c.i32();
           const right = c.i32();
           const bottom = c.i32();
+          if (s.inPath) {
+            // A closed figure starting at the rightmost point, in the current
+            // arc direction (Win32 SetArcDirection covers Ellipse).
+            if (mappingReflects(s)) {
+              unsupportedDrawing(s, 'EMR_ELLIPSE (reflected mapping)');
+              break;
+            }
+            const rx = Math.abs(right - left) / 2;
+            const ry = Math.abs(bottom - top) / 2;
+            if (rx === 0 || ry === 0) break;
+            const sweep = s.arcDirection === AD_CLOCKWISE ? 2 * Math.PI : -2 * Math.PI;
+            const arc = ellipseArc((left + right) / 2, (top + bottom) / 2, rx, ry, 0, sweep);
+            if (!reservePathCommands(s, arc.curves.length + 2)) break;
+            s.path.moveTo(...toPx(s, arc.start[0], arc.start[1]));
+            emitCurves(s, s.path, arc);
+            s.path.closePath();
+            break;
+          }
           const [cxl, cyl] = [(left + right) / 2, (top + bottom) / 2];
           const [cx, cy] = toPx(s, cxl, cyl);
           const [ex] = toPx(s, right, cyl);
@@ -1606,6 +2639,10 @@ export function playEmf(
           break;
         }
         case EMR.EXTTEXTOUTW:
+          // Canvas text cannot supply GDI glyph outlines to a retained path:
+          // inside a bracket the text is reported and still drawn directly,
+          // as it was before path brackets were modelled.
+          if (s.inPath) unsupportedDrawing(s, 'EMR_EXTTEXTOUTW (glyph path)');
           drawText(s, c, dv, pos);
           break;
         case EMR.BITBLT:
@@ -1614,50 +2651,95 @@ export function playEmf(
         case EMR.STRETCHDIBITS:
           doStretchDibits(s, c, dv, pos);
           break;
-        default:
-          // GDICOMMENT (may hold EMF+, out of scope), SETICMMODE,
-          // SETMITERLIMIT, SETROP2, SETSTRETCHBLTMODE, INTERSECTCLIPRECT, and any
-          // unrecognized iType: skip by nSize. (Path/clip records ARE handled
-          // above.)
+        case EMR.ARC:
+          drawRadialArc(s, c, 'arc', 'EMR_ARC');
           break;
+        case EMR.ARCTO:
+          drawRadialArc(s, c, 'arcTo', 'EMR_ARCTO');
+          break;
+        case EMR.CHORD:
+          drawRadialArc(s, c, 'chord', 'EMR_CHORD');
+          break;
+        case EMR.PIE:
+          drawRadialArc(s, c, 'pie', 'EMR_PIE');
+          break;
+        case EMR.ANGLEARC:
+          drawAngleArc(s, c);
+          break;
+        case EMR.ROUNDRECT:
+          drawRoundRect(s, c);
+          break;
+        default: {
+          // Drawing records this player cannot draw are reported (and discard
+          // an open path bracket rather than painting a fragment). Every other
+          // record — state such as SETICMMODE, SETMITERLIMIT, SETROP2,
+          // SETSTRETCHBLTMODE, palettes, SETMETARGN (which keeps the visible
+          // clip) — is skipped by nSize.
+          const name = UNSUPPORTED_DRAWING[iType];
+          if (name) unsupportedDrawing(s, name);
+          break;
+        }
       }
-    } catch {
-      // A malformed record must never abort the whole render — just advance.
+    } catch (error) {
+      if (isOoxmlDecodedImageLimitError(error)) throw error;
+      // A malformed record must never abort the whole render: it is reported
+      // and playback advances to the next record.
+      s.unsupported.add(`EMF record ${iType} (malformed)`);
     }
 
     pos = recEnd;
   }
+}
 
-  return s.drew;
+/**
+ * The outcome of rasterizing an EMF through the normal image loading path
+ * ({@link renderEmfToBitmap} → `decodeRasterOrMetafile`). `unsupported` names,
+ * once each, the content the player could not reproduce: unimplemented drawing
+ * records, EMF+ content of an EMF+-only file that failed validation, and
+ * damaged or malformed records. An empty list means no omission was detected;
+ * it does not prove full fidelity (ordinary text advances, for example, are
+ * still drawn with Canvas spacing).
+ * The bitmap is what playback drew around those gaps (`null` when nothing
+ * drew); a caller decides whether that partial picture is acceptable.
+ */
+export interface EmfRasterResult {
+  readonly bitmap: ImageBitmap | null;
+  readonly unsupported: readonly string[];
 }
 
 // ── async OffscreenCanvas wrapper ───────────────────────────────────────────
 
 /**
  * Rasterize an EMF metafile to an `ImageBitmap` of `targetW`×`targetH`, replaying
- * onto an `OffscreenCanvas` 2D context. Returns `null` if the bytes are not a
- * parseable EMF or nothing drew (so the caller can fall back to the existing
- * "missing image" behavior without crashing). Mirrors
+ * onto an `OffscreenCanvas` 2D context, with the report of content it could
+ * not reproduce ({@link EmfRasterResult}). The bitmap is `null` if the bytes
+ * are not a parseable EMF or nothing drew (so the caller can fall back to the
+ * existing "missing image" behavior without crashing). Mirrors
  * {@link ./wmf.ts}#renderWmfToBitmap.
  */
 export async function renderEmfToBitmap(
   bytes: Uint8Array,
   targetW: number,
   targetH: number,
-): Promise<ImageBitmap | null> {
-  if (!isEmf(bytes)) return null;
-  if (targetW <= 0 || targetH <= 0) return null;
+): Promise<EmfRasterResult> {
+  const none: EmfRasterResult = { bitmap: null, unsupported: [] };
+  if (!isEmf(bytes)) return none;
+  if (targetW <= 0 || targetH <= 0) return none;
   // Rasterize on a shared aux canvas (OffscreenCanvas, else a detached <canvas>).
   // Absent both (e.g. a headless test / SSR runtime without either) ⇒ degrade
   // gracefully to null, exactly as the caller already handles an unsupported
   // metafile — never throw.
   const canvas = createAuxCanvas(targetW, targetH);
-  if (!canvas) return null;
+  if (!canvas) return none;
   const ctx = canvas.getContext('2d') as AnyCtx | null;
-  if (!ctx) return null;
+  if (!ctx) return none;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  const drew = playEmf(bytes, ctx, targetW, targetH);
-  if (!drew) return null;
-  return createImageBitmap(canvas);
+  let unsupported: readonly string[] = [];
+  const drew = playEmf(bytes, ctx, targetW, targetH, {
+    onUnsupported: (records) => {
+      unsupported = records;
+    },
+  });
+  return { bitmap: drew ? await createImageBitmap(canvas) : null, unsupported };
 }

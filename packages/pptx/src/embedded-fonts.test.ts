@@ -1,5 +1,6 @@
+import { OoxmlDecodedImageLimitError } from '@silurus/ooxml-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { excludeEmbeddedFontFamilies, loadEmbeddedFonts } from './embedded-fonts.js';
+import { excludeEmbeddedFontFamilies, loadEmbeddedFonts, uncoveredOfficeFontRequests } from './embedded-fonts.js';
 import type { PptxEmbeddedFontRef } from './worker-protocol';
 
 const globals = globalThis as Record<string, unknown>;
@@ -20,6 +21,8 @@ function installFontFaceSet(failLoad = false) {
       public source: ArrayBuffer,
       public descriptors: FontFaceDescriptors,
     ) {}
+    get weight() { return this.descriptors.weight; }
+    get style() { return this.descriptors.style; }
     load() {
       return failLoad
         ? Promise.reject(new Error('load failed'))
@@ -52,6 +55,10 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
     expect(new Set(added.map((face) => face.family)).size).toBe(1);
     expect(loaded.aliases.get('deck sans')).toBe(added[0].family);
     expect(loaded.authoredFamilies.get(added[0].family)).toBe('deck sans');
+    expect(loaded.tuples).toEqual(new Set([
+      'deck sans:400:normal', 'deck sans:700:normal',
+      'deck sans:400:italic', 'deck sans:700:italic',
+    ]));
   });
 
   it('keeps raw PPTX bytes and skips an unreadable part without aborting siblings', async () => {
@@ -129,4 +136,30 @@ describe('loadEmbeddedFonts (ECMA-376 §19.2.1.9 / §15.2.13)', () => {
     expect(loaded.faces).toEqual([]);
     expect(excludeEmbeddedFontFamilies(['calibri'], loaded.aliases)).toEqual(['calibri']);
   });
+
+  it('records only successfully registered style tuples', async () => {
+    installFontFaceSet();
+    const refs: PptxEmbeddedFontRef[] = [
+      { fontName: 'Calibri', style: 'regular', partPath: 'regular.ttf', contentType: 'application/x-font-ttf' },
+      { fontName: 'Calibri', style: 'bold', partPath: 'bold.ttf', contentType: 'application/x-font-ttf' },
+    ];
+    const loaded = await loadEmbeddedFonts(refs, async (path) => {
+      if (path === 'bold.ttf') throw new Error('missing');
+      return bytes();
+    });
+    expect(loaded.tuples).toEqual(new Set(['calibri:400:normal']));
+    expect(uncoveredOfficeFontRequests([
+      { family: 'Calibri', weight: 400, style: 'normal' },
+      { family: 'Calibri', weight: 700, style: 'normal' },
+    ], loaded.tuples)).toEqual([
+      { family: 'Calibri', weight: 700, style: 'normal' },
+    ]);
+  });
+});
+
+it('preserves other typed resource-limit errors instead of treating them as malformed fonts', async () => {
+  const error = new OoxmlDecodedImageLimitError('active-decoded-bytes', 1, 2);
+  await expect(loadEmbeddedFonts([{
+    fontName: 'Limited', style: 'regular', partPath: 'font.ttf', contentType: 'application/x-font-ttf',
+  }], async () => { throw error; })).rejects.toBe(error);
 });

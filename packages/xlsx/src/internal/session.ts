@@ -23,8 +23,18 @@ export {
   type WorksheetModelUsage,
 } from '../worksheet-resource-limits.js';
 export {
+  bindWorksheetPolicy,
+  getWorksheetPolicy,
+} from '../worksheet-policy-context.js';
+export {
   acquireXlsxNodeSession,
   type XlsxNodeAcquisition,
   type XlsxNodeAcquisitionOptions,
   type XlsxNodeArchive,
+  type XlsxNodeSessionArchive,
 } from './node-acquisition.js';
+export {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+  type NormalizedXlsxWorksheetPolicy,
+} from './worksheet-policy.js';

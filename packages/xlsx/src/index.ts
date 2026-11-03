@@ -112,6 +112,7 @@ export type {
   MathSvg,
   ChartDisplayUnits,
   ChartDisplayUnitsLabel,
+  ChartAxisNumberFormat,
   SecondaryValueAxis,
   SrcRect,
   NoFill,
@@ -131,6 +132,18 @@ export { type HyperlinkTarget, openExternalHyperlink } from '@silurus/ooxml-core
 // (ECMA-376 §18.4.8). Exported so headless callers that parse a Worksheet
 // directly (for example a bounded Node worksheet session) can concretize cell text.
 export { resolveSharedStrings } from './shared-strings.js';
+// Application-supplied model sources (LoadOptions.legacyXls): the
+// format-generic contract for opening input that is not an OOXML package.
+export type {
+  ModelSource,
+  ModelSourceConfig,
+  ModelSourceConfigValue,
+  ModelSourceLoad,
+  ModelSourceModule,
+  ModelSourceModuleDescriptor,
+  ModelSourceTarget,
+  OpenedModelSource,
+} from '@silurus/ooxml-core';
 // Typed load-time error surfaced by XlsxWorkbook.load (e.g. a password-protected
 // or legacy-binary .xls file). Re-exported so `@silurus/ooxml/xlsx` consumers can
 // narrow on `err.code`.
@@ -149,7 +162,9 @@ export {
   type OoxmlFormat,
   type OoxmlResourceLimit,
   type OoxmlResourceLimitErrorDetails,
+  type OoxmlUnsupportedContentDetails,
   type OoxmlResourceLimits,
+  type XlsxWorksheetLimits,
   type CjkFallback,
   type OoxmlResourceMetric,
   type OoxmlResourceMetrics,
@@ -194,6 +209,7 @@ export type {
   PhoneticAlignment,
   // Differential / gradient style sub-types (reachable via Styles).
   Dxf,
+  DxfFontToggles,
   GradientFillSpec,
   // Conditional formatting (reachable via Worksheet.conditionalFormats).
   ConditionalFormat,
@@ -219,6 +235,9 @@ export type {
   SlicerElementStyle,
   // Metadata-only pivot facts (reachable via Worksheet.pivotTables).
   PivotTableMetadata,
+  PivotTableStyle,
+  PivotTableStyleElement,
+  PivotAxisItem,
   PivotLocation,
   PivotPageField,
   PivotDataField,
@@ -232,6 +251,7 @@ export type {
   // Drawings / shapes (reachable via Worksheet drawings).
   ImageAnchor,
   Duotone,
+  BlipEffect,
   ChartAnchor,
   ShapeAnchor,
   ShapeInfo,
@@ -259,3 +279,5 @@ export type {
   ChartManualLayout,
   LegendManualLayout,
 } from './types.js';
+
+export type { BlendMode, BlipEffectContainer, BlipEffectFill, BlipEffectImageFill } from '@silurus/ooxml-core';

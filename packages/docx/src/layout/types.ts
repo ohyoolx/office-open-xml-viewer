@@ -1,5 +1,8 @@
+import type { NoteSourceContinuation } from './body-layout-kernel.js';
+import type { LineBoundary } from '../line-layout.js';
+import type { ParagraphFragmentCursor } from './paragraph-pagination.js';
 import type { SectionLayoutContext } from '../layout-context.js';
-import type { DocxStorySource } from '../types.js';
+import type { DocxDiagnostic, DocxDiagnosticCode, DocxStorySource, FramePr } from '../types.js';
 import type {
   GlyphInkBounds,
   TextFontSlotPresence,
@@ -115,13 +118,29 @@ export type DrawingPaintCommand =
     }>
   | Readonly<{
       kind: 'drawingml-shape';
-      plan: DeepReadonly<DrawingMLShapePaintPlan>;
+      insetStroke?: boolean;
+      shadowPass?: boolean;
+      concentricFill?: Readonly<{
+        bounds?: LayoutRect;
+        focus: Readonly<{ l: number; t: number; width: number; height: number }>;
+        rings: readonly Readonly<{ outside: number; inside: number; color: string }>[];
+        centerColor: string;
+      }>;
+      /** Retained VML fill/shadow pass opacity, independent of other passes. */
+      opacity?: number;
+      plan: DeepReadonly<DrawingMLShapePaintPlan & { readonly resolvedGeometry: NonNullable<DrawingMLShapePaintPlan['resolvedGeometry']> }>;
     }>
   | Readonly<{
       /** A retained image resource clipped to the authored DrawingML shape. */
       kind: 'drawingml-image-fill';
-      plan: DeepReadonly<DrawingMLShapePaintPlan>;
+      strokeMask?: boolean;
+      maskBounds?: LayoutRect;
+      insetStroke?: boolean;
+      plan: DeepReadonly<DrawingMLShapePaintPlan & { readonly resolvedGeometry: NonNullable<DrawingMLShapePaintPlan['resolvedGeometry']> }>;
       resourceKey: string;
+      imageRotationDeg?: number;
+      imageFlipH?: boolean;
+      imageFlipV?: boolean;
       fillRect?: Readonly<{ l: number; t: number; r: number; b: number }>;
     }>
   | Readonly<{
@@ -155,6 +174,16 @@ export type DrawingPaintCommand =
       fill: DeepReadonly<Fill> | null;
       opacity: number;
       rotationDeg: number;
+      flipH?: boolean;
+      flipV?: boolean;
+      glyphTransform?: Matrix2DData;
+      imageResourceKey?: string;
+      maskBounds?: LayoutRect;
+      imageRotationDeg?: number;
+      imageFlipH?: boolean;
+      imageFlipV?: boolean;
+      /** Acquired glyph placements for §19.1.2.23 path fitting. */
+      pathSlices?: readonly Readonly<{ sourceX: number; sourceWidth: number; xPt: number; yPt: number; a: number; b: number; c: number; d: number }>[];
       /** True applies §19.1.2.23 fitshape; false preserves authored font size. */
       fitShape: boolean;
       fontSizePt: number;
@@ -175,8 +204,17 @@ export type DrawingPaintCommand =
       rect: LayoutRect;
       /** Keep a non-text graphic upright after the enclosing section-logical
        * frame is rotated into a vertical physical page. */
-      orientation?: 'upright-physical';
+      orientation?: UprightResourceOrientation;
     }>;
+
+/** Closed local counter-turn that keeps a non-text graphic upright in its
+ * owner section's physical page. `upright-physical` cancels the clockwise
+ * vertical frame (local quarter turn counter-clockwise);
+ * `upright-physical-counter-clockwise` cancels a native counter-clockwise
+ * (`sideways-lr`) frame (local quarter turn clockwise). */
+export type UprightResourceOrientation =
+  | 'upright-physical'
+  | 'upright-physical-counter-clockwise';
 
 export interface DrawingLayout extends LayoutNodeBase {
   readonly kind: 'drawing';
@@ -196,6 +234,8 @@ export interface DrawingLayout extends LayoutNodeBase {
     sourceOrder: number;
     horizontalOwnership: 'page' | 'host';
     verticalOwnership: 'page' | 'host';
+    /** Authored §20.4.2.3 cell ownership, independent of row-height containment. */
+    layoutInCell?: true;
     /** @internal This occurrence contributes to its owning table-cell extent. */
     cellContainment?: true;
   }>;
@@ -225,7 +265,15 @@ export interface TextRange {
 }
 
 export type TextDirection = 'ltr' | 'rtl';
-export type WritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr';
+/** `sideways-lr` is the counter-clockwise frame (lines advance upward, later
+ * lines to the right, every glyph rotated with the page). Only a native
+ * {@link SectionFlow} selects it; no OOXML token does. */
+export type WritingMode = 'horizontal-tb' | 'vertical-rl' | 'vertical-lr' | 'sideways-lr';
+
+/** Canonical per-section semantics normalized once from a producer's flow
+ * that no Transitional ST_TextDirection token expresses in this library:
+ * bottom to top (upward, later lines rightward, glyph tops left). */
+export type SectionFlow = 'bottomToTop';
 
 export type TextDecorationLayout = Readonly<{
   kind: 'underline' | 'strikethrough' | 'overline';
@@ -249,6 +297,10 @@ export interface RetainedGlyphPaintOperation {
   readonly fontWeight: number;
   readonly fontStyle: 'normal' | 'italic';
   readonly color: TextColorPolicy;
+  /** Present when the operation paints a contextual span whose acquisition
+   * was pair-kerned (WORD_ARABIC_PAIR_KERNING); absent operations paint one
+   * grapheme, which has no pair to kern. */
+  readonly kerning?: 'normal';
   /** Tight selected-face ink relative to this operation's baseline origin. */
   readonly inkBounds?: Readonly<{
     xMinPt: number;
@@ -304,6 +356,10 @@ export interface TextPaintOp {
   readonly glyphOffsetPt?: PointPt;
   /** `kashida` permits acquisition-inserted U+0640 glyphs over one source range. */
   readonly sourceMapping?: 'identity' | 'kashida';
+  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR: this operation draws one cluster
+   * whose advance took the zero floor; its glyph's natural advance. RTL paint
+   * anchors the glyph's trailing (left) edge on the pen with it. */
+  readonly naturalAdvancePt?: number;
   /** Selected-face ink relative to this operation's alphabetic baseline.
    * Pagination may consume it, but paint must never reconstruct it. */
   readonly inkBounds?: GlyphInkBounds;
@@ -347,9 +403,22 @@ export interface RetainedRunTypographyFacts {
 
 export interface TextPlacement {
   readonly kind: 'text';
+  /** Authored discretionary '-' ink has an empty logical source owner.
+   * Paint still consumes text/paintOps; copy and find consume the typed owner. */
+  readonly optionalHyphenGlyph?: true;
   readonly text: string;
+  /** Semantic rFonts ranges relative to this physical shape unit's text. */
+  readonly semanticSlotSpans?: import('./text.js').TextShapeSpan['semanticSlotSpans'];
   /** Parsed run occurrence retained for destination-page field convergence. */
   readonly sourceRunIndex?: number;
+  /** Formatting-only runs share one glyph sequence. Ownership ranges stay
+   * separate so overlays/fields can address every original source occurrence. */
+  readonly sourceRuns?: readonly Readonly<{
+    range: TextRange;
+    sourceRunIndex: number;
+    role?: 'field-result';
+    dependency?: TextPlacement['dependency'];
+  }>[];
   readonly role?: 'content' | 'numbering-marker' | 'field-result';
   readonly dependency?: 'page' | 'total-pages' | 'date' | 'time' | 'document';
   readonly noteReference?: Readonly<{ kind: 'footnote' | 'endnote'; id: string }>;
@@ -362,6 +431,9 @@ export interface TextPlacement {
   readonly advancePt: number;
   /** Shaped cluster geometry for selection/hit testing. Always covers `range`. */
   readonly clusters: readonly TextClusterLayout[];
+  /** Final U+0020 advance removed by the registered Latin line-fit rule. The
+   * transparent browser overlay must not hit-test beyond this retained box. */
+  readonly trailingSpaceCompressionPt?: number;
   /** Immutable contextual paint operations. Normally one whole-run operation. */
   readonly paintOps: readonly TextPaintOp[];
   readonly color: TextColorPolicy;
@@ -431,6 +503,8 @@ export interface TabPlacement {
 }
 
 export interface AnchorHostPlacement {
+  /** A suppressed automatic note mark still anchors its note to this line. */
+  readonly noteReference?: TextPlacement['noteReference'];
   readonly kind: 'anchor-host';
   readonly range: TextRange;
   readonly bounds: LayoutRect;
@@ -461,6 +535,22 @@ export type ImagePaintResourceDescriptor = Readonly<{
   alpha?: number;
   colorReplaceFrom?: string;
   duotone?: DeepReadonly<Duotone>;
+  /** Part 4 §19.1.2.21: clr1 replaces black, clr2 replaces coloured pixels. */
+  vmlStrokePattern?: DeepReadonly<Duotone>;
+  vmlFill?: DeepReadonly<Extract<import('../types.js').ShapeFill, { fillType: 'image' }>['vml']>;
+  blipEffects?: DeepReadonly<import('@silurus/ooxml-core').BlipEffect[]>;
+  /** Host shape orientation for CT_Blip effects on a shape blip fill
+   * (§20.1.8.45/.49 rotWithShape): the fill paints inside the rotated shape,
+   * so the image itself carries no rotation but its page-fixed effects must
+   * still be evaluated against the host's rotation and flips. */
+  effectHost?: Readonly<{
+    rotation?: number; flipH?: boolean; flipV?: boolean;
+    /** Stretched fill insets (§20.1.8.56): with srcRect they define the full
+     * source frame the chain's EMU measurements are evaluated on. */
+    fillRect?: Readonly<{ l?: number; t?: number; r?: number; b?: number }>;
+    /** A tiled fill samples its source at the fill DPI (§20.1.8.58). */
+    tileDpi?: number;
+  }>;
 }>;
 
 export type ChartPaintResourceDescriptor = Readonly<{
@@ -498,7 +588,7 @@ export interface ResourcePlacement {
   readonly resourceKind: InlineResourceKind;
   /** Keep a non-text graphic upright after the enclosing section-logical frame
    * is rotated into a vertical physical page. Absent means flow-relative. */
-  readonly orientation?: 'upright-physical';
+  readonly orientation?: UprightResourceOrientation;
   readonly bounds: LayoutRect;
   readonly advancePt: number;
 }
@@ -528,11 +618,24 @@ export type ParagraphPlacement =
   | ResourcePlacement
   | DrawingPlacement;
 
+/** One physical line for spacing, pagination, counters and source ownership.
+ * Overlays/hit testing use placements, never the bounding rectangle spanning
+ * the excluded area between disjoint gaps. */
 export interface LineLayout {
+  /** Disjoint float gaps retained only as horizontal shading allocations. */
+  readonly wrapFragments?: readonly LayoutRect[];
+  /** Occupied float gap, independent of alignment/text ink. Paint uses this
+   * retained allocation for paragraph shading without filling the obstacle. */
+  readonly wrapBounds?: LayoutRect;
   readonly range: TextRange;
   readonly bounds: LayoutRect;
   readonly baselinePt: number;
   readonly advancePt: number;
+  /** Trailing grid leading eligible for plain-paragraph page-edge admission.
+   * Authored paragraph decorations disable it before continuation slicing;
+   * only whitelisted plain text paint can use it at unreserved body boundaries.
+   * Placement and paint always retain the full advance. */
+  readonly gridAfterLeadingPt?: number;
   readonly placements: readonly ParagraphPlacement[];
   /** §17.18.84 bar-tab vertical rules acquired independently of tab advances. */
   readonly barTabRules?: readonly BorderSegment[];
@@ -567,6 +670,17 @@ export interface WrapExclusion {
   readonly polygon: readonly PointPt[];
   readonly anchorOccurrenceId?: string;
   readonly verticalOwnership?: 'page' | 'host';
+  /** WORD_MODE14_TIGHT_ANCHOR_LINE_REWRAP: the anchor line starting at this
+   * top does not wrap around its own object. Paragraph-local; the registry
+   * entry seen by other paragraphs carries the full exclusion. */
+  readonly anchorLineExemptTopPt?: number;
+  /** WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH: a line starting at or below this Y
+   * whose bottom lies exactly on this polygon's top wraps around it. Set only
+   * on carried later anchors. */
+  readonly topEdgeInclusiveFromYPt?: number;
+  /** The drawing is wrapTight in a compatibility-mode-14 document; read by
+   * WORD_MODE14_TIGHT_ANCHOR_TOP_TOUCH when pagination carries it. */
+  readonly wordMode14TightAnchor?: boolean;
 }
 
 /** @internal Occurrence-keyed DrawingML object bounds for §20.4.2.3.
@@ -590,6 +704,7 @@ export interface ParagraphFlowEvent {
 
 export interface ParagraphMarkLayout {
   readonly hidden: boolean;
+  readonly wrapBounds?: LayoutRect;
   readonly bounds: LayoutRect;
 }
 
@@ -637,6 +752,10 @@ export interface ParagraphLayout extends LayoutNodeBase {
   readonly spacing: ParagraphSpacingLayout;
   readonly contextualSpacing: boolean;
   readonly lines: readonly LineLayout[];
+  /** Note-flow acquisition retains source boundaries so another column can
+   * shape the unconsumed suffix at its own width through the same paragraph engine. */
+  readonly noteLineEndBoundaries?: readonly LineBoundary[];
+  readonly noteSourceStart?: ParagraphFragmentCursor;
   readonly borders: readonly BorderSegment[];
   readonly shading?: FillPaint;
   readonly resources: readonly InlineResourceLayout[];
@@ -677,13 +796,32 @@ export interface TableCellBlockLayout {
   readonly advancePt: number;
 }
 
+/** ECMA-376 §17.4.72 rotated cell text, expressed with the DrawingML text-box
+ * vertical modes that share its paint semantics: `vert` (§17.18.93 tbRl),
+ * `vert270` (btLr) and `eaVert` (tbRlV, East Asian glyphs upright). */
+export type TableCellVerticalMode = 'vert' | 'vert270' | 'eaVert';
+
+export interface TableCellVerticalTextLayout {
+  readonly mode: TableCellVerticalMode;
+  /** Maps the cell's local horizontal content frame (origin at the start of
+   * the first line, x along the line, y across lines) to table points. */
+  readonly transform: Matrix2DData;
+}
+
 export interface TableCellLayout extends LayoutNodeBase {
   readonly kind: 'table-cell';
   readonly contentBounds: LayoutRect;
   readonly verticalMerge: 'none' | 'restart' | 'continue';
+  /** A paint role of a `continue` cell that owns its painted region: a
+   * page-local merge continuation (table-pagination.ts) or a projected empty
+   * owner (table.ts gridMergeRole). The source w:vMerge value is unchanged
+   * and the cell's content stays suppressed. */
+  readonly visualMergeOwnership?: 'continuation';
   readonly vAlign: 'top' | 'center' | 'bottom';
   readonly background?: FillPaint;
   readonly blocks: readonly TableCellBlockLayout[];
+  /** Present for rotated cell text: blocks are in the local frame. */
+  readonly verticalText?: TableCellVerticalTextLayout;
 }
 
 export interface TableRowLayout extends LayoutNodeBase {
@@ -707,6 +845,14 @@ export interface TableLayout extends LayoutNodeBase {
   /** Point space already owned by `resolvedFloatingTables`; occurrence projection
    * must not translate those final frames a second time. */
   readonly resolvedFloatingTableCoordinateSpace?: FloatRegistryCoordinateSpace;
+  /** @internal Cell-owner host (table-owner-runs.ts): a frame-placed
+   * owner of source rows of a body, header or footer root table, never a
+   * §17.4.57 positioned table. */
+  readonly cellOwnerHost?: true;
+  /** @internal Axes of a header/footer story-root cell-owner host already in
+   * page coordinates (a page/margin frame result). Like a page-owned anchor
+   * layer, story band and occurrence translation leave those axes in place. */
+  readonly ownerHostPageAxes?: Readonly<{ horizontal: boolean; vertical: boolean }>;
 }
 
 /**
@@ -741,6 +887,9 @@ export interface FloatingTableReferenceFramesPt {
 }
 
 interface FloatRegistryEntryCorePt {
+  /** Cell-start grid frame: its wrap moves flow, not an empty carrier's
+   * paragraph-relative drawing insertion reference. */
+  readonly paragraphAnchorReference?: 'unwrapped-empty-carrier';
   readonly occurrenceId: string;
   readonly paragraphId: number;
   readonly bounds: LayoutRect;
@@ -761,6 +910,10 @@ interface FloatRegistryEntryCorePt {
     leftPt: number;
   }>;
   readonly wrapPolygon?: readonly PointPt[];
+  /** See WrapExclusion.topEdgeInclusiveFromYPt. */
+  readonly topEdgeInclusiveFromYPt?: number;
+  /** See WrapExclusion.anchorLineExemptTopPt. */
+  readonly anchorLineExemptTopPt?: number;
 }
 
 /** Point-space snapshot used while final table-fragment float placement is
@@ -776,6 +929,10 @@ export type FloatRegistryEntryPt =
     }>
   | Readonly<FloatRegistryEntryCorePt & {
       readonly kind: 'frame';
+      /** §17.18.104 framePr wrap projected by `frameWrapExclusionMode`.
+       * Body paragraph frames and cell-owner row hosts always state it;
+       * absent projects square. */
+      readonly exclusionMode?: 'square' | 'topAndBottom';
     }>;
 
 export type FloatRegistryCoordinateSpace = Exclude<
@@ -849,6 +1006,7 @@ export interface ResolvedFloatingTablePlacementLayout {
 
 export interface TextBoxLayout extends LayoutNodeBase {
   readonly kind: 'textbox';
+  readonly clipRects?: readonly LayoutRect[];
   readonly story: StoryLayout;
   /** DrawingML fontRef color inherited by runs without an explicit w:color. */
   readonly defaultTextColor?: string;
@@ -885,12 +1043,49 @@ export interface StoryLayout {
   readonly blocks: readonly PaintNode[];
   readonly advancePt: number;
   readonly diagnostics: readonly LayoutDiagnostic[];
+  /** @internal The story holds content only a page position places — a
+   * page- or margin-anchored header/footer root cell-owner host
+   * (table-owner-runs.ts), §17.4.57 positioned tables of its tables, or a
+   * text box whose story holds such content — so its geometry depends on the
+   * placement its composer gives it
+   * (`StoryLayoutAcquisitionInput.bandTranslationPt` / `pageFrames`). */
+  readonly bandDependent?: true;
+}
+
+/** Page-owned occurrence of one reserved separator story: the separator or
+ * continuation separator leading a page's note band
+ * (ECMA-376 §17.11.23 / §17.11.1), or the continuation notice ending a page on
+ * which a note continues (§17.18.33). The canonical reserved source is shared
+ * by every occurrence; geometry belongs to this destination page. */
+export interface NoteSeparatorLayout {
+  readonly role: 'separator' | 'continuationSeparator' | 'continuationNotice';
+  readonly source: SourceRef;
+  readonly flowBounds: LayoutRect;
+  readonly advancePt: number;
+  /** The story's acquired paragraph; it paints its own decorations only. */
+  readonly paragraph?: ParagraphLayout;
+  /** Ink of the U+0003/U+0004 control, emitted only here. */
+  readonly rule?: Readonly<{
+    mark: 'short' | 'full';
+    source: SourceRef;
+    segment: BorderSegment;
+  }>;
 }
 
 export interface NoteLayout extends LayoutNodeBase {
+  /** One page-wide area: a common reserve and this column chunk's top offset. */
+  readonly pageArea?: Readonly<{ heightPt: number; offsetPt: number }>;
+  /** Acquisition origin for reusing equal-width shaped suffixes. */
+  readonly acquisitionSourceStart?: NoteSourceContinuation;
   readonly kind: 'note';
+  /** Scalar library rule of the modern/absent-native path. Empty when a
+   * reserved {@link leading} occurrence owns the separator. */
   readonly separator: readonly BorderSegment[];
+  readonly leading?: NoteSeparatorLayout;
   readonly story: StoryLayout;
+  /** The page's continuation notice (§17.18.33), owned by the last note of a
+   * band in which some note continues on a later page. */
+  readonly trailing?: NoteSeparatorLayout;
 }
 
 export type PaintNode = ParagraphLayout | TableLayout | DrawingLayout | TextBoxLayout | NoteLayout;
@@ -1051,23 +1246,10 @@ export interface LayoutPage {
   readonly changeBars?: readonly ChangeBarLayout[];
 }
 
-export type LayoutDiagnosticCode =
-  | 'FLOW_OVERLAP'
-  | 'BOTTOM_MARGIN_INVASION'
-  | 'FLOW_DOMAIN_INVASION'
-  | 'INVALID_REFERENCE'
-  | 'INVALID_GEOMETRY'
-  | 'INVALID_VALUE'
-  | 'MISSING_RESOURCE'
-  | 'NON_CONVERGENCE'
-  | 'UNSUPPORTED_FEATURE';
-
-export interface LayoutDiagnostic {
-  readonly code: LayoutDiagnosticCode;
-  readonly severity: 'warning' | 'error';
-  readonly source?: SourceRef;
-  readonly message: string;
-}
+// Layout and resource acquisition share the public diagnostic value contract.
+// Keeping aliases here does not expose the retained layout implementation.
+export type LayoutDiagnosticCode = DocxDiagnosticCode;
+export type LayoutDiagnostic = DocxDiagnostic;
 
 export interface DocumentLayout {
   readonly pages: readonly LayoutPage[];
@@ -1077,6 +1259,9 @@ export interface DocumentLayout {
 export type CompatibilityEvidence =
   | Readonly<{ kind: 'microsoft-note'; reference: string }>
   | Readonly<{ kind: 'regression-test'; reference: string }>
+  /** Library policy with no Office measurement: the record's description must
+   * give the rationale; `reference` names the DOCX test that pins it. */
+  | Readonly<{ kind: 'library-policy'; reference: string }>
   | Readonly<{
       kind: 'office-observation';
       syntheticFixtureId: string;
@@ -1095,6 +1280,9 @@ export interface LayoutServices {
   readonly text: TextLayoutService;
   readonly images: ImageMetadataService;
   readonly math: MathMetadataService;
+  /** Immutable document-level capability for paragraph footnote continuation.
+   * Unsupported cuts fail explicitly; this does not select another renderer. */
+  readonly allowFootnoteContinuation?: boolean;
   /** Geometry-affecting vertical glyph acquisition capability. Kept separate
    * from horizontal text shaping so each service fingerprint stays truthful. */
   readonly verticalGlyphFingerprint?: string;
@@ -1177,6 +1365,10 @@ export interface TableCellBlockInput {
   readonly layout: ParagraphLayout | TableLayout;
   /** Stable source index; continuation slices must not renumber field ownership. */
   readonly sourceBlockIndex: number;
+  /** Effective ECMA-376 §17.3.1.14 paragraph policy; absent for tables. */
+  readonly keepLines?: boolean;
+  /** Effective ECMA-376 §17.3.1.44 paragraph policy; absent for tables. */
+  readonly widowControl?: boolean;
   /** True when destination-page context can change the acquired child geometry. */
   readonly pageDependent?: boolean;
   /** The required empty paragraph after a nested table owns no row-height ink. */
@@ -1193,6 +1385,10 @@ export interface TableColumnCellConstraint {
   readonly columnStart: number;
   readonly columnSpan: number;
   readonly preferredWidth: TablePreferredWidthConstraint | null;
+  /** §17.4.29 protects a dxa preference during AutoFit shrinking. */
+  readonly noWrap?: boolean;
+  /** Resolved §17.4.42 horizontal cell margins included in content widths. */
+  readonly horizontalMarginsPt?: number;
   readonly minContentWidthPt: number;
   readonly maxContentWidthPt: number;
 }
@@ -1214,6 +1410,11 @@ export interface TableColumnLayoutInput {
   /** Physical occurrence ceiling. `null` means the containing frame imposes
    * no width ceiling (for example, an authored fixed table nested in a cell). */
   readonly availableWidthPt: number | null;
+  /** The outer-cell margin portion of the physical AutoFit ceiling. */
+  readonly outerMarginAllowancePt?: number;
+  /** WORD_AUTOFIT_CONTENT_COLUMN_GROWTH: let unpreferred content columns grow
+   * past the saved grid toward their maximum content width. */
+  readonly growUnpreferredColumns?: boolean;
   readonly gridWidthsPt: readonly number[];
   readonly gridWidthKeys?: readonly (string | null)[];
   readonly tablePreferredWidthPt: number | null;
@@ -1256,13 +1457,20 @@ export interface TableRowFormatInput {
   readonly cellSpacingPt: number;
   readonly justification: string | null;
   readonly exception: TableRowExceptionInput | null;
-  readonly cells: readonly { readonly marginsPt: TableCellMarginsInput }[];
+  readonly cells: readonly {
+    readonly marginsPt: TableCellMarginsInput;
+    /** Null unless the effective margin comes from an authored/inherited
+     * legacy left element. Defaults and logical margins are unmeasured. */
+    readonly originLeftMarginPt?: number | null;
+  }[];
 }
 
 /** Immutable parser/model projection consumed by table acquisition. */
 export interface TableFormatInput {
   readonly effectiveStyleId: string | null;
   readonly ordinaryFlow: boolean;
+  /** The producer supplies the indent as the physical outer table edge. */
+  readonly outerEdgeIndent?: boolean;
   /** Parser-owned ECMA-376 §17.4.37 logical table membership. */
   readonly logicalSequenceId?: string | null;
   readonly logicalRowOffset?: number;
@@ -1272,8 +1480,15 @@ export interface TableFormatInput {
   readonly firstRowException: TableRowExceptionInput | null;
 }
 
-/** Parser-independent positioning facts retained from §17.4.57 `<w:tblpPr>`. */
+/** Parser-independent positioning facts from §17.4.57 `<w:tblpPr>` or an
+ * acquired homogeneous cell-owned grid frame. */
 export interface FloatingTablePositionInput {
+  /** A grid frame at its host cell's insertion cursor. The following paragraph
+   * may select its page, but its before-spacing is not this vertical anchor. */
+  readonly textAnchor?: 'cell-start';
+  /** Bounded acquired grid-frame policy: the host content band determines
+   * alignment independently of fixed grid ink. Not a general AUTO-width rule. */
+  readonly widthBasis?: 'host-cell-content';
   readonly leftFromTextPt: number;
   readonly rightFromTextPt: number;
   readonly topFromTextPt: number;
@@ -1302,7 +1517,21 @@ export interface TableCellLayoutInput {
   readonly vAlign: 'top' | 'center' | 'bottom';
   readonly background?: FillPaint;
   readonly borders: TableEdgeInputs;
+  /** ECMA-376 §17.4.73 / §17.4.79 cell diagonals (outside edge conflict
+   * resolution). Absent when the cell authors neither. */
+  readonly diagonalBorders?: Readonly<{
+    tl2br: TableBorderInput | null;
+    tr2bl: TableBorderInput | null;
+  }>;
   readonly blocks: readonly TableCellBlockInput[];
+  /** ECMA-376 §17.4.72 rotated cell text. Blocks were acquired with
+   * `lineLengthPt` as their line width; the cell requires
+   * `requiredLineLengthPt` of physical content height. */
+  readonly verticalText?: Readonly<{
+    mode: TableCellVerticalMode;
+    lineLengthPt: number;
+    requiredLineLengthPt: number;
+  }>;
 }
 
 export interface TableRowLayoutInput {
@@ -1318,12 +1547,26 @@ export interface TableRowLayoutInput {
   readonly exceptionBorders: TableEdgeInputs | null;
   /** Effective §17.4.27/.26 row alignment. */
   readonly alignment: 'left' | 'center' | 'right';
-  /** Effective table indent after Word's first-row tblPrEx rule. In an adjacent
+  /** Signed leading-axis origin translation after first-row tblPrEx and the
+   * measured margin-hang rule. In an adjacent
    * §17.4.37 group this is re-oriented into the group frame by the union
    * builder, so no separate physical-indent field is retained here. */
   readonly indentPt: number;
   readonly cells: readonly TableCellLayoutInput[];
   readonly repeatedHeader: boolean;
+  /** Cell-owner row carrier (table-owner-runs.ts): a plain snapshot
+   * of the leading logical-cell paragraph's parsed framePr and its source,
+   * present only on rows of a body, header or footer root table
+   * (tableRowsElectCarriers). A source fact only; owner runs and placement
+   * are resolved downstream. */
+  readonly ownerCarrier?: TableRowOwnerCarrier;
+}
+
+/** The framePr of a row's leading logical-cell paragraph and that paragraph's
+ * complete source. The paragraph itself remains ordinary cell content. */
+export interface TableRowOwnerCarrier {
+  readonly framePr: FramePr;
+  readonly source: SourceRef;
 }
 
 export interface TableLayoutInput {
@@ -1340,6 +1583,20 @@ export interface TableLayoutInput {
   readonly columnWidthKeys?: readonly (string | null)[];
   readonly borders: TableEdgeInputs;
   readonly rows: readonly TableRowLayoutInput[];
+  /** Cell-owner host segment (table-owner-runs.ts): the carrier shared by
+   * the owner run these rows form. Present only on a projected
+   * host segment, which its owning domain places out of ordinary flow. */
+  readonly ownerHost?: TableRowOwnerCarrier;
+  /** Cell-owner segment projection (table-owner-runs.ts ownerSegmentInput):
+   * the `logicalRowIndex` of a segment's first own row when that row, after
+   * the source table's first row, holds a vMerge continuation. In this input's
+   * grid such a continuation with no merged cell above it opens its merge
+   * region as an empty owner (table.ts gridMergeRole). The logical row index,
+   * not the row id, names it: every occurrence input pagination derives from
+   * the row (a cut fragment with its own fragment id, a page-dependent
+   * reacquisition, a bounded track window) keeps the source logical index,
+   * which is unique within one input. Absent on every other input. */
+  readonly segmentOpeningLogicalRowIndex?: number;
 }
 
 export type FlowBlockInput = ParagraphLayoutInput | TableLayoutInput;
@@ -1352,6 +1609,10 @@ export interface FlowContainer {
   /** Text boxes lay out complete overflow before applying bodyPr clipping or
    * spAutoFit to the outer frame. Other stories remain capacity-bounded. */
   readonly capacity?: 'bounded' | 'unbounded';
+  /** Authored DrawingML inline wrapping policy for text-box paragraphs. */
+  readonly noWrap?: boolean;
+  /** Upright inline math in a quarter-turn DrawingML WordArt frame. */
+  readonly quarterTurnMath?: boolean;
 }
 
 export interface FlowCursor extends PointPt {}
@@ -1392,4 +1653,33 @@ export interface BlockLayoutAlgorithms {
     placement: FlowBlockPlacement,
     services: LayoutServices,
   ): BlockLayoutResult<TableLayout>;
+}
+
+/** Effective private VML parser facts, projected before layout acquisition. */
+export interface VmlShapeAcquisitionFacts {
+  /** Cumulative group vector effect in points relative to the leaf origin. */
+  readonly vmlGroupTransform?: readonly [number, number, number, number, number, number];
+  readonly vmlSkew?: Readonly<{
+    offset: NonNullable<import('../types.js').ShapeRun['vmlShadow']>['offset'];
+    origin: readonly [number, number];
+    matrix: readonly [number, number, number, number, number, number];
+    absolutePerspective: boolean;
+  }>;
+  readonly vmlEdgeStrokes?: readonly Readonly<{
+    edge: 'left' | 'top' | 'right' | 'bottom' | 'column';
+    color: string;
+    widthPt: number;
+    dash?: string | null;
+    cap?: 'butt' | 'square' | 'round' | null;
+    join: 'miter' | 'bevel' | 'round';
+    miterLimit: number;
+    compound?: string | null;
+    image?: Extract<import('../types.js').ShapeFill, { fillType: 'image' }> | null;
+    pattern?: import('@silurus/ooxml-core').Duotone | null;
+  }>[];
+  readonly vmlStrokeFill?: Extract<import('../types.js').ShapeFill, { fillType: 'image' }>;
+  readonly vmlStrokePattern?: import('@silurus/ooxml-core').Duotone;
+  readonly vmlInsetPen?: boolean;
+  readonly vmlConcentricGradient?: boolean;
+  readonly vmlTextRects?: Array<[number, number, number, number]>;
 }

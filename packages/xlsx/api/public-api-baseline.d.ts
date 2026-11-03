@@ -12,6 +12,136 @@ export function autoResize(render: (width: number, height: number) => void | Pro
 export interface AutoResizeOptions {
     pauseWhenHidden?: boolean;
 }
+export type BlendMode = 'darken' | 'lighten' | 'mult' | 'over' | 'screen';
+export type BlipEffect = {
+    type: 'grayscale';
+} | {
+    type: 'biLevel';
+    thresh: number;
+} | {
+    type: 'colorChange';
+    from: string;
+    fromAlpha: number;
+    to: string;
+    toAlpha: number;
+    useAlpha: boolean;
+} | {
+    type: 'luminance';
+    bright: number;
+    contrast: number;
+} | {
+    type: 'duotone';
+    clr1?: string;
+    clr2?: string;
+} | {
+    type: 'alphaBiLevel';
+    thresh: number;
+} | {
+    type: 'alphaCeiling' | 'alphaFloor';
+} | {
+    type: 'alphaInv';
+    color?: string;
+} | {
+    type: 'hsl';
+    hue: number;
+    sat: number;
+    lum: number;
+} | {
+    type: 'tint';
+    hue: number;
+    amt: number;
+} | {
+    type: 'blur';
+    radius: number;
+    grow: boolean;
+} | {
+    type: 'alphaMod';
+    container: BlipEffectContainer;
+} | {
+    type: 'container';
+    container: BlipEffectContainer;
+} | {
+    type: 'reference';
+    reference: string;
+} | {
+    type: 'definitions';
+    containers: readonly BlipEffectContainer[];
+    work: number;
+} | {
+    type: 'effectCountLimit';
+    observed: number;
+} | {
+    type: 'alphaOutset';
+    radius: number;
+} | {
+    type: 'blend';
+    container: BlipEffectContainer;
+    blend: BlendMode;
+} | {
+    type: 'fill';
+    fill: BlipEffectFill;
+} | {
+    type: 'glow';
+    glow: Glow;
+} | {
+    type: 'shadow';
+    shadow: Shadow;
+    inner: boolean;
+} | {
+    type: 'softEdge';
+    radius: number;
+} | {
+    type: 'reflection';
+    reflection: Reflection & {
+        kx?: number;
+        ky?: number;
+        algn?: Shadow['algn'];
+        fadeDir?: number;
+        rotWithShape?: boolean;
+    };
+} | {
+    type: 'transform';
+    sx: number;
+    sy: number;
+    kx: number;
+    ky: number;
+    tx: number;
+    ty: number;
+} | {
+    type: 'relativeOffset';
+    tx: number;
+    ty: number;
+} | {
+    type: 'presetShadow';
+    shadows: readonly Shadow[];
+} | {
+    type: 'fillOverlay';
+    fill: BlipEffectFill;
+    blend: BlendMode;
+} | {
+    type: 'alphaModFix';
+    amt: number;
+} | {
+    type: 'alphaRepl';
+    alpha: number;
+} | {
+    type: 'colorReplace';
+    color: string;
+} | {
+    type: 'unsupported';
+    effect: string;
+};
+export interface BlipEffectContainer {
+    readonly kind: 'sib' | 'tree';
+    readonly name?: string;
+    readonly effects: readonly BlipEffect[];
+}
+export type BlipEffectFill = SolidFill | NoFill | PatternFill | (Omit<GradientFill, 'stops'> & {
+    readonly stops: readonly GradientStop[];
+}) | BlipEffectImageFill;
+export type BlipEffectImageFill = Omit<ImageFill, 'blipEffects'> & {
+    readonly blipEffects?: readonly BlipEffect[];
+};
 export interface Border {
     left: BorderEdge | null;
     right: BorderEdge | null;
@@ -53,6 +183,8 @@ export interface CellFont {
     size: number;
     color: string | null;
     name: string | null;
+    scheme?: 'major' | 'minor';
+    charset?: number;
     underlineStyle?: string;
     vertAlign?: 'superscript' | 'subscript';
 }
@@ -89,6 +221,7 @@ export interface CellXf {
     textRotation?: number;
     shrinkToFit?: boolean;
     readingOrder?: number;
+    ownFontColor?: boolean;
 }
 export interface CfIcon {
     iconSet: string;
@@ -100,6 +233,7 @@ export type CfRule = {
     formulas: string[];
     dxfId: number | null;
     priority: number;
+    stopIfTrue?: boolean;
 } | {
     type: 'expression';
     formula: string;
@@ -110,6 +244,8 @@ export type CfRule = {
     type: 'colorScale';
     stops: CfStop[];
     priority: number;
+    activeFormula?: string;
+    stopIfTrue?: boolean;
 } | {
     type: 'dataBar';
     color: string;
@@ -117,6 +253,9 @@ export type CfRule = {
     max: CfValue;
     priority: number;
     gradient: boolean;
+    activeFormula?: string;
+    extThresholdFormula?: boolean;
+    stopIfTrue?: boolean;
 } | {
     type: 'top10';
     top: boolean;
@@ -124,6 +263,7 @@ export type CfRule = {
     rank: number;
     dxfId: number | null;
     priority: number;
+    stopIfTrue?: boolean;
 } | {
     type: 'aboveAverage';
     aboveAverage: boolean;
@@ -131,6 +271,7 @@ export type CfRule = {
     stdDev?: number;
     dxfId: number | null;
     priority: number;
+    stopIfTrue?: boolean;
 } | {
     type: 'iconSet';
     iconSet: string;
@@ -138,10 +279,14 @@ export type CfRule = {
     reverse: boolean;
     priority: number;
     customIcons?: CfIcon[];
+    activeFormula?: string;
+    stopIfTrue?: boolean;
 } | {
     type: 'other';
     kind: string;
     priority: number;
+    unsupportedFormulaPhases?: number;
+    stopIfTrue?: boolean;
 };
 export interface CfStop {
     kind: string;
@@ -167,6 +312,10 @@ export interface ChartAnchor {
 export interface ChartAreaGroupDecorations {
     groupIndex: number;
     dropLines?: ChartDecorationLineStyle | null;
+}
+export interface ChartAxisNumberFormat {
+    authoredCode: string;
+    sourceLinked?: boolean | null;
 }
 export interface ChartBarGroupDecorations {
     groupIndex: number;
@@ -391,6 +540,7 @@ export interface ChartexHistogramBinning {
     intervalClosed?: 'l' | 'r' | null;
     underflow?: number | null;
     overflow?: number | null;
+    edgeFormatCode?: string | null;
 }
 export interface ChartexRegionMap {
     rows: ChartexRegionMapRow[];
@@ -483,6 +633,7 @@ export interface ChartModel {
     title: string | null;
     titleRichRuns?: ChartTextRun[] | null;
     titlePresent?: boolean;
+    authoredWithoutSeries?: boolean;
     categories: string[];
     categorySourceHidden?: boolean[] | null;
     categoryLevels?: string[][] | null;
@@ -562,6 +713,7 @@ export interface ChartModel {
     subtotalIndices: number[];
     legendManualLayout?: LegendManualLayout | null;
     valAxisFormatCode?: string | null;
+    valAxisNumberFormat?: ChartAxisNumberFormat | null;
     valAxisDisplayUnits?: ChartDisplayUnits | null;
     catAxisDisplayUnits?: ChartDisplayUnits | null;
     barGapWidth?: number | null;
@@ -650,6 +802,7 @@ export interface ChartModel {
     valAxisLineDash?: string | null;
     valAxisLinePaintAuthored?: boolean | null;
     catAxisFormatCode?: string | null;
+    catAxisNumberFormat?: ChartAxisNumberFormat | null;
     catAxisMin?: number | null;
     catAxisMax?: number | null;
     titleManualLayout?: ChartManualLayout | null;
@@ -733,6 +886,13 @@ export interface ChartModel {
     chartexTreemap?: ChartexTreemap | null;
     chartexRegionMap?: ChartexRegionMap | null;
     chartexHistogramBinning?: ChartexHistogramBinning | null;
+    chartexParetoOwnerIndex?: number | null;
+    chartexParetoSortDescending?: boolean | null;
+    chartexParetoFlatEndpoint?: boolean | null;
+    chartexSuppressGeometry?: boolean | null;
+    chartexParetoOutlineOwner?: boolean | null;
+    chartexPrimaryAxisRight?: boolean | null;
+    chartexShowUnpairedPercentageAxis?: boolean | null;
     chartexAccents?: string[] | null;
     chartexColorPalette?: Array<string | null> | null;
     chartexColorStyleMethod?: string | null;
@@ -1103,6 +1263,7 @@ export interface DefinedName {
     name: string;
     formula: string;
 }
+type DrawingAnchorTag = 'oneCellAnchor' | 'twoCellAnchor';
 export interface DrawingMLCustomDashSegment {
     dash: number;
     space: number;
@@ -1120,6 +1281,14 @@ export interface Dxf {
     fill: CellFill | null;
     border: Border | null;
     numFmt?: NumFmt | null;
+    fontToggles?: DxfFontToggles;
+}
+export interface DxfFontToggles {
+    bold?: boolean;
+    italic?: boolean;
+    underline?: boolean;
+    strike?: boolean;
+    automaticColor?: boolean;
 }
 type ExtensibleLiteral<Known extends string> = Known | (string & Record<never, never>);
 type Fill = SolidFill | NoFill | GradientFill | PatternFill | ImageFill;
@@ -1201,8 +1370,14 @@ export interface ImageAnchor {
     toRow: number;
     toRowOff: number;
     editAs?: string;
+    anchorTag?: DrawingAnchorTag;
+    anchorExtCx?: number;
+    anchorExtCy?: number;
     nativeExtCx: number;
     nativeExtCy: number;
+    rotation?: number;
+    flipH?: boolean;
+    flipV?: boolean;
     imagePath: string;
     mimeType: string;
     svgImagePath?: string;
@@ -1214,6 +1389,7 @@ export interface ImageAnchor {
     };
     alpha?: number;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
 }
 export interface ImageFill {
     fillType: 'image';
@@ -1228,6 +1404,7 @@ export interface ImageFill {
     tile?: TileInfo;
     alpha?: number;
     duotone?: Duotone__emitterCollision1;
+    blipEffects?: BlipEffect[];
 }
 export interface ImageResourceOptions {
     decodedByteBudget?: number;
@@ -1248,6 +1425,7 @@ export interface LegendManualLayout {
 }
 export interface LoadOptions extends LoadOptions__emitterCollision1 {
     mode?: 'main' | 'worker';
+    legacyXls?: ModelSource<'xlsx'>;
 }
 interface LoadOptions__emitterCollision1 {
     useGoogleFonts?: boolean;
@@ -1256,6 +1434,7 @@ interface LoadOptions__emitterCollision1 {
     wasmUrl?: string | URL;
     maxZipEntryBytes?: number;
     resourceLimits?: OoxmlResourceLimits;
+    xlsxWorksheetLimits?: XlsxWorksheetLimits;
     debug?: boolean;
     onResourceMetrics?: (metrics: OoxmlResourceMetrics) => void;
     workerTimeoutMs?: number;
@@ -1389,6 +1568,29 @@ export interface MergeCell {
     bottom: number;
     right: number;
 }
+const MODEL_SOURCE_MODULE_PROTOCOL = 'ooxml-model-source-module/v2';
+export interface ModelSource<T extends ModelSourceTarget = ModelSourceTarget> {
+    readonly target: T;
+    claim(bytes: Uint8Array): boolean;
+    beginLoad(): ModelSourceLoad;
+}
+export type ModelSourceConfig = Readonly<Record<string, ModelSourceConfigValue>>;
+export type ModelSourceConfigValue = string | number | boolean | null;
+export interface ModelSourceLoad {
+    readonly module: ModelSourceModuleDescriptor;
+    readonly transfer?: readonly Transferable[];
+    release(): void;
+}
+export interface ModelSourceModule<TArchive = unknown> {
+    openModelSource(bytes: Uint8Array, config: ModelSourceConfig, signal?: AbortSignal, transfer?: readonly Transferable[]): Promise<OpenedModelSource<TArchive>>;
+}
+export interface ModelSourceModuleDescriptor {
+    readonly protocol: typeof MODEL_SOURCE_MODULE_PROTOCOL;
+    readonly target: ModelSourceTarget;
+    readonly moduleUrl: string;
+    readonly config: ModelSourceConfig;
+}
+export type ModelSourceTarget = 'docx' | 'xlsx' | 'pptx';
 export interface NoFill {
     fillType: 'none';
 }
@@ -1403,12 +1605,13 @@ export class OoxmlDecodedImageLimitError extends RangeError {
     readonly code: 'ooxml-decoded-image-limit';
     constructor(metric: OoxmlDecodedImageLimitMetric, limit: number, observed: number);
 }
-export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes';
+export type OoxmlDecodedImageLimitMetric = 'image-dimension' | 'image-pixels' | 'active-decoded-bytes' | 'image-effect-count' | 'image-effect-work' | 'tiff-lzw-work' | 'metafile-path-commands' | 'metafile-record-points' | 'metafile-record-polygons' | 'metafile-record-rectangles' | 'metafile-record-text-units';
 export class OoxmlError extends Error {
     readonly code: OoxmlErrorCode;
-    constructor(code: OoxmlErrorCode, message: string);
+    readonly details?: OoxmlUnsupportedContentDetails;
+    constructor(code: OoxmlErrorCode, message: string, details?: OoxmlUnsupportedContentDetails);
 }
-export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml';
+export type OoxmlErrorCode = 'encrypted' | 'invalid-password' | 'unsupported-encryption' | 'legacy-binary-format' | 'not-ooxml' | 'unsupported-image-effect' | 'invalid-numbering' | 'unsupported-content';
 export type OoxmlErrorStage = 'container' | 'decompression' | 'parsing' | 'serialization' | 'layout' | 'rendering' | 'worker';
 export type OoxmlFormat = 'docx' | 'xlsx' | 'pptx';
 export type OoxmlResourceLimit = number | null;
@@ -1456,6 +1659,12 @@ export interface OoxmlResourcePolicySnapshot {
     readonly maxArchiveEntryBytes: number | null;
     readonly maxTotalInflatedBytes: number | null;
     readonly maxArchiveEntries: number | null;
+    readonly xlsxWorksheetLimits?: Readonly<{
+        readonly maxRows: number;
+        readonly maxCells: number;
+        readonly maxOwnedUtf8Bytes: number;
+        readonly maxJsonBytes: number;
+    }>;
 }
 export interface OoxmlResourceUsageSnapshot {
     readonly archiveEntryCount: number;
@@ -1475,6 +1684,15 @@ export interface OoxmlResourceViolation {
     readonly configurable: boolean;
     readonly usage: OoxmlResourceUsageSnapshot;
 }
+export interface OoxmlUnsupportedContentDetails {
+    readonly format: string;
+    readonly reason: 'source-subset';
+}
+export interface OpenedModelSource<TArchive> {
+    readonly archive: TArchive;
+    readonly viewDefaults?: Readonly<Record<string, boolean>>;
+    close(): void;
+}
 export function openExternalHyperlink(url: string, allowed?: readonly string[], win?: Pick<Window, 'open'> | undefined): boolean;
 export interface OutlinePr {
     summaryBelow: boolean;
@@ -1484,6 +1702,9 @@ export interface ParsedWorkbook {
     workbook: Workbook;
     styles: Styles;
     sharedStrings: SharedString[];
+    layoutMetrics?: {
+        maximumDigitWidth: number;
+    };
 }
 export type PathCmd = {
     op: 'moveTo';
@@ -1519,6 +1740,8 @@ export type PathCmd = {
 export interface PathInfo {
     w: number;
     h: number;
+    fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+    stroke?: false;
     commands: PathCmd[];
 }
 export interface PatternFill {
@@ -1539,6 +1762,10 @@ export interface PhoneticRun {
     text: string;
 }
 export type PhoneticType = 'fullwidthKatakana' | 'halfwidthKatakana' | 'Hiragana' | 'noConversion';
+export interface PivotAxisItem {
+    kind: string;
+    depth: number;
+}
 export type PivotCacheSource = {
     kind: 'worksheet';
     sheet?: string;
@@ -1634,6 +1861,23 @@ export interface PivotTableMetadata {
     cacheSource?: PivotCacheSource;
     status: PivotMetadataStatus;
     extensionUris?: string[];
+    style?: PivotTableStyle;
+    rowItems?: PivotAxisItem[];
+    columnItems?: PivotAxisItem[];
+}
+export interface PivotTableStyle {
+    name: string;
+    showRowHeaders: boolean;
+    showColumnHeaders: boolean;
+    showRowStripes: boolean;
+    showColumnStripes: boolean;
+    showLastColumn: boolean;
+    elements: PivotTableStyleElement[];
+}
+export interface PivotTableStyleElement {
+    kind: string;
+    size: number;
+    dxf: Dxf;
 }
 export interface Reflection {
     blur: number;
@@ -1681,6 +1925,7 @@ export interface RunFont {
     name?: string | null;
     underlineStyle?: string;
     vertAlign?: 'superscript' | 'subscript';
+    normalColor?: boolean;
 }
 export interface SecondaryValueAxis {
     style?: ChartExElementStyle | null;
@@ -1692,6 +1937,7 @@ export interface SecondaryValueAxis {
     title: string | null;
     hidden: boolean;
     formatCode?: string | null;
+    numberFormat?: ChartAxisNumberFormat | null;
     displayUnits?: ChartDisplayUnits | null;
     fontColor?: string | null;
     fontPaintAuthored?: boolean | null;
@@ -1762,6 +2008,9 @@ export interface ShapeAnchor {
     editAs?: string;
     nativeExtCx: number;
     nativeExtCy: number;
+    anchorTag?: DrawingAnchorTag;
+    anchorExtCx?: number;
+    anchorExtCy?: number;
     shapes: ShapeInfo[];
 }
 export type ShapeFill = Exclude<Fill, {
@@ -1789,6 +2038,7 @@ export type ShapeGeom = {
     };
     alpha?: number;
     duotone?: Duotone;
+    blipEffects?: BlipEffect[];
 };
 export interface ShapeInfo {
     zOrder?: number;
@@ -1829,10 +2079,20 @@ export interface ShapeParagraph {
     marL?: number;
     marR?: number;
     indent?: number;
+    defTabSz?: number;
+    tabStops?: {
+        pos: number;
+        algn: string;
+    }[];
     spaceLine?: SpaceLine | null;
+    spaceBefore?: SpaceLine | null;
+    spaceAfter?: SpaceLine | null;
     runs: ShapeTextRun[];
 }
 export interface ShapeText {
+    vert?: string;
+    anchorCtr?: boolean;
+    spcFirstLastPara?: boolean;
     anchor: string;
     wrap: string;
     autoFit?: string;
@@ -1850,6 +2110,7 @@ export type ShapeTextRun = {
     bold: boolean;
     italic: boolean;
     size: number;
+    spacing?: number;
     color?: string;
     fontFace?: string;
     fontFaceEa?: string;
@@ -1989,6 +2250,8 @@ export interface TableInfo {
     lastColumnDxf?: number;
     band1HorizontalDxf?: number;
     band2HorizontalDxf?: number;
+    styleElements?: PivotTableStyleElement[];
+    styleError?: string;
     columns: TableColumnInfo[];
 }
 export class TiffDecodeError extends Error {
@@ -2061,6 +2324,8 @@ export interface Worksheet {
     colCollapsed?: Record<number, boolean>;
     colHidden?: Record<number, boolean>;
     defaultColWidth: number;
+    baseColWidth?: number;
+    defaultColWidthIsUi?: boolean;
     defaultRowHeight: number;
     defaultRowHeightCustom?: boolean;
     mergeCells: MergeCell[];
@@ -2088,6 +2353,11 @@ export interface Worksheet {
     sparklineGroups?: SparklineGroup[];
     defaultFontFamily?: string;
     defaultFontSize?: number;
+    defaultFontBold?: boolean;
+    defaultFontItalic?: boolean;
+    normalFontSize?: number;
+    themeJapaneseMajorFont?: string;
+    themeJapaneseMinorFont?: string;
     date1904?: boolean;
     parseError?: string;
 }
@@ -2313,6 +2583,10 @@ export interface XlsxSheetViewerOptions extends LoadOptions {
     cellScale?: number;
     resizable?: boolean;
     showScrollbars?: boolean;
+    minRows?: number;
+    minCols?: number;
+    marginRows?: number;
+    marginCols?: number;
     zoomMin?: number;
     zoomMax?: number;
     onScaleChange?: (scale: number) => void;
@@ -2422,6 +2696,12 @@ export class XlsxWorkbook {
     private __privatePresence;
     private static __staticPrivatePresence;
     private constructor();
+}
+export interface XlsxWorksheetLimits {
+    maxRows?: number;
+    maxCells?: number;
+    maxOwnedUtf8Bytes?: number;
+    maxJsonBytes?: number;
 }
 export interface ZoomableViewer {
     getScale(): number;

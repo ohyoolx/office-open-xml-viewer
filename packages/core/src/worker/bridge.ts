@@ -25,6 +25,8 @@
  * timers and listeners are torn down on settle so nothing leaks.
  */
 
+import { createAbortError } from '../internal/abort.js';
+
 /** The subset of the DOM `Worker` interface the bridge depends on. Keeping it
  *  structural lets tests substitute an in-memory fake. The real `Worker`
  *  satisfies this — it exposes the `error` / `messageerror` events too. */
@@ -115,9 +117,7 @@ interface PendingEntry<TRes> {
 /** Build an `AbortError`-flavoured Error without depending on the environment's
  *  `DOMException` constructor (absent in some worker/test runtimes). */
 function abortError(): Error {
-  const err = new Error('worker request aborted');
-  err.name = 'AbortError';
-  return err;
+  return createAbortError('worker request aborted');
 }
 
 export class WorkerBridge<TRes = unknown> {
@@ -173,7 +173,17 @@ export class WorkerBridge<TRes = unknown> {
    */
   private _handleWorkerError = (e: ErrorEvent | MessageEvent): void => {
     const detail = 'message' in e && e.message ? `: ${e.message}` : '';
-    this._failure ??= new Error(`Worker error${detail}`);
+    // HTML sandboxing gives frames without allow-same-origin an opaque origin.
+    // Chromium reports a blocked Blob module-worker load there as an `error`
+    // with an empty message. Both rendering modes intentionally retain module
+    // Workers; opaque-origin frames are outside the supported browser setup,
+    // rather than a trigger for a classic-Worker or synchronous-parse fallback.
+    // Keep the normal error text when the browser supplies it, and treat this
+    // hint as diagnostic rather than a classified cause.
+    const opaqueOriginHint = e.type === 'error' && !detail && globalThis.origin === 'null'
+      ? ': this page has an opaque origin; a sandboxed iframe without allow-same-origin can block Worker loading'
+      : '';
+    this._failure ??= new Error(`Worker error${detail}${opaqueOriginHint}`);
     this._rejectAll(this._failure);
   };
 

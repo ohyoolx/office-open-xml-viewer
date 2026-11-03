@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import rustDiagnosticTypes from '../../parser/src/types.rs?raw';
-import { createBodyLayoutInput } from '../body-layout-input.js';
+import rustDiagnosticTypes from '../../model/src/lib.rs?raw';
+import { bodyLayoutAcquisitionInput } from '../parser-model.js';
+import { projectBodyLayoutInput } from './body-layout-input.js';
 import { createLayoutServices } from '../layout-runtime.js';
 import { layoutDocument } from '../document-layout.js';
 import type { InternalDocxDocumentModel } from '../parser-model.js';
@@ -16,12 +17,26 @@ const wire = (
   code: string,
   severity: ParseDiagnosticWire['severity'],
   path: readonly number[],
+  part = 'word/document.xml',
 ): ParseDiagnosticWire => ({
   code,
   severity,
-  part: 'word/document.xml',
+  part,
   path,
 });
+
+const CONTRACT_MISMATCH = {
+  code: 'INVALID_VALUE',
+  severity: 'warning',
+  message: 'The parser diagnostic contract did not match this renderer build',
+} as const;
+
+const NESTED_CELL_FRAME_FLOW = {
+  code: 'UNSUPPORTED_FEATURE',
+  severity: 'warning',
+  source: { story: 'body', storyInstance: 'body', path: [0] },
+  message: 'Nested-cell paragraph frames are retained but laid out in ordinary cell flow; their frame positioning is not implemented for this source',
+} as const;
 
 const section: SectionProps = {
   pageWidth: 200,
@@ -138,6 +153,23 @@ describe('private parser diagnostic mapping', () => {
     }]);
   });
 
+  it('accepts the nested-cell frame-flow fact only from the exact producer document part', () => {
+    expect(mapParseDiagnostics([
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0], 'document'),
+    ], 1)).toEqual([NESTED_CELL_FRAME_FLOW]);
+
+    // Each code is bound to one exact part: neither producer can claim the
+    // other's fact, and no near-miss part or severity is normalized.
+    for (const candidate of [
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0]),
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0], 'Document'),
+      wire('NESTED_CELL_FRAME_FLOW', 'error', [0], 'document'),
+      wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0], 'document'),
+    ]) {
+      expect(mapParseDiagnostics([candidate], 1)).toEqual([CONTRACT_MISMATCH]);
+    }
+  });
+
   it('preserves validated nested numeric source coordinates', () => {
     expect(mapParseDiagnostics([
       wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0, 3, 2]),
@@ -167,13 +199,40 @@ describe('private parser diagnostic mapping', () => {
       Object.entries(PARSER_DIAGNOSTIC_CONTRACT)
         .map(([code, contract]) => [code, contract.severity]),
     ));
+
+    // A code without its own Rust part constant is a WordprocessingML
+    // document-part fact (parser/src/parser.rs DOCUMENT_PART).
+    const rustParts: Record<string, string> = Object.fromEntries(
+      [...rustDiagnosticTypes.matchAll(
+        /pub const PARSE_DIAGNOSTIC_PART_([A-Z_]+):\s*&str\s*=\s*"([^"]+)";/g,
+      )].map((match) => [match[1]!, match[2]!]),
+    );
+    expect(Object.keys(rustParts).every((code) =>
+      Object.hasOwn(PARSER_DIAGNOSTIC_CONTRACT, code))).toBe(true);
+    expect(Object.fromEntries(
+      Object.entries(PARSER_DIAGNOSTIC_CONTRACT)
+        .map(([code, contract]) => [code, (contract as { part?: unknown }).part]),
+    )).toEqual(Object.fromEntries(
+      Object.keys(PARSER_DIAGNOSTIC_CONTRACT)
+        .map((code) => [code, rustParts[code] ?? 'word/document.xml']),
+    ));
+  });
+
+  it('attaches the nested-cell frame-flow warning to the final production layout', () => {
+    const model = document([
+      wire('NESTED_CELL_FRAME_FLOW', 'warning', [0], 'document'),
+    ]);
+    const services = createLayoutServices(model, { measureContext: measureContext() });
+
+    expect(layoutDocument(model, services, { currentDateMs: 0 }).diagnostics)
+      .toEqual([NESTED_CELL_FRAME_FLOW]);
   });
 
   it('crosses acquisition once and freezes the final layout diagnostic graph', () => {
     const model = document([
       wire('UNSUPPORTED_TEXT_EFFECT', 'warning', [0]),
     ]);
-    const input = createBodyLayoutInput(model as DocxDocumentModel);
+    const input = projectBodyLayoutInput(bodyLayoutAcquisitionInput(model as DocxDocumentModel));
 
     expect(structuredClone(input).parserDiagnostics).toEqual(input.parserDiagnostics);
     const services = createLayoutServices(model, { measureContext: measureContext() });

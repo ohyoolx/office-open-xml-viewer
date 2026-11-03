@@ -8,6 +8,8 @@
 //! pass can hand one complete paragraph/table/section block at a time to the
 //! existing semantic parser.
 
+use crate::chartex_choice::{self, Facts, Verdict, CHARTEX_NS, PATH};
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::rc::Rc;
 
@@ -23,7 +25,21 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::XmlVersion;
 
 const DOCUMENT_PART: &str = "word/document.xml";
-const STREAMED_XML_EVENT_BYTES: usize = 1024 * 1024;
+/// One lexical event (a start tag with all its attributes, a text node, a
+/// comment) may be as large as the logical body block that contains it, whose
+/// projection is already bounded by `HARD_MAX_DOCX_BODY_BLOCK_XML_BYTES`. A
+/// smaller per-event ceiling would reject blocks that ceiling admits, and Office
+/// writes such tokens: a legacy VML shape (ECMA-376 Part 4 §19.1.2.19,
+/// CT_Shape) carries the DrawingML equivalent as a base64-encoded package in its
+/// `o:gfxdata` attribute, so a single start tag grows with the shape's content
+/// and the format sets no bound on it. The event reader still stops one hostile
+/// or unterminated token at this ceiling rather than at the part size, and it
+/// applies equally to events that are not retained (an unselected
+/// `mc:Fallback`, a comment).
+pub(crate) const STREAMED_XML_EVENT_BYTES: usize = HARD_MAX_DOCX_BODY_BLOCK_XML_BYTES as usize;
+// Library resource policy: only retained namespace declarations and resolved
+// MCE state use this budget; ordinary attribute payload uses the event/block
+// ceiling, including when Part 3 §9.4 removes physical ancestors.
 const STREAMED_XML_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,21 +76,52 @@ enum ProcessedElementKind {
         selected_branch: bool,
         seen_choice: bool,
         seen_fallback: bool,
+        rollback_to: Option<usize>,
+        choice_end_len: usize,
     },
     AlternateBranch {
         selected: bool,
+        observer: Option<ChoiceObserver>,
+        filter_direct_children: bool,
     },
 }
 
 impl ElementFrame {
     fn children_are_visible(&self) -> bool {
         self.visible
-            && !matches!(
-                self.kind,
+            && match &self.kind {
                 ProcessedElementKind::Ignored
-                    | ProcessedElementKind::AlternateBranch { selected: false }
-            )
+                | ProcessedElementKind::AlternateBranch {
+                    selected: false, ..
+                } => false,
+                ProcessedElementKind::AlternateBranch {
+                    observer: Some(observer),
+                    ..
+                } if observer.discarded => false,
+                _ => true,
+            }
     }
+}
+
+// Fixed-size path state per selected Choice. `level` never retreats, enforcing
+// first matching direct child; `open_level` retreats on End, preventing a later
+// sibling container from supplying descendants of the first container.
+struct ChoiceObserver {
+    base_depth: usize,
+    capture_checkpoint: usize,
+    level: u8,
+    open_level: u8,
+    facts: Facts,
+    rid: Option<String>,
+    capability_provisional: bool,
+    discarded: bool,
+    deferred_must_understand: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ChoiceSupport {
+    understood: bool,
+    capability_provisional: bool,
 }
 
 #[derive(Default)]
@@ -100,6 +147,7 @@ struct Capture {
 pub(crate) struct DocumentBodyProjector<R: BufRead> {
     reader: BoundedXmlReader<R>,
     reporter: Option<PackageLimitReporter>,
+    renderable_chartex_rids: Rc<HashSet<String>>,
     frames: Vec<ElementFrame>,
     depth: usize,
     body_content_depth: Option<usize>,
@@ -108,14 +156,20 @@ pub(crate) struct DocumentBodyProjector<R: BufRead> {
     sdts: Vec<SdtFrame>,
     capture: Option<Capture>,
     cover_break_after: Vec<bool>,
+    discarded_provisional_choices: usize,
     finished: bool,
 }
 
 impl<R: BufRead> DocumentBodyProjector<R> {
-    pub(crate) fn new(source: R, reporter: Option<PackageLimitReporter>) -> Self {
+    pub(crate) fn new(
+        source: R,
+        reporter: Option<PackageLimitReporter>,
+        renderable_chartex_rids: Rc<HashSet<String>>,
+    ) -> Self {
         Self {
             reader: BoundedXmlReader::new(source, STREAMED_XML_EVENT_BYTES, "document body"),
             reporter,
+            renderable_chartex_rids,
             frames: Vec::new(),
             depth: 0,
             body_content_depth: None,
@@ -124,6 +178,7 @@ impl<R: BufRead> DocumentBodyProjector<R> {
             sdts: Vec::new(),
             capture: None,
             cover_break_after: Vec::new(),
+            discarded_provisional_choices: 0,
             finished: false,
         }
     }
@@ -132,10 +187,11 @@ impl<R: BufRead> DocumentBodyProjector<R> {
         if self.finished {
             return Ok(None);
         }
+        let mut event_buffer = Vec::new();
         loop {
             let bounded = self
                 .reader
-                .read_event()
+                .read_event_into(&mut event_buffer)
                 .map_err(|error| self.map_read_error(error))?;
             let source_offset = usize::try_from(bounded.span.start)
                 .map_err(|_| "document body source offset exceeds this platform".to_string())?;
@@ -165,43 +221,29 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                         ));
                     }
 
-                    let visible = self
+                    let mut visible = self
                         .frames
                         .last()
                         .is_none_or(ElementFrame::children_are_visible);
+                    if self.observe_choice_start(namespace, &start, false) {
+                        visible = false;
+                    }
                     let (kind, mce_scope) =
                         self.classify_processed_element(namespace, &start, &context, visible)?;
                     if self.capture.is_some() {
                         if let ProcessedElementKind::Retained { opaque, .. } = &kind {
                             if visible {
-                                let mut retained = start;
-                                self.prepare_retained_element(
-                                    &mut retained,
-                                    &context,
-                                    &mce_scope,
-                                    *opaque,
+                                self.append_retained_element(
+                                    &start, &context, &mce_scope, *opaque, false,
                                 )?;
-                                self.append_capture(Event::Start(retained))?;
                             }
                         }
                     } else if let ProcessedElementKind::Retained { opaque, .. } = &kind {
-                        if visible {
-                            let mut retained = start;
-                            if !*opaque {
-                                bounded_xml::strip_processed_mce_attributes(
-                                    self.reader.reader(),
-                                    &mut retained,
-                                    &mce_scope,
-                                    &docx_understands_namespace,
-                                    "document",
-                                )?;
-                            }
-                            self.handle_start(
-                                namespace,
-                                retained,
-                                &context,
-                                next_depth,
-                                source_offset,
+                        if visible
+                            && self.handle_start(namespace, &start, next_depth, source_offset)?
+                        {
+                            self.append_retained_element(
+                                &start, &context, &mce_scope, *opaque, false,
                             )?;
                         }
                     }
@@ -228,23 +270,22 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                     .map_err(|error| {
                         self.map_bounded_error(error, HardResourceLimitKind::XmlContextBytes)
                     })?;
-                    let visible = self
+                    let mut visible = self
                         .frames
                         .last()
                         .is_none_or(ElementFrame::children_are_visible);
+                    if self.observe_choice_start(namespace, &empty, true) {
+                        visible = false;
+                    }
                     let (kind, mce_scope) =
                         self.classify_processed_element(namespace, &empty, &context, visible)?;
+                    self.reject_empty_provisional_choice(&kind);
                     if self.capture.is_some() {
                         match kind {
                             ProcessedElementKind::Retained { opaque, .. } if visible => {
-                                let mut retained = empty;
-                                self.prepare_retained_element(
-                                    &mut retained,
-                                    &context,
-                                    &mce_scope,
-                                    opaque,
+                                self.append_retained_element(
+                                    &empty, &context, &mce_scope, opaque, true,
                                 )?;
-                                self.append_capture(Event::Empty(retained))?;
                             }
                             ProcessedElementKind::AlternateContent {
                                 seen_choice: false, ..
@@ -259,20 +300,11 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                     } else {
                         match kind {
                             ProcessedElementKind::Retained { opaque, .. } if visible => {
-                                let mut retained = empty;
-                                if !opaque {
-                                    bounded_xml::strip_processed_mce_attributes(
-                                        self.reader.reader(),
-                                        &mut retained,
-                                        &mce_scope,
-                                        &docx_understands_namespace,
-                                        "document",
+                                if self.handle_empty(namespace, &empty, source_offset)? {
+                                    self.append_retained_element(
+                                        &empty, &context, &mce_scope, opaque, true,
                                     )?;
-                                }
-                                if let Some(block) =
-                                    self.handle_empty(namespace, retained, &context, source_offset)?
-                                {
-                                    return Ok(Some(block));
+                                    return self.finish_capture().map(Some);
                                 }
                             }
                             ProcessedElementKind::AlternateContent {
@@ -288,12 +320,14 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                     }
                 }
                 Event::End(end) => {
+                    self.observe_choice_end()?;
                     if let Some(capture) = self.capture.as_ref() {
                         let closes_capture = self.depth == capture.root_depth;
-                        let retained = self.frames.last().is_some_and(|frame| {
-                            frame.visible
-                                && matches!(frame.kind, ProcessedElementKind::Retained { .. })
-                        });
+                        let retained = self.discarded_provisional_choices == 0
+                            && self.frames.last().is_some_and(|frame| {
+                                frame.visible
+                                    && matches!(frame.kind, ProcessedElementKind::Retained { .. })
+                            });
                         self.handle_end(namespace, end.local_name().as_ref())?;
                         if retained {
                             self.append_capture(Event::End(end))?;
@@ -331,7 +365,11 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                                 frame.kind,
                                 ProcessedElementKind::Retained { .. }
                                     | ProcessedElementKind::Unwrapped
-                                    | ProcessedElementKind::AlternateBranch { selected: true }
+                                    | ProcessedElementKind::AlternateBranch {
+                                        selected: true,
+                                        filter_direct_children: false,
+                                        ..
+                                    }
                             )
                     });
                     if self.capture.is_some() && retained_content {
@@ -340,6 +378,286 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                 }
             }
         }
+    }
+
+    fn observe_choice_start(
+        &mut self,
+        namespace: Option<&str>,
+        element: &BytesStart<'_>,
+        empty: bool,
+    ) -> bool {
+        let local = element.local_name();
+        let Ok(local) = std::str::from_utf8(local.as_ref()) else {
+            return false;
+        };
+        let mut discard_checkpoint = None;
+        let mut discarded_count = 0usize;
+        // Only the five raw ancestor slots can participate in the path. No
+        // descendants scan, sibling rescan, or retained unselected payload.
+        for k in 1..=PATH.len().min(self.frames.len()) {
+            let index = self.frames.len() - k;
+            let ProcessedElementKind::AlternateBranch {
+                observer: Some(observer),
+                ..
+            } = &mut self.frames[index].kind
+            else {
+                continue;
+            };
+            if observer.discarded {
+                continue;
+            }
+            debug_assert_eq!(self.depth + 1 - observer.base_depth, k);
+            if k == 1 {
+                observer.facts.direct_children = observer.facts.direct_children.saturating_add(1);
+            }
+            let path_match = observer.level as usize == k - 1
+                && observer.open_level as usize == k - 1
+                && PATH[k - 1].matches(namespace, local);
+            if observer.capability_provisional
+                && k == 1
+                && (observer.facts.direct_children != 1 || !path_match)
+            {
+                observer.discarded = true;
+                discarded_count += 1;
+                discard_checkpoint = Some(
+                    discard_checkpoint.map_or(observer.capture_checkpoint, |checkpoint: usize| {
+                        checkpoint.min(observer.capture_checkpoint)
+                    }),
+                );
+                continue;
+            }
+            if !path_match {
+                continue;
+            }
+            observer.level = k as u8;
+            if !empty {
+                observer.open_level = k as u8;
+            }
+            if k == 1 {
+                observer.facts.drawing = true;
+            }
+            if k == 4 || k == 5 {
+                for attribute in element.attributes() {
+                    let Ok(attribute) = attribute else {
+                        observer.facts.chartex_uri = false;
+                        break;
+                    };
+                    let (ns, name) = self
+                        .reader
+                        .reader()
+                        .resolver()
+                        .resolve_attribute(attribute.key);
+                    if (k == 4 && attribute.key.as_ref() == b"uri")
+                        || (k == 5
+                            && name.as_ref() == b"id"
+                            && bounded_xml::resolved_namespace_is(&ns, |ns| {
+                                ooxml_common::ns::is_r_ns(Some(ns))
+                            }))
+                    {
+                        let Ok(value) = attribute.normalized_value(XmlVersion::Implicit1_0) else {
+                            // Observation adds no XML error path. Leave malformed
+                            // attribute bytes to the parent's validation instead
+                            // of replacing them with a resource fallback.
+                            observer.facts.chartex_uri = false;
+                            break;
+                        };
+                        if k == 4 {
+                            observer.facts.chartex_uri = value == CHARTEX_NS;
+                        } else {
+                            observer.rid = Some(value.into_owned());
+                        }
+                    }
+                }
+                if observer.capability_provisional && k == 4 && !observer.facts.chartex_uri {
+                    observer.discarded = true;
+                    discarded_count += 1;
+                    discard_checkpoint = Some(
+                        discard_checkpoint
+                            .map_or(observer.capture_checkpoint, |checkpoint: usize| {
+                                checkpoint.min(observer.capture_checkpoint)
+                            }),
+                    );
+                }
+            }
+        }
+        if let Some(checkpoint) = discard_checkpoint {
+            self.discarded_provisional_choices += discarded_count;
+            self.capture
+                .as_mut()
+                .expect("provisional observer requires capture")
+                .xml
+                .truncate(checkpoint);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reject_empty_provisional_choice(&mut self, kind: &ProcessedElementKind) {
+        let ProcessedElementKind::AlternateBranch {
+            observer:
+                Some(ChoiceObserver {
+                    capability_provisional: true,
+                    capture_checkpoint,
+                    ..
+                }),
+            ..
+        } = kind
+        else {
+            return;
+        };
+        self.capture
+            .as_mut()
+            .expect("provisional observer requires capture")
+            .xml
+            .truncate(*capture_checkpoint);
+        if let Some(ElementFrame {
+            kind:
+                ProcessedElementKind::AlternateContent {
+                    selected_branch, ..
+                },
+            ..
+        }) = self.frames.last_mut()
+        {
+            *selected_branch = false;
+        }
+    }
+
+    fn observe_choice_end(&mut self) -> Result<(), String> {
+        for k in 1..=PATH.len().min(self.frames.len().saturating_sub(1)) {
+            let index = self.frames.len() - k - 1;
+            if let ProcessedElementKind::AlternateBranch {
+                observer: Some(observer),
+                ..
+            } = &mut self.frames[index].kind
+            {
+                if observer.open_level as usize == k {
+                    observer.open_level -= 1;
+                }
+            }
+        }
+        let Some((capability_provisional, discarded, verdict, checkpoint, deferred_error)) = self
+            .frames
+            .last_mut()
+            .and_then(|frame| match &mut frame.kind {
+                ProcessedElementKind::AlternateBranch {
+                    observer: Some(observer),
+                    ..
+                } => {
+                    observer.facts.renderable_rid = observer
+                        .rid
+                        .as_ref()
+                        .is_some_and(|rid| self.renderable_chartex_rids.contains(rid));
+                    let verdict = if observer.discarded {
+                        Verdict::Parent
+                    } else {
+                        chartex_choice::verdict(&observer.facts)
+                    };
+                    Some((
+                        observer.capability_provisional,
+                        observer.discarded,
+                        verdict,
+                        observer.capture_checkpoint,
+                        observer.deferred_must_understand,
+                    ))
+                }
+                _ => None,
+            })
+        else {
+            return Ok(());
+        };
+        if discarded {
+            self.discarded_provisional_choices =
+                self.discarded_provisional_choices.saturating_sub(1);
+        }
+        let end_len = self
+            .capture
+            .as_ref()
+            .expect("observer requires capture")
+            .xml
+            .len();
+        let parent = self.frames.len() - 2;
+        if let ProcessedElementKind::AlternateContent {
+            selected_branch,
+            rollback_to,
+            choice_end_len,
+            ..
+        } = &mut self.frames[parent].kind
+        {
+            if capability_provisional && verdict == Verdict::Parent {
+                // The 2015 token is unsupported outside this exact ChartEx
+                // shape. Restore the parent's open selection state so a later
+                // Choice or the Fallback wins, and retain none of this branch.
+                self.capture
+                    .as_mut()
+                    .expect("observer requires capture")
+                    .xml
+                    .truncate(checkpoint);
+                *selected_branch = false;
+            } else if verdict == Verdict::Unrenderable {
+                // Keep selected_branch set: later understood Choices remain
+                // dropped. Without an authored Fallback, leave the Choice bytes.
+                *rollback_to = Some(checkpoint);
+                *choice_end_len = end_len;
+            }
+        }
+        // ECMA-376 Part 3 §§9.3–9.4: process MustUnderstand only after
+        // Choice selection. A 2015-only Choice is provisional until its exact
+        // ChartEx shape is known; a discarded ordinary drawing must not reject
+        // the document. Selected ChartEx branches keep the existing mismatch.
+        if deferred_error
+            && !(capability_provisional && verdict == Verdict::Parent)
+            && !Self::defer_must_understand_mismatch(self.frames.iter_mut().rev().skip(1))
+        {
+            // The diagnostic intentionally omits the namespace text: retaining
+            // one authored namespace string per pending Choice could multiply
+            // the bounded namespace-context budget by nesting depth.
+            return Err(
+                "document MCE MustUnderstand namespace is not understood in selected ChartEx Choice"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_processed_must_understand(&mut self, namespaces: &[String]) -> Result<(), String> {
+        if namespaces
+            .iter()
+            .any(|namespace| !docx_understands_namespace(namespace))
+            && Self::defer_must_understand_mismatch(self.frames.iter_mut().rev())
+        {
+            return Ok(());
+        }
+        bounded_xml::validate_mce_must_understand(
+            namespaces,
+            &docx_understands_namespace,
+            "document",
+        )
+    }
+
+    fn defer_must_understand_mismatch<'a>(
+        frames: impl Iterator<Item = &'a mut ElementFrame>,
+    ) -> bool {
+        for frame in frames {
+            if let ProcessedElementKind::AlternateBranch {
+                observer: Some(observer),
+                ..
+            } = &mut frame.kind
+            {
+                if observer.capability_provisional {
+                    // A discarded Choice is already unselected even while its
+                    // descendant frames remain open. Absorb their mismatches
+                    // here rather than validating them or deferring outward.
+                    if !observer.discarded {
+                        // One bit per depth-bounded observer; retain neither
+                        // descendant payload nor authored namespace text.
+                        observer.deferred_must_understand = true;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub(crate) fn plan(&self) -> Result<DocumentBodyPlan, String> {
@@ -363,6 +681,19 @@ impl<R: BufRead> DocumentBodyProjector<R> {
             .last()
             .map(|frame| Rc::clone(&frame.mce_scope))
             .unwrap_or_else(StreamedMceScope::root);
+        if self.frames.last().is_some_and(|frame| {
+            matches!(
+                frame.kind,
+                ProcessedElementKind::AlternateBranch {
+                    filter_direct_children: true,
+                    ..
+                }
+            )
+        }) && !(is_w_ns(namespace)
+            && matches!(element.local_name().as_ref(), b"drawing" | b"pict"))
+        {
+            return Ok((ProcessedElementKind::Ignored, inherited));
+        }
         if !visible {
             return Ok((ProcessedElementKind::Ignored, inherited));
         }
@@ -452,11 +783,25 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                     }
                 )
             });
-            let choice_understood = if local_name == "Choice" && selection_open {
+            let mut choice_support = if local_name == "Choice" && selection_open {
                 Some(self.streamed_choice_is_understood(element, context)?)
             } else {
                 None
             };
+            if choice_support.is_some_and(|support| support.capability_provisional)
+                && attributes
+                    .must_understand
+                    .iter()
+                    .any(|namespace| !docx_understands_namespace(namespace))
+            {
+                // The parent leaves a 2015-only Choice unselected, so its
+                // MustUnderstand must remain inactive until the Choice has both
+                // the narrow ChartEx shape and processable MCE requirements.
+                choice_support = Some(ChoiceSupport {
+                    understood: false,
+                    capability_provisional: false,
+                });
+            }
 
             let alternate = self
                 .frames
@@ -466,10 +811,18 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                 selected_branch,
                 seen_choice,
                 seen_fallback,
+                rollback_to,
+                choice_end_len,
             } = &mut alternate.kind
             else {
                 unreachable!("AlternateContent parent checked")
             };
+            let fallback_override = local_name == "Fallback" && rollback_to.is_some();
+            let fallback_understood = attributes
+                .must_understand
+                .iter()
+                .all(|namespace| docx_understands_namespace(namespace));
+            let filter_direct_children = fallback_override && fallback_understood;
             let selected = if local_name == "Choice" {
                 if *seen_fallback {
                     return Err(
@@ -479,7 +832,9 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                 }
                 *seen_choice = true;
                 !*selected_branch
-                    && choice_understood.expect("open Choice selection has a classification")
+                    && choice_support
+                        .expect("open Choice selection has a classification")
+                        .understood
             } else {
                 if !*seen_choice {
                     return Err(
@@ -494,33 +849,59 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                     );
                 }
                 *seen_fallback = true;
-                !*selected_branch
+                if fallback_override && !fallback_understood {
+                    // The parent selected Choice remains authoritative when the
+                    // resource override's Fallback cannot satisfy §9.4.
+                    rollback_to.take();
+                    false
+                } else if let Some(checkpoint) = rollback_to.take() {
+                    let capture = self.capture.as_mut().expect("observer requires capture");
+                    debug_assert_eq!(capture.xml.len(), *choice_end_len);
+                    capture.xml.truncate(checkpoint);
+                    true
+                } else {
+                    !*selected_branch
+                }
             };
             if selected {
                 *selected_branch = true;
-                bounded_xml::validate_mce_must_understand(
-                    &attributes.must_understand,
-                    &docx_understands_namespace,
-                    "document",
-                )?;
+                self.validate_processed_must_understand(&attributes.must_understand)?;
             }
             return Ok((
-                ProcessedElementKind::AlternateBranch { selected },
+                ProcessedElementKind::AlternateBranch {
+                    selected,
+                    observer: (selected && local_name == "Choice")
+                        .then(|| {
+                            self.capture.as_ref().map(|capture| ChoiceObserver {
+                                base_depth: self.depth + 1,
+                                capture_checkpoint: capture.xml.len(),
+                                level: 0,
+                                open_level: 0,
+                                facts: Facts::default(),
+                                rid: None,
+                                capability_provisional: choice_support
+                                    .expect("selected Choice has a classification")
+                                    .capability_provisional,
+                                discarded: false,
+                                deferred_must_understand: false,
+                            })
+                        })
+                        .flatten(),
+                    filter_direct_children,
+                },
                 attributes.scope,
             ));
         }
 
         if is_mc && local_name == "AlternateContent" {
-            bounded_xml::validate_mce_must_understand(
-                &attributes.must_understand,
-                &docx_understands_namespace,
-                "document",
-            )?;
+            self.validate_processed_must_understand(&attributes.must_understand)?;
             return Ok((
                 ProcessedElementKind::AlternateContent {
                     selected_branch: false,
                     seen_choice: false,
                     seen_fallback: false,
+                    rollback_to: None,
+                    choice_end_len: 0,
                 },
                 attributes.scope,
             ));
@@ -535,21 +916,13 @@ impl<R: BufRead> DocumentBodyProjector<R> {
                     element,
                     "document",
                 )?;
-                bounded_xml::validate_mce_must_understand(
-                    &attributes.must_understand,
-                    &docx_understands_namespace,
-                    "document",
-                )?;
+                self.validate_processed_must_understand(&attributes.must_understand)?;
                 return Ok((ProcessedElementKind::Unwrapped, attributes.scope));
             }
             return Ok((ProcessedElementKind::Ignored, attributes.scope));
         }
 
-        bounded_xml::validate_mce_must_understand(
-            &attributes.must_understand,
-            &docx_understands_namespace,
-            "document",
-        )?;
+        self.validate_processed_must_understand(&attributes.must_understand)?;
         Ok((
             ProcessedElementKind::Retained {
                 namespace: namespace.map(str::to_string),
@@ -560,13 +933,16 @@ impl<R: BufRead> DocumentBodyProjector<R> {
         ))
     }
 
-    fn prepare_retained_element(
-        &self,
-        element: &mut BytesStart<'static>,
+    fn append_retained_element(
+        &mut self,
+        element: &BytesStart<'_>,
         context: &NamespaceContext,
         scope: &StreamedMceScope,
         opaque: bool,
+        empty: bool,
     ) -> Result<(), String> {
+        let capture = self.capture.as_ref().expect("retained element has capture");
+        let block_root = capture.root_depth == self.depth + 1;
         let processed_parent = self
             .frames
             .iter()
@@ -580,35 +956,46 @@ impl<R: BufRead> DocumentBodyProjector<R> {
         let physical_parent_is_retained = self.frames.last().is_some_and(|frame| {
             frame.visible && matches!(frame.kind, ProcessedElementKind::Retained { .. })
         });
-        if !physical_parent_is_retained {
-            bounded_xml::inject_missing_namespaces(
-                element,
-                context,
-                processed_parent,
-                STREAMED_XML_CONTEXT_BYTES,
-                "document body block",
-            )
-            .map_err(|error| {
-                self.map_bounded_error(error, HardResourceLimitKind::XmlContextBytes)
-            })?;
+        // Part 3 §9.4 removes selected Choice/ProcessContent ancestors. Repair
+        // their namespace bindings together with stripping/quote conversion in
+        // one exact preflight against the REMAINING block budget, then write
+        // directly to the block. The caller borrows the sole event buffer.
+        let repair = if block_root {
+            Some((context, None))
+        } else if !physical_parent_is_retained {
+            Some((context, processed_parent))
+        } else {
+            None
+        };
+        let result = bounded_xml::append_projected_start_tag(
+            &mut self
+                .capture
+                .as_mut()
+                .expect("retained element has capture")
+                .xml,
+            self.reader.reader(),
+            element,
+            bounded_xml::StartTagProjection {
+                repair,
+                mce: (!opaque).then_some((scope, &docx_understands_namespace)),
+                empty,
+            },
+            HARD_MAX_DOCX_BODY_BLOCK_XML_BYTES as usize,
+        );
+        if matches!(result, Err(BoundedXmlError::Limit { .. })) && self.discard_overflowing_choice()
+        {
+            return Ok(());
         }
-        if !opaque {
-            bounded_xml::strip_processed_mce_attributes(
-                self.reader.reader(),
-                element,
-                scope,
-                &docx_understands_namespace,
-                "document",
-            )?;
-        }
-        Ok(())
+        result.map_err(|error| {
+            self.map_bounded_error(error, HardResourceLimitKind::DocxBodyBlockXmlBytes)
+        })
     }
 
     fn streamed_choice_is_understood(
         &self,
         choice: &BytesStart<'_>,
         context: &NamespaceContext,
-    ) -> Result<bool, String> {
+    ) -> Result<ChoiceSupport, String> {
         use ooxml_common::mce::ChoiceRequiresClassification;
 
         let classification = bounded_xml::classify_bounded_mce_choice_requires(
@@ -620,8 +1007,32 @@ impl<R: BufRead> DocumentBodyProjector<R> {
         )
         .map_err(|error| self.map_bounded_error(error, HardResourceLimitKind::XmlContextBytes))?;
         match classification {
-            ChoiceRequiresClassification::Understood => Ok(true),
-            ChoiceRequiresClassification::Unsupported => Ok(false),
+            ChoiceRequiresClassification::Understood => Ok(ChoiceSupport {
+                understood: true,
+                capability_provisional: false,
+            }),
+            ChoiceRequiresClassification::Unsupported => {
+                let with_chart_ex_capability = bounded_xml::classify_bounded_mce_choice_requires(
+                    choice,
+                    context,
+                    &|namespace| {
+                        docx_understands_namespace(namespace)
+                            || namespace == crate::chartex_choice::CHARTEX_CAPABILITY_NS
+                    },
+                    STREAMED_XML_CONTEXT_BYTES,
+                    "document",
+                )
+                .map_err(|error| {
+                    self.map_bounded_error(error, HardResourceLimitKind::XmlContextBytes)
+                })?;
+                Ok(ChoiceSupport {
+                    understood: with_chart_ex_capability
+                        == ChoiceRequiresClassification::Understood
+                        && self.capture.is_some(),
+                    capability_provisional: with_chart_ex_capability
+                        == ChoiceRequiresClassification::Understood,
+                })
+            }
             ChoiceRequiresClassification::Missing => {
                 Err("document MCE Choice must have a Requires attribute".to_string())
             }
@@ -637,72 +1048,50 @@ impl<R: BufRead> DocumentBodyProjector<R> {
     fn handle_start(
         &mut self,
         namespace: Option<&str>,
-        start: BytesStart<'static>,
-        context: &Rc<NamespaceContext>,
+        start: &BytesStart<'_>,
         next_depth: usize,
         source_offset: usize,
-    ) -> Result<(), String> {
-        let local_name = local_name(&start)?;
+    ) -> Result<bool, String> {
+        let local_name = local_name(start)?;
         let is_word = is_w_ns(namespace);
         if is_word && local_name == "body" && self.body_content_depth.is_none() {
             self.body_seen = true;
             self.body_content_depth = Some(next_depth);
-            return Ok(());
+            return Ok(false);
         }
 
-        self.observe_sdt_metadata(is_word, &local_name, &start, next_depth)?;
+        self.observe_sdt_metadata(is_word, &local_name, start, next_depth)?;
         if self.at_logical_level() && is_word && local_name == "sdt" {
             self.sdts.push(SdtFrame {
                 open_depth: next_depth,
                 ..SdtFrame::default()
             });
-            return Ok(());
+            return Ok(false);
         }
         if self.at_logical_level() && is_word && is_body_block(&local_name) {
-            let mut root = start;
-            bounded_xml::inject_missing_namespaces(
-                &mut root,
-                context,
-                None,
-                STREAMED_XML_CONTEXT_BYTES,
-                "document body block",
-            )
-            .map_err(|error| {
-                self.map_bounded_error(error, HardResourceLimitKind::XmlContextBytes)
-            })?;
             self.capture = Some(Capture {
                 root_depth: next_depth,
                 source_offset,
                 local_name,
                 xml: Vec::new(),
             });
-            self.append_capture(Event::Start(root))?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn handle_empty(
         &mut self,
         namespace: Option<&str>,
-        empty: BytesStart<'static>,
-        context: &Rc<NamespaceContext>,
+        empty: &BytesStart<'_>,
         source_offset: usize,
-    ) -> Result<Option<ProjectedBodyBlock>, String> {
-        let local_name = local_name(&empty)?;
+    ) -> Result<bool, String> {
+        let local_name = local_name(empty)?;
         let is_word = is_w_ns(namespace);
-        self.observe_sdt_metadata(is_word, &local_name, &empty, self.depth)?;
+        self.observe_sdt_metadata(is_word, &local_name, empty, self.depth)?;
         if !(self.at_logical_level() && is_word && is_body_block(&local_name)) {
-            return Ok(None);
+            return Ok(false);
         }
-        let mut root = empty;
-        bounded_xml::inject_missing_namespaces(
-            &mut root,
-            context,
-            None,
-            STREAMED_XML_CONTEXT_BYTES,
-            "document body block",
-        )
-        .map_err(|error| self.map_bounded_error(error, HardResourceLimitKind::XmlContextBytes))?;
         self.capture = Some(Capture {
             // Empty elements do not push a physical reader frame, but their
             // logical element depth is still one below the current parent.
@@ -714,8 +1103,7 @@ impl<R: BufRead> DocumentBodyProjector<R> {
             local_name,
             xml: Vec::new(),
         });
-        self.append_capture(Event::Empty(root))?;
-        self.finish_capture().map(Some)
+        Ok(true)
     }
 
     fn handle_end(&mut self, namespace: Option<&str>, raw_local_name: &[u8]) -> Result<(), String> {
@@ -816,7 +1204,47 @@ impl<R: BufRead> DocumentBodyProjector<R> {
         }) == Some(true)
     }
 
-    fn append_capture(&mut self, event: Event<'static>) -> Result<(), String> {
+    fn discard_overflowing_choice(&mut self) -> bool {
+        let checkpoint = self.frames.iter_mut().rev().find_map(|frame| {
+            let ProcessedElementKind::AlternateBranch {
+                observer: Some(observer),
+                ..
+            } = &mut frame.kind
+            else {
+                return None;
+            };
+            if !observer.capability_provisional || observer.discarded {
+                return None;
+            }
+            // The parent never retains a 2015-only Choice. If a provisional
+            // candidate cannot fit the parent's block budget before its
+            // ChartEx shape is known, fail closed to the parent-selected
+            // later Choice/Fallback instead of introducing a new limit.
+            observer.discarded = true;
+            Some(observer.capture_checkpoint)
+        });
+        if let Some(checkpoint) = checkpoint {
+            self.discarded_provisional_choices += 1;
+            self.capture
+                .as_mut()
+                .expect("provisional observer requires capture")
+                .xml
+                .truncate(checkpoint);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn append_capture(&mut self, event: Event<'_>) -> Result<(), String> {
+        let projected = bounded_xml::projected_event_bytes(&event);
+        let would_overflow = self.capture.as_ref().is_some_and(|capture| {
+            capture.xml.len().saturating_add(projected)
+                > HARD_MAX_DOCX_BODY_BLOCK_XML_BYTES as usize
+        });
+        if would_overflow && self.discard_overflowing_choice() {
+            return Ok(());
+        }
         let capture = self
             .capture
             .as_mut()
@@ -859,6 +1287,12 @@ impl<R: BufRead> DocumentBodyProjector<R> {
     fn map_read_error(&self, error: BoundedXmlReadError) -> String {
         match error {
             BoundedXmlReadError::Xml(message) => message,
+            BoundedXmlReadError::NamespaceDeclarationLimit { limit, observed } => self
+                .report_limit(
+                    HardResourceLimitKind::XmlNamespaceDeclarations,
+                    limit,
+                    observed,
+                ),
             BoundedXmlReadError::EventLimit { limit, observed } => {
                 self.report_limit(HardResourceLimitKind::XmlEventBytes, limit, observed)
             }
@@ -886,7 +1320,7 @@ impl<R: BufRead> DocumentBodyProjector<R> {
     }
 }
 
-fn docx_understands_namespace(namespace: &str) -> bool {
+pub(crate) fn docx_understands_namespace(namespace: &str) -> bool {
     use ooxml_common::ns::{is_a_ns, is_c_ns, is_m_ns, is_pic_ns, is_r_ns, is_wp_ns};
 
     is_w_ns(Some(namespace))
@@ -899,7 +1333,7 @@ fn docx_understands_namespace(namespace: &str) -> bool {
         || crate::parser::docx_understands_drawing_ns(namespace)
 }
 
-fn docx_is_application_defined_extension_element(
+pub(crate) fn docx_is_application_defined_extension_element(
     namespace: Option<&str>,
     local_name: &str,
 ) -> bool {
@@ -959,8 +1393,11 @@ mod tests {
     const WPS: &str = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
 
     fn project(xml: &str) -> (Vec<ProjectedBodyBlock>, DocumentBodyPlan) {
-        let mut projector =
-            DocumentBodyProjector::new(BufReader::new(Cursor::new(xml.as_bytes().to_vec())), None);
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(xml.as_bytes().to_vec())),
+            None,
+            Rc::default(),
+        );
         let mut blocks = Vec::new();
         while let Some(block) = projector.next_block().unwrap() {
             blocks.push(block);
@@ -1109,8 +1546,11 @@ mod tests {
         let rejected = format!(
             r#"<w:document xmlns:w="{W}" xmlns:mc="{MC}" xmlns:u="urn:unsupported"><w:body><w:p><w:r mc:MustUnderstand="u"><w:t>x</w:t></w:r></w:p></w:body></w:document>"#,
         );
-        let mut projector =
-            DocumentBodyProjector::new(BufReader::new(Cursor::new(rejected.into_bytes())), None);
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(rejected.into_bytes())),
+            None,
+            Rc::default(),
+        );
         assert!(projector
             .next_block()
             .unwrap_err()
@@ -1225,8 +1665,11 @@ mod tests {
         let mismatch = format!(
             r#"<w:document xmlns:w="{W}" xmlns:mc="{MC}" xmlns:u="urn:unsupported" mc:MustUnderstand="u"><w:body><w:p/></w:body></w:document>"#,
         );
-        let mut projector =
-            DocumentBodyProjector::new(BufReader::new(Cursor::new(mismatch.into_bytes())), None);
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(mismatch.into_bytes())),
+            None,
+            Rc::default(),
+        );
         assert!(projector
             .next_block()
             .unwrap_err()
@@ -1236,9 +1679,243 @@ mod tests {
     #[test]
     fn missing_body_is_fatal_for_the_streamed_required_part() {
         let xml = format!(r#"<w:document xmlns:w="{W}"/>"#);
-        let mut projector =
-            DocumentBodyProjector::new(BufReader::new(Cursor::new(xml.into_bytes())), None);
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(xml.into_bytes())),
+            None,
+            Rc::default(),
+        );
         assert!(projector.next_block().unwrap_err().contains("no <w:body>"));
+    }
+
+    #[test]
+    fn repaired_large_events_stay_within_two_block_buffers() {
+        use ooxml_common::resource::{OoxmlFormat, ResourceGovernor};
+        use std::io::Read;
+
+        // Generate the payload through Read, excluding whole-input storage.
+        // Count allocator-requested live bytes, including the event buffer,
+        // projected block, namespace state, and all rewrite intermediates.
+        let mut peaks = Vec::new();
+        for byte in *b"A\"" {
+            let peak = crate::allocation_tests::peak(|| {
+                let governor = ResourceGovernor::from_wasm(OoxmlFormat::Docx, None, None, None);
+                let scope = governor.scope("parse");
+                let prefix = format!(
+                    r#"<w:document xmlns:w="{W}" xmlns:mc="{MC}" xmlns:wps="{WPS}" xmlns:v="urn:schemas-microsoft-com:vml"><w:body><w:p><mc:AlternateContent><mc:Choice Requires="wps" xmlns:o="urn:schemas-microsoft-com:office:office"><v:shape o:gfxdata='"#,
+                );
+                let suffix = b"'/></mc:Choice></mc:AlternateContent></w:p></w:body></w:document>";
+                let input = Cursor::new(prefix.into_bytes())
+                    .chain(std::io::repeat(byte).take(31 * 1024 * 1024))
+                    .chain(Cursor::new(suffix));
+                let mut projector =
+                    DocumentBodyProjector::new(BufReader::new(input), None, Rc::default());
+                let result = projector.next_block();
+                if byte == b'A' {
+                    let block = result.unwrap().unwrap();
+                    assert!(block.xml.len() > 31 * 1024 * 1024);
+                } else {
+                    let error = result.unwrap_err();
+                    let payload: serde_json::Value = serde_json::from_str(
+                        error
+                            .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                            .expect("typed block limit"),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        payload["details"]["violation"]["resource"],
+                        "docx-body-block-xml"
+                    );
+                    assert_eq!(
+                        scope.resource_limit_error().as_deref(),
+                        Some(error.as_str())
+                    );
+                }
+            });
+            eprintln!(
+                "31 MiB byte {byte}: peak {peak} bytes ({:.3} MiB)",
+                peak as f64 / 1048576.0
+            );
+            peaks.push(peak);
+        }
+        for peak in peaks {
+            assert!(
+                peak <= 2 * HARD_MAX_DOCX_BODY_BLOCK_XML_BYTES as usize,
+                "peak live allocation {peak} exceeds two block buffers"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_declaration_count_exhaustion_is_typed_and_latched() {
+        use ooxml_common::resource::{OoxmlFormat, ResourceGovernor};
+        let uri = "x".repeat(8 * 1024);
+        let declarations = (0..257)
+            .map(|n| format!(r#" xmlns:n{n}="{uri}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<w:document xmlns:w="{W}"><w:body><w:p{declarations}/></w:body></w:document>"#
+        );
+        let governor = ResourceGovernor::from_wasm(OoxmlFormat::Docx, None, None, None);
+        let scope = governor.scope("parse");
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(xml.into_bytes())),
+            None,
+            Rc::default(),
+        );
+        let error = projector.next_block().unwrap_err();
+        let payload: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed namespace limit"),
+        )
+        .unwrap();
+        let violation = &payload["details"]["violation"];
+        assert_eq!(violation["resource"], "xml-context");
+        assert_eq!(violation["metric"], "declarations");
+        assert_eq!(violation["limit"], 256);
+        assert_eq!(violation["observed"], 257);
+        assert_eq!(
+            scope.resource_limit_error().as_deref(),
+            Some(error.as_str())
+        );
+        assert_eq!(projector.next_block().unwrap_err(), error);
+    }
+
+    #[test]
+    fn admits_large_vml_shape_start_tags_within_the_block_ceiling() {
+        // ECMA-376 Part 4 §19.1.2.19 CT_Shape declares o:gfxdata, a
+        // base64Binary DrawingML package. The same tag must be admitted after
+        // Part 3 §9.4 removes selected MCE/ProcessContent wrappers.
+        let gfxdata = "A".repeat(STREAMED_XML_CONTEXT_BYTES + 4);
+        let shape = format!(r#"<v:shape o:gfxdata="{gfxdata}"/>"#);
+        for content in [
+            format!(
+                r#"<v:shape xmlns:o="urn:schemas-microsoft-com:office:office" o:gfxdata="{gfxdata}"/>"#
+            ),
+            // Repair a large Empty event immediately below selected Choice.
+            format!(
+                r#"<mc:AlternateContent><mc:Choice Requires="wps" xmlns:o="urn:schemas-microsoft-com:office:office">{shape}</mc:Choice></mc:AlternateContent>"#
+            ),
+            // Repair a Start event through nested selection, including a
+            // selected Fallback, inside w:pict within w:object.
+            format!(
+                r#"<mc:AlternateContent><mc:Choice Requires="wps"><mc:AlternateContent><mc:Choice Requires="f"/><mc:Fallback xmlns:o="urn:schemas-microsoft-com:office:office"><v:shape o:gfxdata="{gfxdata}"><v:path/></v:shape></mc:Fallback></mc:AlternateContent></mc:Choice></mc:AlternateContent>"#
+            ),
+            // Ignorable attribute stripping must preserve the large retained
+            // attribute when ProcessContent removes the physical parent.
+            format!(
+                r#"<f:wrapper xmlns:o="urn:schemas-microsoft-com:office:office"><v:shape f:drop="ignored" o:gfxdata="{gfxdata}"/></f:wrapper>"#
+            ),
+        ] {
+            let xml = format!(
+                r#"<w:document xmlns:w="{W}" xmlns:mc="{MC}" xmlns:wps="{WPS}" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:f="urn:future" mc:Ignorable="f" mc:ProcessContent="f:wrapper"><w:body><w:p><w:r><w:object><w:pict>{content}</w:pict></w:object></w:r></w:p></w:body></w:document>"#,
+            );
+            let (blocks, _) = project(&xml);
+            assert_eq!(blocks.len(), 1);
+            let projected = std::str::from_utf8(&blocks[0].xml).unwrap();
+            let doc = roxmltree::Document::parse(projected).unwrap();
+            let shape = doc
+                .descendants()
+                .find(|node| node.has_tag_name(("urn:schemas-microsoft-com:vml", "shape")))
+                .unwrap();
+            assert_eq!(
+                shape.attribute(("urn:schemas-microsoft-com:office:office", "gfxdata")),
+                Some(gfxdata.as_str())
+            );
+            assert!(!projected.contains("AlternateContent"));
+            assert!(!projected.contains("f:wrapper"));
+            assert!(!projected.contains("f:drop"));
+        }
+    }
+
+    #[test]
+    fn admits_large_unselected_fallback_tag_without_retaining_it() {
+        let gfxdata = "A".repeat(STREAMED_XML_CONTEXT_BYTES + 4);
+        let xml = format!(
+            r#"<w:document xmlns:w="{W}" xmlns:mc="{MC}" xmlns:wps="{WPS}" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"><w:body><w:p><w:r><w:pict><mc:AlternateContent><mc:Choice Requires="wps"><v:shape id="selected"/></mc:Choice><mc:Fallback><v:shape o:gfxdata="{gfxdata}"/></mc:Fallback></mc:AlternateContent></w:pict></w:r></w:p></w:body></w:document>"#,
+        );
+        let (blocks, _) = project(&xml);
+        assert_eq!(blocks.len(), 1);
+        let projected = std::str::from_utf8(&blocks[0].xml).unwrap();
+        assert!(projected.contains(r#"id="selected""#));
+        assert!(!projected.contains("gfxdata"));
+        assert!(projected.len() < 1024);
+    }
+
+    #[test]
+    fn block_root_repair_uses_the_block_budget_for_start_and_empty_events() {
+        // Synthetic ordinary attribute isolates the block-root repair gates;
+        // this is a projection budget test, not a schema-validity claim.
+        let data = "A".repeat(STREAMED_XML_CONTEXT_BYTES + 4);
+        for tail in ["/>", "></w:p>"] {
+            let xml = format!(
+                r#"<w:document xmlns:w="{W}"><w:body><w:p data="{data}"{tail}</w:body></w:document>"#,
+            );
+            let (blocks, _) = project(&xml);
+            assert_eq!(blocks.len(), 1);
+            let doc =
+                roxmltree::Document::parse(std::str::from_utf8(&blocks[0].xml).unwrap()).unwrap();
+            assert_eq!(doc.root_element().attribute("data"), Some(data.as_str()));
+        }
+    }
+
+    #[test]
+    fn namespace_declaration_explosion_still_fails_with_typed_context_limit() {
+        use ooxml_common::resource::{OoxmlFormat, ResourceGovernor};
+
+        // Five declarations cross the 4 MiB state budget while staying well
+        // below the event/block ceiling. Include ignored branches: namespace
+        // state is bounded even when their ordinary payload is not retained.
+        let uri = "x".repeat(STREAMED_XML_CONTEXT_BYTES / 4);
+        let declarations = (0..5)
+            .map(|n| format!(r#" xmlns:n{n}="urn:{n}:{uri}""#))
+            .collect::<String>();
+        for requires in ["wps", "f"] {
+            let governor = ResourceGovernor::from_wasm(OoxmlFormat::Docx, None, None, None);
+            let scope = governor.scope("parse");
+            let xml = format!(
+                r#"<w:document xmlns:w="{W}" xmlns:mc="{MC}" xmlns:wps="{WPS}" xmlns:f="urn:future" xmlns:v="urn:schemas-microsoft-com:vml"><w:body><w:p><w:r><w:pict><mc:AlternateContent><mc:Choice Requires="{requires}"><v:shape{declarations}/></mc:Choice><mc:Fallback/></mc:AlternateContent></w:pict></w:r></w:p></w:body></w:document>"#,
+            );
+            let mut projector = DocumentBodyProjector::new(
+                BufReader::new(Cursor::new(xml.into_bytes())),
+                None,
+                Rc::default(),
+            );
+            let error = projector.next_block().unwrap_err();
+            let payload: serde_json::Value = serde_json::from_str(
+                error
+                    .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                    .expect("typed limit"),
+            )
+            .unwrap();
+            assert_eq!(payload["code"], "ooxml-resource-limit");
+            let violation = &payload["details"]["violation"];
+            assert_eq!(violation["resource"], "xml-context");
+            assert_eq!(violation["limit"], STREAMED_XML_CONTEXT_BYTES);
+            assert_eq!(violation["observed"], STREAMED_XML_CONTEXT_BYTES + 1);
+            assert_eq!(violation["part"], DOCUMENT_PART);
+            assert_eq!(
+                scope.resource_limit_error().as_deref(),
+                Some(error.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_one_unretained_event_larger_than_the_block_ceiling() {
+        let comment = "x".repeat(HARD_MAX_DOCX_BODY_BLOCK_XML_BYTES as usize);
+        let xml = format!(
+            r#"<w:document xmlns:w="{W}"><w:body><w:p><!--{comment}--></w:p></w:body></w:document>"#,
+        );
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(xml.into_bytes())),
+            None,
+            Rc::default(),
+        );
+        assert!(projector
+            .next_block()
+            .unwrap_err()
+            .contains("limit exceeded"));
     }
 
     #[test]
@@ -1263,8 +1940,11 @@ mod tests {
         let exact = format!(
             r#"<w:document xmlns:w="{W}"><w:body><w:p>{exact_inner}</w:p></w:body></w:document>"#,
         );
-        let mut projector =
-            DocumentBodyProjector::new(BufReader::new(Cursor::new(exact.into_bytes())), None);
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(exact.into_bytes())),
+            None,
+            Rc::default(),
+        );
         let block = projector.next_block().unwrap().unwrap();
         assert_eq!(block.xml.len(), HARD_MAX_DOCX_BODY_BLOCK_XML_BYTES as usize);
 
@@ -1272,8 +1952,11 @@ mod tests {
         let over = format!(
             r#"<w:document xmlns:w="{W}"><w:body><w:p>{over_inner}</w:p></w:body></w:document>"#,
         );
-        let mut projector =
-            DocumentBodyProjector::new(BufReader::new(Cursor::new(over.into_bytes())), None);
+        let mut projector = DocumentBodyProjector::new(
+            BufReader::new(Cursor::new(over.into_bytes())),
+            None,
+            Rc::default(),
+        );
         assert!(projector
             .next_block()
             .unwrap_err()

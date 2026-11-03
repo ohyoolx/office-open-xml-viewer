@@ -75,27 +75,40 @@ export const optionalRenderers: readonly OptionalRendererReference[] = [
     entry: '@silurus/ooxml/tiff',
     exportName: 'tiff',
     contract: 'TiffRenderer',
-    desc: 'Decodes bounded stripped TIFF 6.0 images in DOCX, XLSX and PPTX. Supported classes are uncompressed bilevel, 8-bit grayscale, RGB, RGBA and process-CMYK, plus 1-bit CCITT Group 4. Unsupported or malformed classes make standalone calls and DOCX/PPTX rendering report TiffDecodeError. XLSX rendering, including XlsxViewer, contains the failure at that picture and shows an unavailable-image placeholder.',
+    desc: 'Decodes bounded stripped TIFF 6.0 images in DOCX, XLSX and PPTX. Supported classes are bilevel, 8-bit grayscale, RGB, RGBA and process-CMYK, uncompressed or LZW-compressed (8-bit classes optionally with horizontal differencing), plus 1-bit CCITT Group 4. Unsupported or malformed classes make standalone calls and DOCX/PPTX rendering report TiffDecodeError. XLSX rendering, including XlsxViewer, contains the failure at that picture and shows an unavailable-image placeholder.',
   },
 ];
 
 const RESOURCE_LIMITS = { name: 'resourceLimits', type: 'OoxmlResourceLimits', def: '128 MiB per entry / 256 MiB distinct total / 4,096 entries', desc: 'Shared DOCX/XLSX/PPTX package budgets. maxArchiveEntryBytes caps each package part; maxTotalInflatedBytes counts the largest amount read from every distinct part without charging repeat reads twice; maxArchiveEntries bounds central-directory entries before ZIP index allocation. Supply positive safe integers, or null to disable one configurable budget (internal hard ceilings remain). Violations reject with OoxmlResourceLimitError. These deterministic counters reduce OOM risk but do not measure or guarantee peak memory.', emphasis: 'Violations reject with OoxmlResourceLimitError.', detailsHref: '/errors#ooxml-resource-limit-error', detailsLabel: 'Error fields' };
+const XLSX_WORKSHEET_LIMITS = { name: 'xlsxWorksheetLimits', type: 'XlsxWorksheetLimits', def: '100,000 rows / 250,000 cell records / 32 MiB owned UTF-8 / 64 MiB JSON', desc: 'Logical XLSX worksheet budgets, validated before load effects and snapshotted per load. Omitted fields and an empty object use the defaults. Supplied fields must be positive safe integers no greater than Number.MAX_SAFE_INTEGER - 1; null is invalid. Rows and cells count retained records, not grid coordinates or unique indexes. maxOwnedUtf8Bytes counts every string in Cell.value, including typed discriminators and rich-text and phonetic strings, plus formula text, with shared strings charged per cell after resolution. maxJsonBytes counts structural JSON UTF-8: JSON.stringify of the assembled model in browser and Node, or complete serde_json output on the native Rust path. Each dimension of the derived worksheet cache is the larger of its default (200,000 rows / 500,000 cells / 64 MiB owned / 128 MiB JSON) and the worksheet limit. Each coordinate index independently allows max(250000, maxCells) unique keys. ZIP, input, wire, representation and copy limits stay separate. These are logical budgets, not physical memory; raising them accepts out-of-memory risk.', emphasis: 'These are logical budgets, not physical memory; raising them accepts out-of-memory risk.' };
 const IMAGE_RESOURCES = { name: 'imageResources', type: 'ImageResourceOptions', def: "{ decodedByteBudget: 128 MiB, strategy: 'adaptive', resolution: 'native-if-fit' }", desc: "Decoded-raster policy shared by DOCX, XLSX and PPTX paints. Ordinary browser rasters receive a geometry-weighted share of decodedByteBudget before source extraction, allowing each source to flow directly into decode. A source keeps native resolution when it fits its share and otherwise uses up to a 2x canvas/DPR grid when that share has headroom. If the complete set of display grids exceeds the budget, adaptive mode reduces them by one uniform quality ratio. Set resolution: 'display' to minimize retained pixels. Natural-size consumers, pixel effects that require the authored grid, and non-resizable formats retain their guarded source-specific paths. Set strategy: 'strict' to preserve requested targets and receive OoxmlDecodedImageLimitError on an aggregate crossing. The budget accepts 4 bytes through 512 MiB; encoded-source, per-axis and per-surface hard safety ceilings remain non-disableable.", emphasis: 'A source keeps native resolution when it fits its share and otherwise uses up to a 2x canvas/DPR grid when that share has headroom.', detailsHref: '/errors#decoded-image-limit-error', detailsLabel: 'Safety boundaries' };
 const RESOURCE_METRICS = { name: 'onResourceMetrics', type: '(metrics: OoxmlResourceMetrics) => void', desc: 'Receives the content-free initial-load report used by the debug card, without enabling console output. It reports the configured public policy, timing checkpoints, format/mode, success or typed failure discriminants, source bytes, and observed archive counters when available. It does not wait for a Viewer\'s first paint. On success, call getResourceMetrics() on the engine or Viewer for a fresh snapshot after lazy package work. Callback exceptions never change load results.', emphasis: 'Receives the content-free initial-load report used by the debug card, without enabling console output.' };
 const RESOURCE_METRICS_METHOD = { sig: 'getResourceMetrics(): Promise<OoxmlResourceMetrics>', desc: 'Return a fresh, content-free package-usage snapshot, including lazy archive work observed since load. Collection is always active; debug controls only console output.', emphasis: 'Collection is always active; debug controls only console output.' };
 const DEBUG = { name: 'debug', type: 'boolean', def: 'false', desc: 'Print one content-free, Ratatui-inspired resource report when the measured load or Node session finishes or fails. Browser DevTools use typography-only %c styling to keep Unicode borders and gauges aligned without changing foreground or background colours; Node and Worker consoles receive one plain argument. Use onResourceMetrics instead for production collection.', emphasis: 'Use onResourceMetrics instead for production collection.' };
 const ZIP = { name: 'maxZipEntryBytes', type: 'number', def: 'resource policy default', desc: 'Deprecated compatibility alias for resourceLimits.maxArchiveEntryBytes. It is scheduled for removal in a future breaking release; new code should use resourceLimits. Existing positive values retain their per-entry meaning; zero / negative values fall back to the standard default.', emphasis: 'It is scheduled for removal in a future breaking release; new code should use resourceLimits.' };
-const GFONTS = { name: 'useGoogleFonts', type: 'boolean', def: 'false', desc: 'Load metric-compatible webfonts and non-Latin script fallbacks (Noto Arabic / CJK KR·SC·TC·HK·JP / Cyrillic / Hebrew / Thai / Devanagari) from Google Fonts so layout matches Office and non-Latin text never falls back to tofu. Off by default for privacy.', emphasis: 'Off by default for privacy.' };
+const GFONTS = { name: 'useGoogleFonts', type: 'boolean', def: 'false', desc: 'Load optional webfont substitutes and non-Latin script fallbacks (Noto Arabic / CJK KR·SC·TC·HK·JP / Cyrillic / Hebrew / Thai / Devanagari) from Google Fonts. Carlito and Caladea can improve text widths when the base Calibri or Cambria face is missing, but they do not guarantee Office line breaks or vertical layout. Off by default for privacy.', emphasis: 'Off by default for privacy.' };
 const CJK_FALLBACK = { name: 'cjkFallback', type: "'auto' | 'sc' | 'tc' | 'hk' | 'jp' | 'kr'", def: "'auto'", desc: 'Regional preference used when Han text reaches font fallback and the document has not already identified a region. The requested font remains first; recognized regional CJK font names, an East Asian run language where available, and unambiguous Kana or Hangul take priority. Auto snapshots HTML lang, then navigator.languages and navigator.language; otherwise JP. Hans or Hant selects SC or TC; without an explicit script, HK/MO selects HK, TW selects TC, and bare zh selects SC. An explicit value makes the regional choice independent of the host locale, but does not download fonts or by itself guarantee pixel-identical output across different font environments.' };
 const PASSWORD = { name: 'password', type: 'string', def: 'undefined', desc: 'Password for an Agile-encrypted OOXML file. Available on self-loading Viewer constructors and headless load(); borrowed fromDocument(), fromPresentation(), and fromWorkbook() factories omit load-only options because their engine is already loaded.', emphasis: 'Available on self-loading Viewer constructors and headless load()' };
 const DPR = { name: 'dpr', type: 'number', def: 'devicePixelRatio', desc: 'Device pixel ratio for the backing store (crispness on HiDPI).' };
 const WASM_URL = { name: 'wasmUrl', type: 'string | URL', def: 'bundled asset', desc: 'Override the URL the parser worker fetches the WebAssembly module from. By default each format resolves the `*_parser_bg.wasm` asset that ships next to its bundle (relative to the module URL); set this to serve it from a CDN or a self-hosted path instead (a relative value resolves against the document URL). Pointing it at a mismatched or missing file makes load() reject when the worker instantiates it.', emphasis: 'Override the URL the parser worker fetches the WebAssembly module from.' };
 const WORKER_TIMEOUT = { name: 'workerTimeoutMs', type: 'number', def: 'unlimited', desc: 'Opt-in worker liveness limit. Ordinary worker requests use it as their response deadline. Worker-mode progressive loads restart this silence interval whenever the worker reports progress. This allows active long-running work to continue. Silence before first paint rejects load(); silence afterward keeps layoutComplete false and rejects waitUntilLayoutComplete(), while configured completion/error callbacks receive the failure. Worker exceptions still reject immediately. Unlimited by default.', emphasis: 'Worker-mode progressive loads restart this silence interval whenever the worker reports progress.' };
-const MATH = { name: 'math', type: 'MathRenderer', def: 'undefined', desc: 'Opt-in OMML equation engine (MathJax + STIX Two Math, ~3 MB). Import it from the separate @silurus/ooxml/math entry — `import { math } from "@silurus/ooxml/math"` — and pass it to render equations in either mode. Omit it and equations are skipped; the MathJax asset is not fetched. When passed, that standalone asset is fetched lazily the first time a document contains an equation.', emphasis: 'Opt-in OMML equation engine (MathJax + STIX Two Math, ~3 MB).' };
+const MATH = { name: 'math', type: 'MathRenderer', def: 'undefined', desc: 'Opt-in OMML equation engine (MathJax + STIX Two Math, ~4 MB). Import it from the separate @silurus/ooxml/math entry — `import { math } from "@silurus/ooxml/math"` — and pass it to render equations in either mode. Omit it and equations are skipped; the MathJax asset is not fetched. When passed, that standalone asset is fetched lazily the first time a document contains an equation.', emphasis: 'Opt-in OMML equation engine (MathJax + STIX Two Math, ~4 MB).' };
 const THREE_D = { name: 'threeD', type: 'ChartThreeDRenderer', def: 'undefined', desc: 'Opt-in model-space 3-D chart renderer. Import `threeD` from the separate `@silurus/ooxml/three-d` entry and inject it once. Omit it to use the canonical 2-D fallback and avoid loading or evaluating the mesh/camera implementation in main mode. The self-contained worker asset retains the worker-side implementation. It renders the view angle authored in OOXML in main and worker modes.', emphasis: 'Opt-in model-space 3-D chart renderer.' };
 const REGION_MAP = { name: 'regionMap', type: 'ChartRegionMapRenderer', def: 'undefined', desc: 'Opt-in offline ChartEx Region Map renderer using a pinned, public-domain Natural Earth country asset. Import `regionMap` from `@silurus/ooxml/region-map` and inject it once. Unsupported cached or sub-country views fail closed. The built-in renderer works in main and worker modes.', emphasis: 'Opt-in offline ChartEx Region Map renderer' };
 const CHART_EX = { name: 'chartEx', type: 'ChartExRenderer', def: 'undefined', desc: 'Opt-in renderer for Microsoft ChartEx (`cx:*`) chart families. Import `chartEx` from `@silurus/ooxml/chart-ex` and inject it once. Classic 2-D charts stay in the default format entries; ChartEx is opt-in. The built-in renderer works in main and worker modes.', emphasis: 'Classic 2-D charts stay in the default format entries; ChartEx is opt-in.' };
-const TIFF = { name: 'tiff', type: 'TiffRenderer', def: 'undefined', desc: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX. Import `tiff` from `@silurus/ooxml/tiff` and inject it once. The bounded codec accepts stripped TIFF 6.0 bilevel, grayscale, RGB, RGBA and process-CMYK images, plus CCITT Group 4 bilevel images. Omit it to keep the implementation out of ordinary format bundles; recognized TIFF images then use an unavailable-image placeholder while the rest of the document keeps rendering. Unsupported or malformed input makes standalone codec calls and DOCX/PPTX rendering report TiffDecodeError; XLSX rendering, including XlsxViewer, contains it at that picture and shows the placeholder. The built-in codec works in main and worker modes.', emphasis: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX.' };
+const TIFF = { name: 'tiff', type: 'TiffRenderer', def: 'undefined', desc: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX. Import `tiff` from `@silurus/ooxml/tiff` and inject it once. The bounded codec accepts stripped TIFF 6.0 bilevel, grayscale, RGB, RGBA and process-CMYK images, uncompressed or LZW-compressed, plus CCITT Group 4 bilevel images. Omit it to keep the implementation out of ordinary format bundles; recognized TIFF images then use an unavailable-image placeholder while the rest of the document keeps rendering. Unsupported or malformed input makes standalone codec calls and DOCX/PPTX rendering report TiffDecodeError; XLSX rendering, including XlsxViewer, contains it at that picture and shows the placeholder. The built-in codec works in main and worker modes.', emphasis: 'Opt-in TIFF image codec shared by DOCX, XLSX and PPTX.' };
+const LEGACY_SOURCE = (exportName: 'legacyDoc' | 'legacyXls' | 'legacyPpt', entry: 'doc' | 'xls' | 'ppt', format: 'docx' | 'xlsx' | 'pptx', factory: string): ApiOption => ({
+  name: exportName,
+  type: `ModelSource<'${format}'>`,
+  def: 'undefined',
+  desc: `Experimental opt-in reader for a supported subset of legacy .${entry} files, from the separate @silurus/ooxml-legacy-office add-on (install it at exactly the same version). Import \`${exportName}\` from \`@silurus/ooxml-legacy-office/${entry}\` and pass it as \`{ ${exportName} }\`; use \`${factory}({ wasmUrl, moduleUrl })\` for custom asset URLs. Importing it fetches nothing; its reader loads only when a matching file is opened. Unsupported legacy input rejects with OoxmlError('unsupported-content'); without it, legacy files reject with OoxmlError('legacy-binary-format').`,
+  emphasis: 'Experimental opt-in reader',
+  detailsHref: '/legacy-office',
+  detailsLabel: 'Legacy Office guide',
+});
+const LEGACY_DOC = LEGACY_SOURCE('legacyDoc', 'doc', 'docx', 'createLegacyDoc');
+const LEGACY_XLS = LEGACY_SOURCE('legacyXls', 'xls', 'xlsx', 'createLegacyXls');
+const LEGACY_PPT = LEGACY_SOURCE('legacyPpt', 'ppt', 'pptx', 'createLegacyPpt');
 const MODE = { name: 'mode', type: "'main' | 'worker'", def: "'main'", desc: "Use 'main' for the smallest worker download, the lowest single-frame overhead or custom renderer objects; parsing still runs in a Worker, while Canvas rendering runs on the main thread. Use 'worker' when document layout and paint would compete with application UI responsiveness. It requires Worker and OffscreenCanvas, downloads a larger render worker and transfers an ImageBitmap per frame. Built-in math, ChartEx, 3-D, Region Map and TIFF renderers use the same options in both modes. In worker mode, use the bitmap render methods instead of methods that accept a Canvas.", emphasis: "Use 'worker' when document layout and paint would compete with application UI responsiveness." };
 const VIEWER_MODE = { name: 'mode', type: "'main' | 'worker'", def: "'main'", desc: "Use 'main' for ordinary previews, the smallest worker download or custom renderer objects. Use 'worker' when rendering larger or more complex documents would compete with scrolling, navigation or other application UI. Worker mode requires Worker and OffscreenCanvas, downloads a larger render worker and transfers an ImageBitmap per frame. Viewer navigation, zoom, virtualized scrolling, selection, find, hyperlinks and the built-in math, ChartEx, 3-D, Region Map and TIFF renderers remain available in both modes.", emphasis: "Use 'worker' when rendering larger or more complex documents would compete with scrolling, navigation or other application UI." };
 const ZOOM_MIN_MAX = { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Zoom factor bounds for setScale / fitWidth / fitPage (10%–400%).' };
@@ -137,6 +150,11 @@ const DOCX_CURRENT_DATE: ApiOption = {
   def: 'load time',
   desc: 'Date used to resolve DATE and TIME fields. It participates in the retained layout variant, so pass it at load time when deterministic field values or pagination are required.',
 };
+const DOCX_FOOTNOTE_CONTINUATION: ApiOption = {
+  name: 'allowFootnoteContinuation', type: 'boolean', def: 'true',
+  desc: 'Paragraph footnotes continue across physical pages by default, including for ordinary DOCX input. This can change page placement. Column placement and separators follow the document settings. Pass false to retain the previous whole-note pagination. With continuation, fitting tables remain whole. Notes requiring table splitting or field reflow that changes the source cut can reject layout. Full-note acquisition has library source and page budgets.',
+  emphasis: 'Pass false to retain the previous whole-note pagination.',
+};
 const DOCX_LAYOUT_VIEW_OPTIONS: readonly ApiOption[] = [
   DOCX_SHOW_TRACKED_CHANGES,
   DOCX_CURRENT_DATE,
@@ -144,8 +162,8 @@ const DOCX_LAYOUT_VIEW_OPTIONS: readonly ApiOption[] = [
 const DOCX_SLICE_LAYOUT: ApiOption = {
   name: 'sliceLayout',
   type: 'boolean',
-  def: 'false',
-  desc: 'In main mode, yield to the browser between pagination slices while load() still waits for the complete document. Worker mode already keeps pagination off the UI thread; without progressiveLayout this option has no additional effect there. Use progressiveLayout when opening pages should become available before full pagination finishes.',
+  def: 'true in main mode',
+  desc: 'Main-mode layout yields to the browser between pagination slices by default while load() waits for the complete document. Pass false to run it synchronously. Worker mode already keeps pagination off the UI thread; without progressiveLayout this option has no additional effect there. Use progressiveLayout when opening pages should become available before full pagination finishes.',
   detailsHref: '/docx#progressive-layout',
   detailsLabel: 'Progressive layout guide',
 };
@@ -265,6 +283,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_PPT,
         VIEWER_MODE,
         ...PPTX_PROGRESSIVE_OPTIONS,
         ZOOM_MIN_MAX,
@@ -301,7 +320,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'PptxPresentation',
       ctor: 'await PptxPresentation.load(source, options?)',
       note: 'Headless engine — parse once, render any slide into any canvas you supply (scroll views, thumbnail grids, master–detail).',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...PPTX_PROGRESSIVE_OPTIONS],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_PPT, MODE, ...PPTX_PROGRESSIVE_OPTIONS],
       methods: [
         { sig: 'static load(source, options?): Promise<PptxPresentation>', desc: 'Parse a deck from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening slide is paintable.' },
         { sig: 'get slideCount(): number', desc: 'Total slides.' },
@@ -362,6 +381,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_PPT,
         DPR,
         MODE,
         ...PPTX_PROGRESSIVE_OPTIONS,
@@ -400,7 +420,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         CJK_FALLBACK,
         PASSWORD,
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent text layer for native selection & copy.' },
-        ...DOCX_LAYOUT_VIEW_OPTIONS,
+        ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION,
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only picture, chart, and shape selection with a non-editable outline and element context. No editor model is added.' },
         { name: 'onSelectionContextChange', type: '(context: DocxSelectionContext | null) => void', desc: 'Receive bounded detached text or element context. This callback does not enable element hit-testing by itself.' },
         CONTEXT_MENU('DocxSelectionContext'),
@@ -415,6 +435,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_DOC,
         VIEWER_MODE,
         DOCX_PROGRESSIVE_LAYOUT,
         DOCX_SLICE_LAYOUT,
@@ -451,7 +472,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'DocxDocument',
       ctor: 'await DocxDocument.load(source, options?)',
       note: 'Headless engine — render any page into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_DOC, MODE, ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION, DOCX_PROGRESSIVE_LAYOUT, DOCX_SLICE_LAYOUT, DOCX_LAYOUT_PROGRESS, DOCX_LAYOUT_PARTIAL, DOCX_LAYOUT_COMPLETE],
       methods: [
         { sig: 'static load(source, options?): Promise<DocxDocument>', desc: 'Parse a document from a URL or ArrayBuffer. With progressiveLayout, resolve when the opening pages are paintable while pagination continues in the background.' },
         { sig: 'get comments(): readonly Readonly<DocComment>[]', desc: 'Immutable detached comments and replies stored in the document.' },
@@ -461,6 +482,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { sig: 'revisionAnchorRanges(): readonly RevisionAnchorRange[]', desc: 'Logical tracked-change ranges for the currently available page prefix. Await waitUntilLayoutComplete() before treating this as a full-document projection.' },
         { sig: 'getBookmarkPage(name: string): number | undefined', desc: 'Resolve a bookmark in the currently available page prefix. Await waitUntilLayoutComplete() before concluding that an unresolved name is absent from the document.' },
         { sig: 'collectPageRuns(index, options?): Promise<DocxTextRunInfo[]>', desc: 'Collect the same immutable text-run geometry emitted while rendering one page.' },
+        { sig: 'get diagnostics(): readonly DocxDiagnostic[]', desc: 'Parser and layout limitations plus font and image acquisition failures. Available in main and worker modes; read after load/layout and page rendering to inspect fallback or incomplete content.' },
         { sig: 'get pageCount(): number', desc: 'Pages available so far; authoritative only when layoutComplete is true.' },
         { sig: 'get layoutComplete(): boolean', desc: 'True only after the authoritative document layout succeeds. It is false while progressive layout is publishing pages and remains false if background pagination fails; waitUntilLayoutComplete() reports that failure.' },
         { sig: 'waitUntilLayoutComplete(): Promise<void>', desc: 'Wait for the authoritative full layout. Rejects if background pagination fails after load() resolved.' },
@@ -490,7 +512,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Absolute zoom scale bounds (10%–400%). When width fit needs a smaller scale, that fitted scale remains reachable as the effective minimum.' },
         { name: 'refitOnResize', type: 'boolean', def: 'true', desc: 'Re-fit to the container width when it resizes. Set false to preserve an absolute scale independently of viewport width; explicit fitWidth() / fitPage() still work.' },
         { name: 'enableTextSelection', type: 'boolean', def: 'false', desc: 'Overlay a transparent, selectable text layer per page for native copy in both render modes.' },
-        ...DOCX_LAYOUT_VIEW_OPTIONS,
+        ...DOCX_LAYOUT_VIEW_OPTIONS, DOCX_FOOTNOTE_CONTINUATION,
         { name: 'comments', type: 'boolean | DocxCommentsOptions', def: 'false', desc: 'Show read-only document comment highlights, message icons, and built-in margin cards. Pass `cards: false` for an application-owned list that retains Viewer-owned range highlighting, or `markers: false` to hide only the icons. The options object also controls resolved-thread visibility, side, and optional connectors. Theme cards, highlights, and markers with CSS custom properties or documented classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only drawing selection on mounted pages with a non-editable outline and element context.' },
         { name: 'onSelectionContextChange', type: '(context: DocxSelectionContext | null) => void', desc: 'Receive bounded detached text, selected-comment, or element context for external AI/MCP integrations. This callback does not enable element hit-testing.' },
@@ -511,6 +533,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_DOC,
         DPR,
         MODE,
         DOCX_PROGRESSIVE_LAYOUT,
@@ -552,6 +575,8 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Zoom slider bounds as scale factors (10%–400%).' },
         { name: 'resizable', type: 'boolean', def: 'true', desc: 'Allow resizing columns/rows by dragging header borders. View-only — it changes the on-screen view only and never modifies the loaded file. Set false to disable.', emphasis: 'View-only — it changes the on-screen view only and never modifies the loaded file.' },
         { name: 'showScrollbars', type: 'boolean', def: 'true', desc: 'Show native worksheet scrollbars. Set false only when the host supplies another viewport navigation UI.' },
+        { name: 'minRows / minCols', type: 'number', def: '50 / 26', desc: 'Minimum worksheet rows and columns included in the scroll grid and fit calculations. Content, drawings and frozen panes can extend these bounds.' },
+        { name: 'marginRows / marginCols', type: 'number', def: '30 / 10', desc: 'Additional blank rows and columns kept as scroll headroom after the resolved grid extent. Fit calculations exclude this headroom.' },
         { name: 'selectionColor', type: 'string', def: "'#1a73e8'", desc: 'Accent color for the cell-selection rectangle (any CSS color). The fill is the same color at 8% opacity.' },
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only chart, picture, and shape selection with a non-editable outline and element context, without changing the underlying cell selection.' },
         { name: 'comments', type: 'boolean | XlsxCommentsOptions', def: 'true', desc: 'Show authored cell note or threaded-comment markers and their anchored read-only popup. Pass an options object to control resolved-thread visibility. Theme the popup with documented CSS custom properties or classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
@@ -562,6 +587,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         PASSWORD,
         ZIP,
         RESOURCE_LIMITS,
+        XLSX_WORKSHEET_LIMITS,
         IMAGE_RESOURCES,
         RESOURCE_METRICS,
         DEBUG,
@@ -570,6 +596,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_XLS,
         VIEWER_MODE,
         ON_SCALE_CHANGE,
         ON_HYPERLINK_CLICK,
@@ -579,7 +606,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'onSelectionStateChange', type: '(sel: XlsxSelectionState | null) => void', desc: 'Called only when canonical selection state changes; geometry, ActiveCell, extension anchor, and multiple areas remain distinct.' },
         { name: 'onSelectionContextChange', type: '(context: XlsxSelectionContext | null) => void', desc: 'Receive bounded detached selected-cell content, including attached comments, or element context for read-only AI/MCP handoff. This callback does not enable element hit-testing; rapid changes are coalesced per animation frame.' },
         CONTEXT_MENU('XlsxSelectionContext'),
-        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A in both LTR and RTL sheets.' },
+        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A in both LTR and RTL sheets. In worker mode it also fires once when a lagging frame lands and moves the cell geometry that getCellViewportRect() reports.' },
         VIEWER_ON_ERROR,
       ],
       methods: [
@@ -600,7 +627,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { sig: 'getViewportOffset(): XlsxViewportOffset', desc: 'Return the active sheet viewport offset in logical CSS pixels.' },
         { sig: 'setViewportOffset(offset: XlsxViewportOffset): Promise<void>', desc: 'Move the active viewport to a finite offset, clamped to the used scroll extent.' },
         { sig: 'scrollToCell(ref: string, options?: XlsxScrollToCellOptions): Promise<void>', desc: 'Scroll a cell reference into view, optionally aligning it to the start, center, end, or nearest edge.' },
-        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations.' },
+        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations. In worker mode the bounds follow the last painted frame; refresh overlays from onViewportChange.' },
         { sig: 'relayout(): Promise<void>', desc: 'Re-read the viewport box, clamp the current offset, and render again after an external layout change.' },
         { sig: 'getScale(): number', desc: 'The current zoom factor (1 = 100%).' },
         { sig: 'setScale(scale: number): void', desc: 'Set the zoom factor (1 = 100%), clamped to [zoomMin, zoomMax] and snapped to whole percent; re-renders and fires onScaleChange when it changes. View-only.' },
@@ -625,18 +652,21 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { name: 'zoomMin / zoomMax', type: 'number', def: '0.1 / 4', desc: 'Zoom bounds as scale factors (10%–400%).' },
         { name: 'resizable', type: 'boolean', def: 'true', desc: 'Allow resizing columns/rows by dragging header borders. View-only.' },
         { name: 'showScrollbars', type: 'boolean', def: 'true', desc: 'Show native worksheet scrollbars. Set false only when the host supplies another viewport navigation UI.' },
+        { name: 'minRows / minCols', type: 'number', def: '50 / 26', desc: 'Minimum worksheet rows and columns included in the scroll grid and fit calculations. Content, drawings and frozen panes can extend these bounds.' },
+        { name: 'marginRows / marginCols', type: 'number', def: '30 / 10', desc: 'Additional blank rows and columns kept as scroll headroom after the resolved grid extent. Fit calculations exclude this headroom.' },
         { name: 'selectionColor', type: 'string', def: "'#1a73e8'", desc: 'Accent color for the cell-selection rectangle.' },
         { name: 'enableElementSelection', type: 'boolean', def: 'false', desc: 'Enable read-only chart, picture, and shape selection with a non-editable outline and element context.' },
         { name: 'comments', type: 'boolean | XlsxCommentsOptions', def: 'true', desc: 'Show authored cell note or threaded-comment markers and their anchored read-only popup. Pass an options object to control resolved-thread visibility. Theme the popup with documented CSS custom properties or classes on the Viewer container.', detailsHref: '/review-ui', detailsLabel: 'Comment UI guide' },
         FIND_HIGHLIGHT_COLORS,
         { name: 'hiddenSheetMode', type: "'show' | 'skip' | 'dim'", def: "'show'", desc: 'Controls sequential navigation and hidden-sheet visibility without adding tab chrome.' },
-        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A independently of browser RTL scrollLeft conventions.' },
+        { name: 'onViewportChange', type: '(offset: XlsxViewportOffset) => void', desc: 'Called with the clamped logical CSS-pixel offset after the active viewport moves. Horizontal x is measured from column A independently of browser RTL scrollLeft conventions. In worker mode it also fires once when a lagging frame lands and moves the cell geometry that getCellViewportRect() reports.' },
         GFONTS,
         CJK_FALLBACK,
         PASSWORD,
         WASM_URL,
         ZIP,
         RESOURCE_LIMITS,
+        XLSX_WORKSHEET_LIMITS,
         IMAGE_RESOURCES,
         RESOURCE_METRICS,
         DEBUG,
@@ -646,6 +676,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         REGION_MAP,
         CHART_EX,
         TIFF,
+        LEGACY_XLS,
         VIEWER_MODE,
         ON_SCALE_CHANGE,
         ON_HYPERLINK_CLICK,
@@ -671,7 +702,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
         { sig: 'getViewportOffset(): XlsxViewportOffset', desc: 'Read the logical start-anchored viewport offset in CSS pixels at the current scale.' },
         { sig: 'setViewportOffset(offset: XlsxViewportOffset): Promise<void>', desc: 'Move to a finite logical offset, clamped to the used scroll extent.' },
         { sig: 'scrollToCell(ref: string, options?: { align?: "nearest" | "start" | "center" | "end" }): Promise<void>', desc: 'Move the viewport to an A1 cell reference with the requested alignment.' },
-        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations.' },
+        { sig: 'getCellViewportRect(cell: CellAddress | string): XlsxCellViewportRect | null', desc: 'Return one cell’s CSS-pixel bounds relative to the worksheet viewport. Use it to anchor application-owned comments or annotations. In worker mode the bounds follow the last painted frame; refresh overlays from onViewportChange.' },
         { sig: 'relayout(): Promise<void>', desc: 'Re-read the canvas CSS box and repaint the current viewport.' },
         ...zoomMethods(false),
         ...findMethods('XlsxMatchLocation'),
@@ -689,7 +720,7 @@ export const apiReference: Record<'docx' | 'xlsx' | 'pptx', ApiClass[]> = {
       name: 'XlsxWorkbook',
       ctor: 'await XlsxWorkbook.load(source, options?)',
       note: 'Headless engine — parse once, render any sheet viewport into any canvas you supply.',
-      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, MODE],
+      options: [GFONTS, CJK_FALLBACK, PASSWORD, WASM_URL, ZIP, RESOURCE_LIMITS, XLSX_WORKSHEET_LIMITS, RESOURCE_METRICS, DEBUG, WORKER_TIMEOUT, MATH, THREE_D, REGION_MAP, CHART_EX, TIFF, LEGACY_XLS, MODE],
       methods: [
         { sig: 'static load(source, options?): Promise<XlsxWorkbook>', desc: 'Parse a workbook from a URL or ArrayBuffer.' },
         { sig: 'get sheetNames(): string[]', desc: 'Names of all sheets.' },

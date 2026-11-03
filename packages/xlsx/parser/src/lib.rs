@@ -1,3 +1,4 @@
+pub(crate) use ooxml_common::spreadsheet_color::resolve_color_attrs;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use std::io::Cursor;
@@ -5,25 +6,33 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 use ooxml_common::depth::parse_guarded;
-use ooxml_common::json_measurement::measure_json;
+use ooxml_common::json_measurement::{
+    measure_json, serialize_json, serialize_json_string, serialize_json_with_limit,
+    serialize_json_with_policy_limit,
+};
 use ooxml_common::ns::{attr_ns, is_r_ns, is_x_ns, relationships};
 use ooxml_common::package_session::{
     PackageLimitReporter, PackageOperation, PackageSessionHandle, RetainedPackageOperation,
 };
+#[cfg(test)]
+use ooxml_common::resource::HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES;
 use ooxml_common::resource::{
-    HardResourceLimitKind, ResourceUsage, HARD_MAX_XLSX_WORKSHEET_CELLS,
-    HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES, HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
-    HARD_MAX_XLSX_WORKSHEET_ROWS,
+    HardResourceLimitKind, ResourceUsage, HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
 };
 
+#[cfg(test)]
+mod finite_worksheet_policy_tests;
 mod markdown;
+mod worksheet_resource_policy;
+pub use worksheet_resource_policy::WorksheetResourcePolicy;
 mod pivot;
 use pivot::*;
 
 mod worksheet_reference;
 use worksheet_reference::{
-    extend_lookup_transactionally, resolve_worksheet_reference, ReferencedCellValue,
-    WorksheetCellLookup, WorksheetCellLookupBuilder, WorksheetReferenceSession,
+    extend_lookup_transactionally, resolve_worksheet_reference, ReferenceIndexLimit,
+    ReferencedCellValue, WorksheetCellLookup, WorksheetCellLookupBuilder,
+    WorksheetReferenceSession,
 };
 #[cfg(test)]
 use worksheet_reference::{extract_reference_cells, MAX_REFERENCE_CELLS};
@@ -63,6 +72,12 @@ use table::*;
 pub(crate) struct XlsxZip {
     session: PackageSessionHandle,
     operation: RetainedPackageOperation,
+    /// Per-archive worksheet policy. It starts as the default and is never
+    /// module-global.
+    worksheet_policy: WorksheetResourcePolicy,
+    /// Set when the policy is configured or when the first operation is
+    /// attempted. After that, the policy is immutable.
+    worksheet_policy_locked: bool,
 }
 
 impl XlsxZip {
@@ -72,7 +87,32 @@ impl XlsxZip {
     }
 
     fn begin_operation(&mut self, name: &str) -> Result<(), String> {
+        // The first attempted operation freezes the worksheet policy, even if
+        // the operation itself then fails to start.
+        self.worksheet_policy_locked = true;
         self.operation.begin(&self.session, name)
+    }
+
+    /// Configure the worksheet policy once, after admission and before any
+    /// operation. Later calls are refused, including attempts to reconfigure.
+    /// Operations are still allowed after configuration.
+    pub(crate) fn configure_worksheet_policy(
+        &mut self,
+        policy: WorksheetResourcePolicy,
+    ) -> Result<(), String> {
+        if self.worksheet_policy_locked {
+            return Err(
+                "worksheet resource policy is immutable: it was already configured or an archive operation has started"
+                    .to_string(),
+            );
+        }
+        self.worksheet_policy = policy;
+        self.worksheet_policy_locked = true;
+        Ok(())
+    }
+
+    fn worksheet_policy(&self) -> WorksheetResourcePolicy {
+        self.worksheet_policy
     }
 
     fn usage(&self) -> ResourceUsage {
@@ -107,6 +147,7 @@ impl XlsxZip {
         run: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Result<T, String> {
         self.begin_operation(name)?;
+        let _resource_scope = self.operation()?.resource_scope()?;
         let result = run(self);
         self.operation.settle(&self.session, result)
     }
@@ -152,11 +193,6 @@ fn settle_xlsx_operation<T>(archive: &mut XlsxZip, result: Result<T, String>) ->
     archive.operation.settle(&archive.session, result)
 }
 
-/// Part-name tag for a whole-container degradation (#774). Already parenthesized
-/// (`"(zip container)"`), symmetric with docx / pptx `"(zip container)"` — so
-/// error formatting below must not wrap it in another pair of parens.
-const CONTAINER_PART: &str = "(zip container)";
-
 #[derive(Default)]
 struct WorksheetModelUsage {
     rows: u64,
@@ -164,33 +200,25 @@ struct WorksheetModelUsage {
     owned_utf8_bytes: u64,
 }
 
-fn report_materialization_limit(
-    archive: &mut XlsxZip,
-    kind: HardResourceLimitKind,
-    part: &str,
-    limit: u64,
-    observed: u64,
-) -> Result<(), String> {
-    archive
-        .operation()?
-        .limit_reporter()?
-        .observe_hard_limit(kind, Some(part), limit, observed)
-}
-
 fn serialize_worksheet_bounded(
     archive: &mut XlsxZip,
     part: &str,
     worksheet: &Worksheet,
 ) -> Result<Vec<u8>, String> {
-    let json_bytes = measure_json(worksheet)?.json_bytes;
-    report_materialization_limit(
-        archive,
+    // maxJsonBytes charges the exact UTF-8 bytes that serde_json emits for the
+    // worksheet graph. It does not promise byte parity with JS number
+    // formatting. The limit is per-archive and adjustable, so a breach reports
+    // configurable:true.
+    let max_json_bytes = archive.worksheet_policy().max_json_bytes();
+    let reporter = archive.operation()?.limit_reporter()?;
+    serialize_json_with_policy_limit(
+        worksheet,
+        Some(&reporter),
         HardResourceLimitKind::WorksheetJsonBytes,
-        part,
-        HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
-        json_bytes,
-    )?;
-    serde_json::to_vec(worksheet).map_err(|error| format!("serialize error: {error}"))
+        Some(part),
+        max_json_bytes,
+        "worksheet JSON exceeds its configured limit",
+    )
 }
 
 fn row_cell_content_utf8_bytes(
@@ -227,26 +255,16 @@ fn row_cell_content_utf8_bytes(
     })
 }
 
-/// Open a xlsx ZIP container, tagging a failure with the container part name.
+/// Open a ZIP container without admitting it as an OPC package.
 ///
-/// #774 (RB7 MAJOR, symmetric with docx / pptx `open_zip`): a truncated / corrupt
-/// ZIP is the MOST COMMON way a xlsx is broken (an incomplete download, a
-/// byte-mangled attachment). `ZipArchive::new` maps that to an opaque
-/// `zip::result::ZipError` that, if propagated, throws with no indication that the
-/// CONTAINER (not some inner part) is the problem. Naming the failure lets the
-/// caller build a `degraded_container_workbook` / `degraded_container_sheet`
-/// tagged with the container, symmetric with how a corrupt sheet part is tagged
-/// inside [`parse_sheet_with`].
-///
-/// `CONTAINER_PART` already carries its own parens, so this formats as
-/// `"{CONTAINER_PART}: {e}"` — NOT `"({CONTAINER_PART}): {e}"`, which would
-/// double-parenthesize into `"((zip container)): ..."` (docx / pptx avoid this
-/// by writing the literal `"(zip container)"` directly instead of a
-/// pre-parenthesized constant).
+/// Test helper only: public entry points admit input through
+/// [`open_workbook_package`], which also enforces the OPC shape.
+#[cfg(test)]
 pub(crate) fn open_zip(data: Vec<u8>) -> Result<XlsxZip, String> {
     open_zip_with_limits(data, None, None)
 }
 
+#[cfg(test)]
 fn open_zip_with_limits(
     data: Vec<u8>,
     max_archive_entry_bytes: Option<u64>,
@@ -276,63 +294,58 @@ fn open_zip_with_policy(
     .map(|session| XlsxZip {
         session,
         operation: RetainedPackageOperation::new("xlsx"),
+        worksheet_policy: WorksheetResourcePolicy::default(),
+        worksheet_policy_locked: false,
     })
     .map_err(ooxml_common::zip::tag_container_error)
 }
 
-/// A placeholder [`ParsedWorkbook`] for a xlsx whose ZIP CONTAINER could not be
-/// opened (truncated / corrupt / not a zip). No parts are readable, so there is
-/// no styles / theme / sharedStrings to derive — surface a single placeholder
-/// sheet carrying the container-tagged error so the viewer lists one tab and
-/// paints a "could not be displayed" overlay. Mirrors the per-sheet
-/// [`Worksheet::placeholder`] used inside [`parse_sheet_with`], but for the
-/// whole-container case.
-fn degraded_container_workbook(parse_error: String) -> ParsedWorkbook {
-    ParsedWorkbook {
-        workbook: Workbook {
-            sheets: vec![SheetMeta {
-                name: CONTAINER_PART.to_string(),
-                sheet_id: 1,
-                r_id: String::new(),
-                tab_color: None,
-                visibility: SheetVisibility::Visible,
-            }],
-            date1904: false,
-            parse_error: Some(parse_error),
-        },
-        styles: Styles::default(),
-        shared_strings: Vec::new(),
-    }
+/// Admit a public-boundary input as a SpreadsheetML package.
+///
+/// Fails closed with the `ooxml_common::opc` not-OOXML envelope when the bytes
+/// are not a readable ZIP, the ZIP is not an OPC package, or the package lacks
+/// `xl/workbook.xml`; no placeholder workbook is fabricated. Damage inside an
+/// admitted package (a malformed sheet part) still degrades per part inside
+/// [`parse_sheet_with`].
+fn open_workbook_package(
+    data: Vec<u8>,
+    max_archive_entry_bytes: Option<u64>,
+    max_total_inflated_bytes: Option<u64>,
+    max_archive_entries: Option<u64>,
+) -> Result<XlsxZip, String> {
+    let zip = open_zip_with_policy(
+        data,
+        max_archive_entry_bytes,
+        max_total_inflated_bytes,
+        max_archive_entries,
+    )
+    .map_err(ooxml_common::opc::container_open_error)?;
+    ooxml_common::opc::require_ooxml_package(
+        &zip.session,
+        ooxml_common::resource::OoxmlFormat::Xlsx,
+    )?;
+    Ok(zip)
 }
 
-/// The single placeholder [`Worksheet`] for the whole-container degradation
-/// (#774): the viewer parses sheet 0 of a [`degraded_container_workbook`] and
-/// gets this back, so it paints the same part-tagged error overlay the per-sheet
-/// break uses. `name` is the placeholder tab name (`CONTAINER_PART`).
-fn degraded_container_sheet(parse_error: String) -> Worksheet {
-    Worksheet::placeholder(CONTAINER_PART, parse_error)
+/// Test fixtures reach the public admission boundary, so each synthetic ZIP
+/// must carry the OPC Media Types stream.
+#[cfg(test)]
+pub(crate) fn write_test_content_types<W: std::io::Write + std::io::Seek>(
+    writer: &mut zip::ZipWriter<W>,
+) {
+    use std::io::Write;
+    writer
+        .start_file(
+            ooxml_common::opc::CONTENT_TYPES_ITEM,
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("test fixture writes to an in-memory ZIP");
+    writer
+        .write_all(
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#,
+        )
+        .expect("test fixture writes to an in-memory ZIP");
 }
-
-// Excel built-in indexed color palette (indices 0-63)
-// Standard Excel 2003 color palette
-const INDEXED_COLORS: &[&str] = &[
-    "#000000", "#FFFFFF", "#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF",
-    "#00FFFF", // 0-7
-    "#000000", "#FFFFFF", "#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF",
-    "#00FFFF", // 8-15
-    "#800000", "#008000", "#000080", "#808000", "#800080", "#008080", "#C0C0C0",
-    "#808080", // 16-23
-    "#9999FF", "#993366", "#FFFFCC", "#CCFFFF", "#660066", "#FF8080", "#0066CC",
-    "#CCCCFF", // 24-31
-    "#000080", "#FF00FF", "#FFFF00", "#00FFFF", "#800080", "#800000", "#008080",
-    "#0000FF", // 32-39
-    "#00CCFF", "#CCFFFF", "#CCFFCC", "#FFFF99", "#99CCFF", "#FF99CC", "#CC99FF",
-    "#FFCC99", // 40-47
-    "#3366FF", "#33CCCC", "#99CC00", "#FFCC00", "#FF9900", "#FF6600", "#666699",
-    "#969696", // 48-55
-    "#003366", "#339966", "#003300", "#333300", "#993300", "#993366", "#333399",
-    "#333333", // 56-63
-];
 
 /// Parse a xlsx archive's workbook index and return it as UTF-8 JSON **bytes**.
 ///
@@ -349,7 +362,7 @@ pub fn parse_xlsx(
 ) -> Result<Vec<u8>, JsValue> {
     console_error_panic_hook::set_once();
     parse_xlsx_inner_with_limits(data, max_archive_entry_bytes, max_total_inflated_bytes)
-        .and_then(|wb| serde_json::to_vec(&wb).map_err(|e| format!("serialize error: {e}")))
+        .and_then(|wb| serialize_json(&wb).map_err(|e| format!("serialize error: {e}")))
         .map_err(|error| JsValue::from_str(&error))
 }
 
@@ -382,10 +395,16 @@ struct WorkbookShared {
     /// Workbook theme `(majorFont.latin, minorFont.latin)` Latin faces
     /// (§20.1.4.2). Chart-text fallback font (CH10).
     theme_fonts: (Option<String>, Option<String>),
+    theme_japanese_fonts: (Option<String>, Option<String>),
     /// Lightweight style projections used while materializing sheets. Full
     /// workbook styles stay owned by the full-parse path instead of being
     /// retained and deeply cloned here.
-    default_font: (Option<String>, Option<f64>),
+    default_font: DefaultFont,
+    /// The Normal cell style font's point size (row-height baseline).
+    normal_font_size: Option<f64>,
+    /// The Normal cell style font's authored color key (see
+    /// `styles::normal_font_color_key`); marks rich-text runs' own colors.
+    normal_font_color: Option<Option<String>>,
     chart_number_formats: ChartNumberFormatCache,
     shared_strings: Rc<[SharedString]>,
     /// #773: a part-tagged degradation error set when `xl/sharedStrings.xml` was
@@ -407,15 +426,20 @@ struct XlsxThemeData {
     format_scheme: ooxml_common::theme::ThemeFormatScheme,
     format_scheme_present: bool,
     fonts: (Option<String>, Option<String>),
+    japanese_fonts: (Option<String>, Option<String>),
     chart_images: ooxml_common::chart::ChartImageRelationships,
 }
 
 impl XlsxThemeData {
     fn load(archive: &mut XlsxZip, workbook_rels_xml: &str) -> Self {
         let Some(target) = find_internal_rel_target_by_type(workbook_rels_xml, "/theme") else {
+            // Zero Theme parts is valid (§14.2.7). Keep declared font names
+            // when no theme resolves their major/minor scheme (§18.8.35);
+            // do not inject an application/locale theme. Font substitution
+            // for unavailable faces (§18.8.29) remains a rendering decision.
             return Self::default();
         };
-        let theme_path = resolve_zip_path("xl", &target);
+        let theme_path = resolve_zip_path("xl/workbook.xml", &target);
         let Ok(xml) = read_zip_string(archive, &theme_path) else {
             return Self {
                 format_scheme_present: true,
@@ -442,11 +466,22 @@ impl XlsxThemeData {
             .map(|hex| format!("#{}", hex.to_uppercase()))
             .collect();
         let theme_fonts = ooxml_common::theme::ThemeFonts::parse(xml);
+        let japanese_fonts = (
+            theme_fonts
+                .major
+                .typeface_for_script("Jpan")
+                .map(str::to_owned),
+            theme_fonts
+                .minor
+                .typeface_for_script("Jpan")
+                .map(str::to_owned),
+        );
         Self {
             colors,
             format_scheme: ooxml_common::theme::ThemeFormatScheme::parse(xml),
             format_scheme_present: true,
             fonts: (theme_fonts.major.latin, theme_fonts.minor.latin),
+            japanese_fonts,
             chart_images: ooxml_common::chart::ChartImageRelationships::default(),
         }
     }
@@ -491,28 +526,45 @@ impl WorkbookShared {
         let theme_format_scheme = Rc::new(theme.format_scheme);
         let theme_format_scheme_present = theme.format_scheme_present;
         let theme_fonts = theme.fonts;
+        let theme_japanese_fonts = theme.japanese_fonts;
         let theme_chart_images = Rc::new(theme.chart_images);
-        let (default_font, chart_number_formats, styles) = if include_full_styles {
-            match parse_styles(archive, theme_colors.as_ref()) {
-                Ok(parsed) => (
-                    parsed.default_font,
-                    parsed.chart_number_formats,
-                    Some(Ok(parsed.styles)),
-                ),
-                Err(error) => (
-                    (None, None),
-                    ChartNumberFormatCache::default(),
-                    Some(Err(error)),
-                ),
-            }
-        } else {
-            match styles::parse_style_projection(archive) {
-                Ok(parsed) => (parsed.default_font, parsed.chart_number_formats, None),
-                Err(_) => ((None, None), ChartNumberFormatCache::default(), None),
-            }
-        };
-        let (shared_strings, shared_strings_error) =
+        let ((default_font, normal_font_size), normal_font_color, chart_number_formats, styles) =
+            if include_full_styles {
+                match parse_styles(archive, theme_colors.as_ref()) {
+                    Ok(parsed) => (
+                        (parsed.default_font, parsed.normal_font_size),
+                        parsed.normal_font_color,
+                        parsed.chart_number_formats,
+                        Some(Ok(parsed.styles)),
+                    ),
+                    Err(error) => (
+                        ((None, None, false, false), None),
+                        None,
+                        ChartNumberFormatCache::default(),
+                        Some(Err(error)),
+                    ),
+                }
+            } else {
+                match styles::parse_style_projection(archive) {
+                    Ok(parsed) => (
+                        (parsed.default_font, parsed.normal_font_size),
+                        parsed.normal_font_color,
+                        parsed.chart_number_formats,
+                        None,
+                    ),
+                    Err(_) => (
+                        ((None, None, false, false), None),
+                        None,
+                        ChartNumberFormatCache::default(),
+                        None,
+                    ),
+                }
+            };
+        let (mut shared_strings, shared_strings_error) =
             read_shared_strings(archive, theme_colors.as_ref());
+        for string in &mut shared_strings {
+            mark_run_colors(string.runs.as_deref_mut(), normal_font_color.as_ref());
+        }
         Ok((
             WorkbookShared {
                 workbook_xml,
@@ -523,7 +575,10 @@ impl WorkbookShared {
                 theme_format_scheme_present,
                 theme_chart_images,
                 theme_fonts,
+                theme_japanese_fonts,
                 default_font,
+                normal_font_size,
+                normal_font_color,
                 chart_number_formats,
                 shared_strings: shared_strings.into(),
                 shared_strings_error,
@@ -541,12 +596,60 @@ impl WorkbookShared {
 /// `wb_doc` / `rels_doc` are re-parsed here from the cached source strings (cheap
 /// in-memory roxmltree parses, no zip inflate) because a `roxmltree::Document`
 /// borrows its input and so can't be stored in `WorkbookShared`.
+/// Effective `<col>` default style per 1-based column (index 0 unused):
+/// the LAST declaration covering a column wins (ECMA-376 §18.3.1.13). Ranges
+/// are painted newest-first and each column is painted once, skipping
+/// already-painted spans, so the work is linear in columns plus declarations
+/// however many declarations overlap. Empty when no column carries a style.
+fn last_column_style_by_column(ranges: &[crate::types::ColumnStyleRange]) -> Vec<Option<u32>> {
+    const MAX_COLUMN: usize = 16_384;
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut styles = vec![None; MAX_COLUMN + 1];
+    // next_unpainted[c]: the first unpainted column >= c (MAX_COLUMN + 1 = none).
+    let mut next_unpainted: Vec<usize> = (0..=MAX_COLUMN + 1).collect();
+    fn find(next: &mut [usize], column: usize) -> usize {
+        let mut root = column;
+        while next[root] != root {
+            root = next[root];
+        }
+        let mut current = column;
+        while next[current] != root {
+            let following = next[current];
+            next[current] = root;
+            current = following;
+        }
+        root
+    }
+    for range in ranges.iter().rev() {
+        let max = (range.max as usize).min(MAX_COLUMN);
+        let mut column = find(&mut next_unpainted, (range.min as usize).max(1));
+        while column <= max {
+            styles[column] = Some(range.style_index);
+            next_unpainted[column] = column + 1;
+            column = find(&mut next_unpainted, column + 1);
+        }
+    }
+    styles
+}
+
 fn parse_sheet_with(
     archive: &mut XlsxZip,
     shared: &WorkbookShared,
     sheet_index: u32,
     name: &str,
 ) -> Result<Vec<u8>, String> {
+    let (worksheet, part) = parse_sheet_model_with(archive, shared, sheet_index, name)?;
+    serialize_worksheet_bounded(archive, &part, &worksheet)
+}
+
+fn parse_sheet_model_with(
+    archive: &mut XlsxZip,
+    shared: &WorkbookShared,
+    sheet_index: u32,
+    name: &str,
+) -> Result<(Worksheet, String), String> {
     // `workbook.xml.rels` is mandatory for a sheet parse (the original
     // the historical worksheet path read it with `?`). `WorkbookShared` caches it leniently for
     // the `parse_xlsx` path, so on the (defensive) missing-rels case re-read it
@@ -589,7 +692,7 @@ fn parse_sheet_with(
         Ok(parsed) => parsed,
         Err(detail) => {
             let ws = Worksheet::placeholder(name, format!("{sheet_part}: {detail}"));
-            return serialize_worksheet_bounded(archive, &sheet_part, &ws);
+            return Ok((ws, sheet_part));
         }
     };
     // Dialog sheets are legacy form definitions, not worksheet grids. Their
@@ -597,7 +700,7 @@ fn parse_sheet_with(
     // so do not spend bounded package resources materializing content the
     // renderer intentionally replaces with an informational surface.
     if sheet_part_kind == SheetPartKind::DialogSheet {
-        return serialize_worksheet_bounded(archive, &sheet_part, &parsed.0);
+        return Ok((parsed.0, sheet_part));
     }
     let worksheet = finalize_projected_sheet(
         archive,
@@ -608,7 +711,7 @@ fn parse_sheet_with(
         parsed,
         CurrentSheetLookup::BuildFromMaterializedRows,
     )?;
-    serialize_worksheet_bounded(archive, &sheet_part, &worksheet)
+    Ok((worksheet, sheet_part))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -682,6 +785,7 @@ fn parse_dialog_sheet_shell(
 enum CurrentSheetLookup {
     BuildFromMaterializedRows,
     Seed(Option<WorksheetCellLookup>),
+    LimitExceeded(ReferenceIndexLimit),
 }
 
 fn finalize_projected_sheet(
@@ -693,18 +797,95 @@ fn finalize_projected_sheet(
     parsed: (Worksheet, HyperlinkRids, String),
     current_lookup: CurrentSheetLookup,
 ) -> Result<Worksheet, String> {
+    finalize_projected_sheet_reusing(
+        archive,
+        shared,
+        sheet_index,
+        name,
+        sheet_path,
+        parsed,
+        current_lookup,
+        None,
+    )
+    .map(|(worksheet, _)| worksheet)
+}
+
+/// The cell-independent parts of a worksheet that the cursor preview has
+/// already finalized. Each is a function of the package, the sheet path, the
+/// theme and the parsed sheet shell only, so the terminal product of the same
+/// cursor reuses them instead of reading and parsing the same drawing,
+/// comment, table, slicer and pivot parts a second time. Charts and
+/// sparklines resolve cell references and are rebuilt with the complete
+/// current-sheet lookup, except that a drawing without any graphic frame
+/// yields no chart for any lookup.
+struct FinalizedSheetParts {
+    hyperlink_rids: HyperlinkRids,
+    sheet_shell_xml: String,
+    images: Vec<ImageAnchor>,
+    shape_groups: Vec<ShapeAnchor>,
+    hyperlinks: Vec<Hyperlink>,
+    comments: Vec<XlsxComment>,
+    comment_refs: Vec<String>,
+    tables: Vec<TableInfo>,
+    slicers: Vec<SlicerAnchor>,
+    pivot_tables: Vec<PivotTableMetadata>,
+    pivot_diagnostics: Vec<PivotDiagnostic>,
+    charts_without_frames: Option<Vec<ChartAnchor>>,
+}
+
+impl FinalizedSheetParts {
+    /// Move the reusable parts out of a finalized worksheet. `saw_chart_frame`
+    /// is the chart loader's report for that same finalization.
+    fn take_from(
+        worksheet: &mut Worksheet,
+        hyperlink_rids: HyperlinkRids,
+        sheet_shell_xml: String,
+        saw_chart_frame: bool,
+    ) -> Self {
+        Self {
+            hyperlink_rids,
+            sheet_shell_xml,
+            images: std::mem::take(&mut worksheet.images),
+            shape_groups: std::mem::take(&mut worksheet.shape_groups),
+            hyperlinks: std::mem::take(&mut worksheet.hyperlinks),
+            comments: std::mem::take(&mut worksheet.comments),
+            comment_refs: std::mem::take(&mut worksheet.comment_refs),
+            tables: std::mem::take(&mut worksheet.tables),
+            slicers: std::mem::take(&mut worksheet.slicers),
+            pivot_tables: std::mem::take(&mut worksheet.pivot_tables),
+            pivot_diagnostics: std::mem::take(&mut worksheet.pivot_diagnostics),
+            charts_without_frames: (!saw_chart_frame)
+                .then(|| std::mem::take(&mut worksheet.charts)),
+        }
+    }
+}
+
+/// Finalize a projected sheet, reusing `reuse` when it was finalized from the
+/// same sheet shell. Also returns whether the chart loader saw a graphic frame.
+#[allow(clippy::too_many_arguments)]
+fn finalize_projected_sheet_reusing(
+    archive: &mut XlsxZip,
+    shared: &WorkbookShared,
+    sheet_index: u32,
+    name: &str,
+    sheet_path: &str,
+    parsed: (Worksheet, HyperlinkRids, String),
+    current_lookup: CurrentSheetLookup,
+    reuse: Option<FinalizedSheetParts>,
+) -> Result<(Worksheet, bool), String> {
     let wb_doc = parse_guarded(&shared.workbook_xml).map_err(|e| e.to_string())?;
     let rels_doc = parse_guarded(&shared.rels_xml).map_err(|e| e.to_string())?;
     let theme_colors = shared.theme_colors.as_ref();
     let (mut ws, hyperlink_rids, sheet_shell_xml) = parsed;
+    let mut reuse = reuse.filter(|parts| {
+        parts.hyperlink_rids == hyperlink_rids && parts.sheet_shell_xml == sheet_shell_xml
+    });
 
-    // Attach any drawing-anchored images and charts for this sheet
-    ws.images = load_sheet_images(archive, sheet_path, theme_colors);
-    // Embedded OLE object previews (the `<oleObjects>` collection, §18.3.1.60)
-    // draw through the same image
-    // list; their preview parts are referenced from the worksheet XML + rels.
-    ws.images
-        .extend(load_sheet_ole_images(archive, sheet_path, &sheet_shell_xml));
+    // The picture, chart and shape loaders share one read and parse of each
+    // drawing part. Reused parts may leave no loader that needs them.
+    let needs_drawings = reuse
+        .as_ref()
+        .is_none_or(|parts| parts.charts_without_frames.is_none());
     let mut reference_session = WorksheetReferenceSession::default();
     let materialized_rows = match current_lookup {
         CurrentSheetLookup::BuildFromMaterializedRows => Some(ws.rows.as_slice()),
@@ -712,46 +893,84 @@ fn finalize_projected_sheet(
             reference_session.seed_current_sheet(name, lookup);
             None
         }
+        CurrentSheetLookup::LimitExceeded(failure) => {
+            reference_session.seed_current_sheet_failure(name, failure);
+            None
+        }
     };
     let defined_names = parse_defined_names_for_sheet(&wb_doc, sheet_index);
-    let charts = load_sheet_charts_with_theme_images(
-        archive,
-        sheet_path,
-        Some(ChartReferenceContext {
-            materialized_rows,
-            materialized_col_hidden: Some(&ws.col_hidden),
-            sheet_name: name,
-            sheets: &shared.sheets,
-            workbook_rels: &rels_doc,
-            shared_strings: shared.shared_strings.as_ref(),
-            defined_names: &defined_names,
-            number_formats: &shared.chart_number_formats,
-            session: &mut reference_session,
-        }),
-        theme_colors,
-        (
-            shared.theme_fonts.0.as_deref(),
-            shared.theme_fonts.1.as_deref(),
-        ),
-        shared
-            .theme_format_scheme_present
-            .then_some(shared.theme_format_scheme.as_ref()),
-        shared.theme_chart_images.as_ref(),
-    );
+    let mut saw_chart_frame = false;
+    let reused_charts = reuse
+        .as_mut()
+        .and_then(|parts| parts.charts_without_frames.take());
+    let mut charts = reused_charts.unwrap_or_default();
+    if needs_drawings {
+        for_each_sheet_drawing(archive, sheet_path, |archive, drawing| {
+            let drawings = std::slice::from_ref(drawing);
+            if reuse.is_none() {
+                ws.images
+                    .extend(load_sheet_images(archive, drawings, theme_colors));
+            }
+            charts.extend(load_sheet_charts_observing_frames(
+                archive,
+                drawings,
+                Some(ChartReferenceContext {
+                    materialized_rows,
+                    materialized_col_hidden: Some(&ws.col_hidden),
+                    sheet_name: name,
+                    sheets: &shared.sheets,
+                    workbook_rels: &rels_doc,
+                    shared_strings: shared.shared_strings.as_ref(),
+                    defined_names: &defined_names,
+                    number_formats: &shared.chart_number_formats,
+                    session: &mut reference_session,
+                }),
+                theme_colors,
+                (
+                    shared.theme_fonts.0.as_deref(),
+                    shared.theme_fonts.1.as_deref(),
+                ),
+                shared
+                    .theme_format_scheme_present
+                    .then_some(shared.theme_format_scheme.as_ref()),
+                shared.theme_chart_images.as_ref(),
+                &mut saw_chart_frame,
+            ));
+            if reuse.is_none() {
+                ws.shape_groups.extend(load_sheet_shape_groups(
+                    archive,
+                    drawings,
+                    theme_colors,
+                    shared.theme_format_scheme.as_ref(),
+                ));
+            }
+        });
+    }
     ws.charts = charts;
-    ws.shape_groups = load_sheet_shape_groups(
-        archive,
-        sheet_path,
-        theme_colors,
-        shared.theme_format_scheme.as_ref(),
-    );
-    ws.hyperlinks = load_hyperlinks(archive, sheet_path, hyperlink_rids);
-    ws.comments = load_sheet_comments(archive, sheet_path, &shared.rels_xml);
-    ws.comment_refs = ws.comments.iter().map(|c| c.cell_ref.clone()).collect();
-    ws.defined_names = defined_names;
-    ws.tables = load_sheet_tables(archive, sheet_path, theme_colors);
-    ws.slicers = load_sheet_slicers(archive, sheet_path, theme_colors);
-    (ws.pivot_tables, ws.pivot_diagnostics) = load_sheet_pivots(archive, sheet_path);
+    if let Some(parts) = reuse {
+        ws.images = parts.images;
+        ws.shape_groups = parts.shape_groups;
+        ws.hyperlinks = parts.hyperlinks;
+        ws.comments = parts.comments;
+        ws.comment_refs = parts.comment_refs;
+        ws.defined_names = defined_names;
+        ws.tables = parts.tables;
+        ws.slicers = parts.slicers;
+        ws.pivot_tables = parts.pivot_tables;
+        ws.pivot_diagnostics = parts.pivot_diagnostics;
+    } else {
+        // OLE previews (§18.3.1.60) follow drawing images in the wire order.
+        ws.images
+            .extend(load_sheet_ole_images(archive, sheet_path, &sheet_shell_xml));
+        ws.hyperlinks = load_hyperlinks(archive, sheet_path, hyperlink_rids);
+        ws.comments = load_sheet_comments(archive, sheet_path, &shared.rels_xml);
+        ws.comment_refs = ws.comments.iter().map(|c| c.cell_ref.clone()).collect();
+        ws.defined_names = defined_names;
+        ws.tables = load_sheet_tables(archive, sheet_path, theme_colors);
+        ws.slicers = load_sheet_slicers(archive, sheet_path, theme_colors);
+        (ws.pivot_tables, ws.pivot_diagnostics) =
+            load_sheet_pivots(archive, sheet_path, theme_colors);
+    }
     let sparkline_groups = load_sheet_sparklines(
         archive,
         &sheet_shell_xml,
@@ -764,14 +983,20 @@ fn finalize_projected_sheet(
         &mut reference_session,
     );
     ws.sparkline_groups = sparkline_groups;
+    mark_rows_run_colors(&mut ws.rows, shared.normal_font_color.as_ref());
     ws.default_font_family = shared.default_font.0.clone();
     ws.default_font_size = shared.default_font.1;
+    ws.default_font_bold = shared.default_font.2.then_some(true);
+    ws.default_font_italic = shared.default_font.3.then_some(true);
+    ws.normal_font_size = shared.normal_font_size;
+    ws.theme_japanese_major_font = shared.theme_japanese_fonts.0.clone();
+    ws.theme_japanese_minor_font = shared.theme_japanese_fonts.1.clone();
     // Denormalize the workbook-wide date system onto this sheet so the cell
     // formatter can resolve serial dates without a workbook back-reference
     // (ECMA-376 §18.2.28 / §18.17.4.1).
     ws.date1904 = shared.date1904;
 
-    Ok(ws)
+    Ok((ws, saw_chart_frame))
 }
 
 fn parse_xlsx_inner_with(
@@ -957,6 +1182,7 @@ mod retained_model_limit_tests {
                 )
                 .unwrap();
             writer.write_all(b"x").unwrap();
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         let mut archive = XlsxZip::new(Cursor::new(package)).unwrap();
@@ -1000,19 +1226,12 @@ fn parse_xlsx_inner_with_limits(
     max_archive_entry_bytes: Option<u64>,
     max_total_inflated_bytes: Option<u64>,
 ) -> Result<ParsedWorkbook, String> {
-    // #774 (RB7 MAJOR): a corrupt / truncated CONTAINER degrades to a placeholder
-    // workbook (one placeholder sheet) rather than erroring, consistent with a
-    // corrupt inner sheet — the viewer shows a "could not display" tab instead of
-    // nothing.
-    let mut archive = match open_zip_with_limits(
+    let mut archive = open_workbook_package(
         data.to_vec(),
         max_archive_entry_bytes,
         max_total_inflated_bytes,
-    ) {
-        Ok(zip) => zip,
-        Err(error) if error.starts_with("OOXML_RESOURCE_LIMIT:") => return Err(error),
-        Err(e) => return Ok(degraded_container_workbook(e)),
-    };
+        None,
+    )?;
     archive.run_operation("parse", |archive| {
         let (shared, styles) = WorkbookShared::load_with_styles(archive)?;
         parse_xlsx_inner_with(archive, &shared, styles)
@@ -1061,91 +1280,6 @@ fn extract_tab_color_from_head(head: &str, theme_colors: &[String]) -> Option<St
     )
 }
 
-/// Convert hex color + tint to resulting hex color using HLS model.
-/// tint > 0: lighten; tint < 0: darken.
-fn apply_tint(hex: &str, tint: f64) -> String {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() < 6 {
-        return format!("#{}", hex);
-    }
-    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f64 / 255.0;
-    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f64 / 255.0;
-    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f64 / 255.0;
-
-    // RGB → HLS
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) / 2.0;
-    let s = if max == min {
-        0.0
-    } else if l < 0.5 {
-        (max - min) / (max + min)
-    } else {
-        (max - min) / (2.0 - max - min)
-    };
-    let h = if max == min {
-        0.0
-    } else if max == r {
-        (g - b) / (max - min) / 6.0
-    } else if max == g {
-        ((b - r) / (max - min) + 2.0) / 6.0
-    } else {
-        ((r - g) / (max - min) + 4.0) / 6.0
-    };
-    let h = if h < 0.0 { h + 1.0 } else { h };
-
-    // Apply tint to luminance
-    let new_l = if tint > 0.0 {
-        l * (1.0 - tint) + tint
-    } else {
-        l * (1.0 + tint)
-    };
-
-    // HLS → RGB
-    let (nr, ng, nb) = hls_to_rgb(h, new_l, s);
-    format!(
-        "#{:02X}{:02X}{:02X}",
-        (nr * 255.0).round() as u8,
-        (ng * 255.0).round() as u8,
-        (nb * 255.0).round() as u8
-    )
-}
-
-fn hls_to_rgb(h: f64, l: f64, s: f64) -> (f64, f64, f64) {
-    if s == 0.0 {
-        return (l, l, l);
-    }
-    let q = if l < 0.5 {
-        l * (1.0 + s)
-    } else {
-        l + s - l * s
-    };
-    let p = 2.0 * l - q;
-    let r = hue_to_rgb(p, q, h + 1.0 / 3.0);
-    let g = hue_to_rgb(p, q, h);
-    let b = hue_to_rgb(p, q, h - 1.0 / 3.0);
-    (r, g, b)
-}
-
-fn hue_to_rgb(p: f64, q: f64, mut t: f64) -> f64 {
-    if t < 0.0 {
-        t += 1.0;
-    }
-    if t > 1.0 {
-        t -= 1.0;
-    }
-    if t < 1.0 / 6.0 {
-        return p + (q - p) * 6.0 * t;
-    }
-    if t < 1.0 / 2.0 {
-        return q;
-    }
-    if t < 2.0 / 3.0 {
-        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
-    }
-    p
-}
-
 pub(crate) fn parse_color(node: &roxmltree::Node, theme_colors: &[String]) -> Option<String> {
     resolve_color_attrs(
         node.attribute("rgb"),
@@ -1154,72 +1288,6 @@ pub(crate) fn parse_color(node: &roxmltree::Node, theme_colors: &[String]) -> Op
         node.attribute("indexed"),
         theme_colors,
     )
-}
-
-/// Resolve a DrawingML/SpreadsheetML color from its raw attribute values
-/// (`rgb` / `theme` + `tint` / `indexed`). Split out from [`parse_color`] so
-/// callers that scan attributes without a roxmltree node (e.g. the bounded
-/// tab-color head probe) share the exact same resolution rules.
-pub(crate) fn resolve_color_attrs(
-    rgb: Option<&str>,
-    theme: Option<&str>,
-    tint: Option<&str>,
-    indexed: Option<&str>,
-    theme_colors: &[String],
-) -> Option<String> {
-    // rgb attribute (ARGB: 8 chars, drop alpha; or 6-char RGB)
-    if let Some(rgb) = rgb {
-        if rgb.len() == 8 {
-            return Some(format!("#{}", rgb[2..].to_uppercase()));
-        }
-        return Some(format!("#{}", rgb.to_uppercase()));
-    }
-
-    // theme attribute → resolve from theme color array + optional tint
-    //
-    // ECMA-376 §18.8.3 stores the theme clrScheme in the order
-    //   dk1, lt1, dk2, lt2, accent1..accent6, hlink, folHlink
-    // but cell style references (c:color/@theme, c:fgColor/@theme, etc.) use
-    // the Excel-internal index where dk1↔lt1 and dk2↔lt2 are SWAPPED:
-    //   0=lt1, 1=dk1, 2=lt2, 3=dk2, 4..11 unchanged.
-    // This is a well-known interoperability quirk (see Open-XML-SDK issue #46
-    // and ECMA-376 §22.1.2.7 where "index values of 0 and 1 are swapped").
-    // This is an index→index remap, not a logical→slot-name mapping, so the
-    // shared ooxml_common::color::SCHEME_DEFAULT_SLOTS table (the canonical
-    // §19.3.1.6 logical→slot names) does not apply here; this stays local.
-    if let Some(theme_str) = theme {
-        if let Ok(idx) = theme_str.parse::<usize>() {
-            let mapped = match idx {
-                0 => 1,
-                1 => 0,
-                2 => 3,
-                3 => 2,
-                n => n,
-            };
-            if let Some(base) = theme_colors.get(mapped) {
-                let tint = tint.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                if tint == 0.0 {
-                    return Some(base.clone());
-                }
-                return Some(apply_tint(base, tint));
-            }
-        }
-    }
-
-    // indexed attribute → Excel built-in palette
-    if let Some(indexed_str) = indexed {
-        if let Ok(idx) = indexed_str.parse::<usize>() {
-            // indices 64 (foreground) and 65 (background) are special: use black/white
-            let color = match idx {
-                64 => "#000000",
-                65 => "#FFFFFF",
-                _ => INDEXED_COLORS.get(idx).copied().unwrap_or("#000000"),
-            };
-            return Some(color.to_string());
-        }
-    }
-
-    None
 }
 
 /// Parse the workbook-level date system from `<workbookPr date1904>`
@@ -1271,8 +1339,20 @@ fn parse_workbook_sheets(doc: &roxmltree::Document) -> Vec<SheetMeta> {
 /// Collect `<definedName>` entries from `workbook.xml`. `sheet_index` selects
 /// which names are in scope: workbook-global (no `localSheetId`) plus any
 /// whose `localSheetId` matches the given sheet position.
+///
+/// Office resolves an unqualified name to the worksheet-scoped definition
+/// before the workbook-scoped one, whatever their XML order (Microsoft
+/// support, "Names in formulas": scope,
+/// https://support.microsoft.com/en-us/excel/names-in-formulas).
+/// The model carries no scope, so
+/// workbook names come first and this sheet's local names last, each scope
+/// in XML order; unqualified-name consumers (chart references, CF formulas,
+/// internal hyperlinks) take the last match. A shadowed global is kept: it
+/// belongs to the sheet's name inventory, and a workbook-qualified reference
+/// still names it (qualified-name resolution is not implemented here).
 fn parse_defined_names_for_sheet(doc: &roxmltree::Document, sheet_index: u32) -> Vec<DefinedName> {
-    let mut names = Vec::new();
+    let mut globals = Vec::new();
+    let mut locals = Vec::new();
     for node in doc.descendants() {
         if node.tag_name().name() != "definedName" || !is_x_ns(node.tag_name().namespace()) {
             continue;
@@ -1288,9 +1368,15 @@ fn parse_defined_names_for_sheet(doc: &roxmltree::Document, sheet_index: u32) ->
             None => continue,
         };
         let formula = node.text().unwrap_or("").to_string();
-        names.push(DefinedName { name, formula });
+        let definition = DefinedName { name, formula };
+        if local.is_some() {
+            locals.push(definition);
+        } else {
+            globals.push(definition);
+        }
     }
-    names
+    globals.append(&mut locals);
+    globals
 }
 
 pub(crate) fn resolve_sheet_path(doc: &roxmltree::Document, r_id: &str) -> Option<String> {
@@ -1460,6 +1546,7 @@ fn parse_si_node(node: &roxmltree::Node, theme_colors: &[String]) -> SharedStrin
                                     }
                                     "color" => {
                                         f.color = parse_color(&rp, theme_colors);
+                                        f.authored_color = Some(styles::authored_color_key(&rp));
                                     }
                                     "rFont" | "name" => {
                                         f.name = rp.attribute("val").map(|s| s.to_string());
@@ -1488,6 +1575,37 @@ fn parse_si_node(node: &roxmltree::Node, theme_colors: &[String]) -> SharedStrin
         phonetic_pr,
     }
 }
+/// Mark each rich-text run whose `<rPr>` color is confirmed to be authored
+/// exactly like the Normal style font's color (`RunFont::normal_color`).
+/// Measured in Excel: such a run takes a table style's font color, while a
+/// run with any other authored color, or none (automatic), keeps it. Only a
+/// confirmed match is marked: when the Normal style cannot be resolved
+/// (`normal` is `None`) nothing is, so runs keep their own colors. Runs
+/// without `<rPr>` are the cell's font and follow the cell's classification.
+fn mark_run_colors(runs: Option<&mut [Run]>, normal: Option<&Option<String>>) {
+    let (Some(runs), Some(normal)) = (runs, normal) else {
+        return;
+    };
+    for font in runs.iter_mut().filter_map(|run| run.font.as_mut()) {
+        // Only an authored `<color>` can confirm the match: a run without one
+        // is automatic, measured against a `theme="1"` Normal; the boundary
+        // where Normal also lacks `<color>` is not measured and keeps the
+        // run's own (automatic) color.
+        font.normal_color = font.authored_color.is_some() && &font.authored_color == normal;
+    }
+}
+
+/// `mark_run_colors` for the inline rich text of worksheet rows, applied on
+/// every path that hands rows to a renderer (materialized sheets and cursor
+/// row batches). Shared-string runs are marked once when the table is read.
+fn mark_rows_run_colors(rows: &mut [Row], normal: Option<&Option<String>>) {
+    for cell in rows.iter_mut().flat_map(|row| row.cells.iter_mut()) {
+        if let CellValue::Text { runs, .. } = &mut cell.value {
+            mark_run_colors(runs.as_deref_mut(), normal);
+        }
+    }
+}
+
 /// Pending cell-hyperlink descriptors, awaiting rels resolution of the external
 /// `r:id`. Each entry is `(col, row, rid, location, display)`:
 /// - `rid`: the external relationship id (§18.3.1.47 `r:id`), if present.
@@ -1497,6 +1615,123 @@ fn parse_si_node(node: &roxmltree::Node, theme_colors: &[String]) -> SharedStrin
 ///
 /// A `<hyperlink>` may carry `rid`, `location`, or both, so both are optional.
 type HyperlinkRids = Vec<(u32, u32, Option<String>, Option<String>, Option<String>)>;
+
+const X14_CF_NS: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+const XM_CF_NS: &str = "http://schemas.microsoft.com/office/excel/2006/main";
+
+fn cf_ns_element(node: roxmltree::Node<'_, '_>, ns: &str, name: &str) -> bool {
+    node.is_element() && node.tag_name().namespace() == Some(ns) && node.tag_name().name() == name
+}
+
+/// MS-XLSX 2.6.27: no-priority dataBar extensions link by GUID; a priority
+/// rule is standalone and its id is ignored. A malformed/duplicate GUID never
+/// selects arbitrary extension decoration (bounded fail-closed library policy).
+fn cf_guid(text: &str) -> Option<String> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.len() != 38 || bytes[0] != b'{' || bytes[37] != b'}' {
+        return None;
+    }
+    for (i, &ch) in bytes[1..37].iter().enumerate() {
+        if [8, 13, 18, 23].contains(&i) {
+            if ch != b'-' {
+                return None;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return None;
+        }
+    }
+    Some(text.to_ascii_lowercase())
+}
+
+/// Return at most two actual standard-rule link identities; retaining any
+/// larger list is unnecessary because multiple links are already ambiguous.
+fn standard_cf_link(rule: roxmltree::Node<'_, '_>) -> (Option<String>, bool) {
+    let mut ids = rule
+        .children()
+        .filter(|n| {
+            n.is_element() && is_x_ns(n.tag_name().namespace()) && n.tag_name().name() == "extLst"
+        })
+        .flat_map(|n| {
+            n.children().filter(|e| {
+                e.is_element() && is_x_ns(e.tag_name().namespace()) && e.tag_name().name() == "ext"
+            })
+        })
+        .flat_map(|n| n.children().filter(|e| cf_ns_element(*e, X14_CF_NS, "id")));
+    // Count actual QName elements BEFORE GUID decoding. Filtering invalid
+    // text first would turn valid+invalid into a single link, or invalid-only
+    // into absent linkage and silently apply stale standard thresholds.
+    // Refusal is library admission policy, not an Office linkage rule.
+    let first = ids.next();
+    let multiple = ids.next().is_some();
+    let link = first.and_then(|n| n.text().and_then(cf_guid));
+    let refused = multiple || (first.is_some() && link.is_none());
+    (link, refused)
+}
+
+/// Only the worksheet extension container owns x14 CF facts; an unrelated
+/// namespace or same-named nested element is not another formula ingress.
+fn x14_cf_containers<'a, 'input>(
+    root: roxmltree::Node<'a, 'input>,
+) -> Vec<roxmltree::Node<'a, 'input>> {
+    root.children()
+        .filter(|n| {
+            n.is_element() && is_x_ns(n.tag_name().namespace()) && n.tag_name().name() == "extLst"
+        })
+        .flat_map(|n| {
+            n.children().filter(|e| {
+                e.is_element() && is_x_ns(e.tag_name().namespace()) && e.tag_name().name() == "ext"
+            })
+        })
+        .flat_map(|n| {
+            n.children()
+                .filter(|e| cf_ns_element(*e, X14_CF_NS, "conditionalFormattings"))
+        })
+        .flat_map(|n| {
+            n.children()
+                .filter(|e| cf_ns_element(*e, X14_CF_NS, "conditionalFormatting"))
+        })
+        .collect()
+}
+
+struct X14DataBarFacts {
+    gradient: Option<bool>,
+    activity_formula: Option<String>,
+    cfvos: Vec<(String, Option<String>)>,
+    malformed: bool,
+}
+
+fn x14_formula_phases(rule: roxmltree::Node<'_, '_>, kind: &str) -> u8 {
+    let direct_formula = rule.children().any(|n| cf_ns_element(n, XM_CF_NS, "f"));
+    let threshold = rule
+        .children()
+        .filter(|n| {
+            cf_ns_element(*n, X14_CF_NS, "dataBar")
+                || cf_ns_element(*n, X14_CF_NS, "colorScale")
+                || cf_ns_element(*n, X14_CF_NS, "iconSet")
+        })
+        .flat_map(|n| {
+            n.children()
+                .filter(|v| cf_ns_element(*v, X14_CF_NS, "cfvo"))
+        })
+        .any(|v| {
+            v.attribute("type") == Some("formula")
+                || v.children().any(|f| cf_ns_element(f, XM_CF_NS, "f"))
+        });
+    let direct = if direct_formula {
+        match kind {
+            "expression" => 1,
+            "cellIs" => 2,
+            "colorScale" | "dataBar" | "iconSet" => 4,
+            // Location provenance only: a direct formula of another
+            // unimplemented non-scale kind is reported, never evaluated.
+            _ => 1,
+        }
+    } else {
+        0
+    };
+    direct | if threshold { 8 } else { 0 }
+}
 
 /// Incrementally inflate and project one worksheet through the active package
 /// operation. Rows are kept private and provisional until the projector emits
@@ -1511,6 +1746,7 @@ fn stream_sheet_data_from_archive(
     shared_strings: Rc<[SharedString]>,
     theme_colors: Rc<[String]>,
 ) -> Result<StreamedSheetData, String> {
+    let policy = archive.worksheet_policy();
     let reporter = archive.operation()?.limit_reporter()?;
     let mut cursor =
         archive.open_worksheet_cursor(part, Rc::clone(&shared_strings), theme_colors)?;
@@ -1546,22 +1782,25 @@ fn stream_sheet_data_from_archive(
                     .owned_utf8_bytes
                     .checked_add(batch_strings)
                     .ok_or_else(|| "worksheet string measurement overflow".to_string())?;
-                reporter.observe_hard_limit(
+                // Per-archive adjustable limits are charged before `extend`.
+                // They report configurable:true for both the default and an
+                // override.
+                reporter.observe_policy_limit(
                     HardResourceLimitKind::WorksheetModelRows,
                     Some(part),
-                    HARD_MAX_XLSX_WORKSHEET_ROWS,
+                    policy.max_rows(),
                     next_rows,
                 )?;
-                reporter.observe_hard_limit(
+                reporter.observe_policy_limit(
                     HardResourceLimitKind::WorksheetModelCells,
                     Some(part),
-                    HARD_MAX_XLSX_WORKSHEET_CELLS,
+                    policy.max_cells(),
                     next_cells,
                 )?;
-                reporter.observe_hard_limit(
+                reporter.observe_policy_limit(
                     HardResourceLimitKind::WorksheetCellContentOwnedUtf8Bytes,
                     Some(part),
-                    HARD_MAX_XLSX_WORKSHEET_CELL_CONTENT_UTF8_BYTES,
+                    policy.max_owned_utf8_bytes(),
                     next_strings,
                 )?;
                 usage.rows = next_rows;
@@ -1574,7 +1813,7 @@ fn stream_sheet_data_from_archive(
                 return Ok(StreamedSheetData {
                     shell_xml: tail.shell_xml,
                     rows,
-                    row_heights: tail.row_heights,
+                    row_geometry: tail.row_geometry,
                 });
             }
             Err(error) => {
@@ -1601,10 +1840,8 @@ fn parse_projected_worksheet(
     theme_colors: &[String],
     name: &str,
 ) -> Result<(Worksheet, HyperlinkRids, String), String> {
-    // Guard against a pathologically deep worksheet XML: the nesting-depth
-    // pre-check now lives inside `parse_guarded`, which rejects an over-deep
-    // part before roxmltree's tree builder can recurse and overflow the fixed
-    // WASM stack. See `ooxml_common::depth::parse_guarded`.
+    // Bound lexical nesting before constructing the worksheet shell DOM;
+    // content errors cannot suppress a resource crossing.
     let doc = parse_guarded(&streamed.shell_xml).map_err(|e| e.to_string())?;
 
     let mut rows = streamed.rows;
@@ -1613,7 +1850,10 @@ fn parse_projected_worksheet(
     // whether the declaration also needs the compact public wire form.
     let mut authored_col_widths: Vec<(crate::types::ColumnWidthRange, bool)> = Vec::new();
     let mut authored_col_styles: Vec<crate::types::ColumnStyleRange> = Vec::new();
-    let mut row_heights = streamed.row_heights;
+    let worksheet_projector::AuthoredRowGeometry {
+        heights: mut row_heights,
+        unspecified_visible,
+    } = streamed.row_geometry;
     // Outline (grouping) metadata — ECMA-376 §18.3.1.13 (col) / §18.3.1.73
     // (row) / §18.3.1.61 (outlinePr). Only non-default entries are recorded so
     // an outline-free sheet keeps empty maps / a `None` outlinePr (byte-stable
@@ -1625,10 +1865,25 @@ fn parse_projected_worksheet(
     let mut merge_cells: Vec<MergeCell> = Vec::new();
     let mut freeze_rows: u32 = 0;
     let mut freeze_cols: u32 = 0;
+    // Fallback for an absent sheetFormatPr. 8.43 is this library's UI-width
+    // choice, not a schema default: §18.3.1.81 supplies no value for an absent
+    // element. A UI width counts content characters (Microsoft Support "Change
+    // the column width and row height"), while a stored defaultColWidth
+    // includes padding (§18.3.1.13). The number alone cannot tell them apart,
+    // because an authored defaultColWidth="8.43" yields the same value. So
+    // default_col_width_is_ui carries that one bit. It starts true and is
+    // cleared by any recognized sheetFormatPr. The renderer encodes a flagged
+    // value with the normative 5 px padding: 56/64/72 px at MDW 6/7/8, versus
+    // 51/59/67 px as a stored width. This is a unit fix only. An application's
+    // StandardWidth (observed 10 with Calibri 11, 65 pt native, on one Mac
+    // Excel 16.113.3 install) remains a separate gap from the 54 pt (72 px at
+    // MDW 8) this fix yields. It is not inferred from this file.
     let mut default_col_width = 8.43;
-    // Intrinsic default row height in *points* — ECMA-376 §18.3.1.81.
-    // 15 pt = 20 CSS px at 96 DPI, Excel's baseline for the Calibri 11
-    // Normal style. The renderer multiplies by 4/3 at display time, so
+    let mut default_col_width_is_ui = true;
+    let mut base_col_width: Option<u32> = None;
+    // Policy fallback in points when sheetFormatPr is absent. §18.3.1.81
+    // requires defaultRowHeight on a present element; it supplies no value
+    // for an absent one. 15 pt = 20 CSS px at 96 DPI. Display uses 4/3, so
     // both this default and per-row `<row ht="…">` values share the
     // same units across the parser/renderer boundary.
     let mut default_row_height = 15.0;
@@ -1648,27 +1903,111 @@ fn parse_projected_worksheet(
     // row's number + 1 (the first row is 1), and an explicit `@r` re-anchors
     // this counter. `prev_row_idx == 0` means "no row yet", so the first
     // implicit row lands at index 1.
-    // Pre-scan worksheet-level extLst for x14:dataBar extension attributes.
-    // Excel 2010+ stores the `gradient` flag on `<x14:dataBar>` inside
-    // `<extLst>/<ext>/<x14:conditionalFormattings>/<x14:conditionalFormatting>
-    // /<x14:cfRule id="{GUID}">`, linked to the SpreadsheetML cfRule via a
-    // matching `<x14:id>{GUID}</x14:id>` inside the cfRule's own extLst
-    // (§2.6.3). Build a GUID → gradient map so cfRule parsing can look up
-    // the override.
-    let mut x14_databar_gradient: HashMap<String, bool> = HashMap::new();
-    for x14_rule in doc
-        .descendants()
-        .filter(|n| n.tag_name().name() == "cfRule" && n.attribute("type") == Some("dataBar"))
+    // MS-XLSX 2.6.27/2.6.30: only no-priority dataBar extensions link to
+    // standard rules, whose cfvos SHOULD be ignored in favour of the linked
+    // extension. Retain effective kinds/text, not equality-based precedence.
+    // Library admission policy, not an Office uniqueness rule: multiple
+    // standard rules referencing one extension would multiply its retained
+    // body. Mark those links unsupported instead; work/storage stays linear
+    // in the admitted XML and no shared formula body is copied per reference.
+    let mut repeated_standard_links: HashMap<String, bool> = HashMap::new();
+    for rule in doc
+        .root_element()
+        .children()
+        .filter(|n| {
+            n.is_element()
+                && is_x_ns(n.tag_name().namespace())
+                && n.tag_name().name() == "conditionalFormatting"
+        })
+        .flat_map(|n| {
+            n.children().filter(|r| {
+                r.is_element()
+                    && is_x_ns(r.tag_name().namespace())
+                    && r.tag_name().name() == "cfRule"
+                    && r.attribute("type") == Some("dataBar")
+            })
+        })
     {
-        let Some(id) = x14_rule.attribute("id") else {
+        if let (Some(id), _) = standard_cf_link(rule) {
+            repeated_standard_links
+                .entry(id)
+                .and_modify(|repeated| *repeated = true)
+                .or_insert(false);
+        }
+    }
+    let x14_containers = x14_cf_containers(doc.root_element());
+    let mut x14_data_bar_facts: HashMap<String, Option<X14DataBarFacts>> = HashMap::new();
+    for x14_rule in x14_containers
+        .iter()
+        .flat_map(|n| n.children())
+        .filter(|n| {
+            cf_ns_element(*n, X14_CF_NS, "cfRule")
+                && n.attribute("type") == Some("dataBar")
+                && n.attribute("priority").is_none()
+        })
+    {
+        let Some(id) = x14_rule.attribute("id").and_then(cf_guid) else {
             continue;
         };
+        let mut facts = X14DataBarFacts {
+            gradient: None,
+            activity_formula: None,
+            cfvos: Vec::new(),
+            malformed: false,
+        };
+        let mut activity_count = 0;
+        for formula in x14_rule
+            .children()
+            .filter(|n| cf_ns_element(*n, XM_CF_NS, "f"))
+        {
+            activity_count += 1;
+            if activity_count == 1 {
+                facts.activity_formula = Some(formula.text().unwrap_or("").to_string());
+            }
+        }
+        let mut bar_count = 0;
         for bar in x14_rule
             .children()
-            .filter(|n| n.tag_name().name() == "dataBar")
+            .filter(|n| cf_ns_element(*n, X14_CF_NS, "dataBar"))
         {
-            if let Some(g) = bar.attribute("gradient") {
-                x14_databar_gradient.insert(id.to_string(), !(g == "0" || g == "false"));
+            bar_count += 1;
+            facts.gradient = bar
+                .attribute("gradient")
+                .map(|g| !(g == "0" || g == "false"));
+            for cfvo in bar
+                .children()
+                .filter(|n| cf_ns_element(*n, X14_CF_NS, "cfvo"))
+            {
+                // The schema has exactly two cfvos. Do not copy unbounded
+                // malformed extras; preserve rejection instead of truncating.
+                if facts.cfvos.len() == 2 {
+                    facts.malformed = true;
+                    continue;
+                }
+                let mut formulas = cfvo.children().filter(|n| cf_ns_element(*n, XM_CF_NS, "f"));
+                let kind = cfvo.attribute("type").unwrap_or("").to_string();
+                let first_formula = formulas.next();
+                // Formula thresholds are unsupported independently of their
+                // text (MS-XLSX 2.7.9); retain kind/marker, never copy the body.
+                let value = if kind == "formula" {
+                    None
+                } else {
+                    first_formula.map(|f| f.text().unwrap_or("").to_string())
+                };
+                if formulas.next().is_some() {
+                    facts.malformed = true;
+                }
+                facts.cfvos.push((kind, value));
+            }
+        }
+        facts.malformed |= bar_count != 1 || activity_count > 1 || facts.cfvos.len() != 2;
+        use std::collections::hash_map::Entry;
+        match x14_data_bar_facts.entry(id) {
+            Entry::Vacant(e) => {
+                e.insert(Some(facts));
+            }
+            Entry::Occupied(mut e) => {
+                e.insert(None);
             }
         }
     }
@@ -1678,17 +2017,11 @@ fn parse_projected_worksheet(
     // with per-threshold `<x14:cfIcon iconSet="X" iconId="N"/>` overrides,
     // and cfvo values inside `<xm:f>` children instead of `val` attributes.
     // The sqref for x14 CF rules lives in a `<xm:sqref>` sibling.
-    let mut x14_icon_formats: Vec<ConditionalFormat> = Vec::new();
-    for x14_cf in doc.descendants().filter(|n| {
-        n.tag_name().name() == "conditionalFormatting"
-            && n.tag_name()
-                .namespace()
-                .map(|u| u.contains("/spreadsheetml/2009/9"))
-                .unwrap_or(false)
-    }) {
+    let mut x14_formats: Vec<ConditionalFormat> = Vec::new();
+    for x14_cf in &x14_containers {
         let sqref: Vec<CellRange> = x14_cf
             .children()
-            .find(|n| n.tag_name().name() == "sqref")
+            .find(|n| cf_ns_element(*n, XM_CF_NS, "sqref"))
             .and_then(|n| n.text())
             .map(parse_sqref)
             .unwrap_or_default();
@@ -1698,18 +2031,54 @@ fn parse_projected_worksheet(
         let mut rules: Vec<CfRule> = Vec::new();
         for x14_rule in x14_cf
             .children()
-            .filter(|n| n.tag_name().name() == "cfRule" && n.attribute("type") == Some("iconSet"))
+            .filter(|n| cf_ns_element(*n, X14_CF_NS, "cfRule"))
         {
-            let priority: i32 = x14_rule
+            // Present positive priority identifies a standalone rule; absent
+            // priority extension records are represented only through a link.
+            let Some(priority) = x14_rule
                 .attribute("priority")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let Some(icon_node) = x14_rule
-                .children()
-                .find(|n| n.tag_name().name() == "iconSet")
+                .and_then(|s| s.parse::<i32>().ok())
+                .filter(|p| *p > 0)
             else {
                 continue;
             };
+            let kind = x14_rule.attribute("type").unwrap_or("");
+            let stop_if_true = x14_rule
+                .attribute("stopIfTrue")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false);
+            let phases = x14_formula_phases(x14_rule, kind);
+            let icon_node = x14_rule
+                .children()
+                .find(|n| cf_ns_element(*n, X14_CF_NS, "iconSet"));
+            // Standalone expression/cellIs and inline-DXF scales are not
+            // implemented. Preserve only bounded formula provenance; no raw
+            // formula/DXF copy, guessed formatting or false stopIfTrue.
+            // x14 formula thresholds have special MS-XLSX 2.7.9 semantics:
+            // even a numeric literal is not a standard formula threshold.
+            let unsupported_icon_threshold = icon_node.is_some_and(|icon| {
+                icon.children()
+                    .filter(|v| cf_ns_element(*v, X14_CF_NS, "cfvo"))
+                    .any(|v| {
+                        !matches!(
+                            v.attribute("type"),
+                            Some("min" | "max" | "num" | "percent" | "percentile")
+                        )
+                    })
+            });
+            if kind != "iconSet" || unsupported_icon_threshold || icon_node.is_none() {
+                if phases != 0 || unsupported_icon_threshold {
+                    rules.push(CfRule::Other {
+                        kind: kind.to_string(),
+                        priority,
+                        stop_if_true,
+                        unsupported_formula_phases: phases
+                            | if unsupported_icon_threshold { 8 } else { 0 },
+                    });
+                }
+                continue;
+            }
+            let icon_node = icon_node.expect("admitted iconSet child");
             let custom = icon_node
                 .attribute("custom")
                 .map(|v| v == "1" || v == "true")
@@ -1724,14 +2093,17 @@ fn parse_projected_worksheet(
                 .unwrap_or(false);
             let mut cfvos: Vec<CfValue> = Vec::new();
             let mut custom_icons: Vec<CfIcon> = Vec::new();
-            for ch in icon_node.children().filter(|n| n.is_element()) {
+            for ch in icon_node
+                .children()
+                .filter(|n| n.is_element() && n.tag_name().namespace() == Some(X14_CF_NS))
+            {
                 match ch.tag_name().name() {
                     "cfvo" => {
-                        let kind = ch.attribute("type").unwrap_or("percent").to_string();
+                        let kind = ch.attribute("type").unwrap_or("").to_string();
                         // x14:cfvo stores the value in `<xm:f>` child; attribute val fallback.
                         let value = ch
                             .children()
-                            .find(|n| n.tag_name().name() == "f")
+                            .find(|n| cf_ns_element(*n, XM_CF_NS, "f"))
                             .and_then(|n| n.text())
                             .map(|s| s.to_string())
                             .or_else(|| ch.attribute("val").map(|s| s.to_string()));
@@ -1757,16 +2129,42 @@ fn parse_projected_worksheet(
                 reverse,
                 priority,
                 custom_icons: if custom { Some(custom_icons) } else { None },
+                // [MS-XLSX] 2.6.27: the rule's own `xm:f` child (flagged by
+                // `activePresent`) is its activity condition.
+                active_formula: x14_rule
+                    .children()
+                    .find(|n| cf_ns_element(*n, XM_CF_NS, "f"))
+                    .and_then(|n| n.text())
+                    .map(|s| s.to_string()),
+                // [MS-XLSX] x14:cfRule carries the same `stopIfTrue`.
+                stop_if_true,
             });
         }
         if !rules.is_empty() {
-            x14_icon_formats.push(ConditionalFormat { sqref, rules });
+            x14_formats.push(ConditionalFormat { sqref, rules });
         }
     }
 
     for node in doc.descendants() {
         match node.tag_name().name() {
             "sheetFormatPr" if is_x_ns(node.tag_name().namespace()) => {
+                // A present element, even with a malformed defaultColWidth,
+                // means the default is stored-width (or base-derived), never
+                // the UI-character fallback.
+                default_col_width_is_ui = false;
+                // ECMA-376 §18.3.1.81: baseColWidth describes implicit columns
+                // only when the sheet does not supply defaultColWidth.
+                // CT_SheetFormatPr (Strict and Transitional) declares
+                // baseColWidth default="8": an omitted attribute on an existing
+                // element means 8. A malformed explicit value stays None. When
+                // the element itself is absent, the historical fallback above
+                // stays in effect; attribute defaults do not create an element.
+                if node.attribute("defaultColWidth").is_none() {
+                    base_col_width = match node.attribute("baseColWidth") {
+                        None => Some(8),
+                        Some(s) => s.parse().ok(),
+                    };
+                }
                 if let Some(v) = node
                     .attribute("defaultColWidth")
                     .and_then(|s| s.parse::<f64>().ok())
@@ -1971,25 +2369,35 @@ fn parse_projected_worksheet(
                 }
             }
             "mergeCell" if is_x_ns(node.tag_name().namespace()) => {
-                if let Some(r) = node.attribute("ref") {
-                    let parts: Vec<&str> = r.split(':').collect();
-                    if parts.len() == 2 {
-                        let (left, top) = parse_cell_ref(parts[0]);
-                        let (right, bottom) = parse_cell_ref(parts[1]);
-                        merge_cells.push(MergeCell {
-                            top,
-                            left,
-                            bottom,
-                            right,
-                        });
-                    }
+                // ST_Ref (§18.3.1.55): both corners must be real grid cells
+                // (A1..XFD1048576). An out-of-grid corner such as
+                // `ZZZZZZ4294967295` is not a cell reference, so it is not a
+                // merge; accepting it would hand renderers and the markdown
+                // projection a range far outside any worksheet.
+                if let Some(range) = node
+                    .attribute("ref")
+                    .filter(|r| r.split(':').count() == 2)
+                    .and_then(worksheet_reference::parse_a1_range)
+                {
+                    merge_cells.push(MergeCell {
+                        top: range.top,
+                        left: range.left,
+                        bottom: range.bottom,
+                        right: range.right,
+                    });
                 }
             }
-            "conditionalFormatting" if is_x_ns(node.tag_name().namespace()) => {
+            "conditionalFormatting"
+                if is_x_ns(node.tag_name().namespace())
+                    && node.parent() == Some(doc.root_element()) =>
+            {
                 let sqref = node.attribute("sqref").map(parse_sqref).unwrap_or_default();
                 let mut rules: Vec<CfRule> = Vec::new();
                 for cf in node.children() {
-                    if cf.tag_name().name() != "cfRule" {
+                    if !cf.is_element()
+                        || !is_x_ns(cf.tag_name().namespace())
+                        || cf.tag_name().name() != "cfRule"
+                    {
                         continue;
                     }
                     let kind = cf.attribute("type").unwrap_or("").to_string();
@@ -1998,12 +2406,33 @@ fn parse_projected_worksheet(
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0);
                     let dxf_id: Option<u32> = cf.attribute("dxfId").and_then(|s| s.parse().ok());
+                    // §18.3.1.10 `stopIfTrue` (xsd:boolean, default false),
+                    // kept for every rule type (see `CfRule`).
+                    let stop_if_true = cf
+                        .attribute("stopIfTrue")
+                        .map(|v| v == "1" || v == "true")
+                        .unwrap_or(false);
+                    // colorScale / dataBar / iconSet: an optional `<formula>`
+                    // is the rule's activity condition (see `CfRule`).
+                    let mut active_formula = cf
+                        .children()
+                        .find(|n| {
+                            n.is_element()
+                                && is_x_ns(n.tag_name().namespace())
+                                && n.tag_name().name() == "formula"
+                        })
+                        .and_then(|n| n.text())
+                        .map(|s| s.to_string());
                     match kind.as_str() {
                         "cellIs" => {
                             let operator = cf.attribute("operator").unwrap_or("equal").to_string();
                             let formulas: Vec<String> = cf
                                 .children()
-                                .filter(|n| n.tag_name().name() == "formula")
+                                .filter(|n| {
+                                    n.is_element()
+                                        && is_x_ns(n.tag_name().namespace())
+                                        && n.tag_name().name() == "formula"
+                                })
                                 .filter_map(|n| n.text().map(|s| s.to_string()))
                                 .collect();
                             rules.push(CfRule::CellIs {
@@ -2011,6 +2440,7 @@ fn parse_projected_worksheet(
                                 formulas,
                                 dxf_id,
                                 priority,
+                                stop_if_true,
                             });
                         }
                         "expression" | "containsBlanks" | "notContainsBlanks" | "containsText"
@@ -2022,14 +2452,14 @@ fn parse_projected_worksheet(
                             // (ECMA-376 §18.3.1.10). Evaluate as an expression rule.
                             let formula = cf
                                 .children()
-                                .find(|n| n.tag_name().name() == "formula")
+                                .find(|n| {
+                                    n.is_element()
+                                        && is_x_ns(n.tag_name().namespace())
+                                        && n.tag_name().name() == "formula"
+                                })
                                 .and_then(|n| n.text())
                                 .unwrap_or("")
                                 .to_string();
-                            let stop_if_true = cf
-                                .attribute("stopIfTrue")
-                                .map(|v| v == "1" || v == "true")
-                                .unwrap_or(false);
                             rules.push(CfRule::Expression {
                                 formula,
                                 dxf_id,
@@ -2038,11 +2468,18 @@ fn parse_projected_worksheet(
                             });
                         }
                         "colorScale" => {
-                            let scale = cf.children().find(|n| n.tag_name().name() == "colorScale");
+                            let scale = cf.children().find(|n| {
+                                n.is_element()
+                                    && is_x_ns(n.tag_name().namespace())
+                                    && n.tag_name().name() == "colorScale"
+                            });
                             let mut stop_values: Vec<(String, Option<String>)> = Vec::new();
                             let mut stop_colors: Vec<String> = Vec::new();
                             if let Some(scale_node) = scale {
-                                for child in scale_node.children() {
+                                for child in scale_node
+                                    .children()
+                                    .filter(|n| n.is_element() && is_x_ns(n.tag_name().namespace()))
+                                {
                                     match child.tag_name().name() {
                                         "cfvo" => {
                                             stop_values.push((
@@ -2075,14 +2512,26 @@ fn parse_projected_worksheet(
                                         .unwrap_or_else(|| "#FFFFFF".to_string()),
                                 })
                                 .collect();
-                            rules.push(CfRule::ColorScale { stops, priority });
+                            rules.push(CfRule::ColorScale {
+                                stops,
+                                priority,
+                                active_formula,
+                                stop_if_true,
+                            });
                         }
                         "dataBar" => {
-                            let bar = cf.children().find(|n| n.tag_name().name() == "dataBar");
+                            let bar = cf.children().find(|n| {
+                                n.is_element()
+                                    && is_x_ns(n.tag_name().namespace())
+                                    && n.tag_name().name() == "dataBar"
+                            });
                             let mut cfvos: Vec<(String, Option<String>)> = Vec::new();
                             let mut color = "#638EC6".to_string();
                             if let Some(bar_node) = bar {
-                                for child in bar_node.children() {
+                                for child in bar_node
+                                    .children()
+                                    .filter(|n| n.is_element() && is_x_ns(n.tag_name().namespace()))
+                                {
                                     match child.tag_name().name() {
                                         "cfvo" => {
                                             cfvos.push((
@@ -2102,42 +2551,43 @@ fn parse_projected_worksheet(
                                     }
                                 }
                             }
-                            // Excel 2010+ x14:dataBar extension may override the
-                            // gradient flag (§2.6.3, default="1"). "0" → solid
-                            // fill. The override lives in a separate
-                            // worksheet-level extLst and is linked via the
-                            // `<x14:id>{GUID}</x14:id>` contained in this
-                            // cfRule's own extLst.
                             let mut gradient = true;
-                            'gradient_lookup: for ext_list in
-                                cf.children().filter(|n| n.tag_name().name() == "extLst")
-                            {
-                                for ext in
-                                    ext_list.children().filter(|n| n.tag_name().name() == "ext")
-                                {
-                                    for id_node in
-                                        ext.descendants().filter(|n| n.tag_name().name() == "id")
-                                    {
-                                        if let Some(guid) = id_node.text() {
-                                            if let Some(&g) = x14_databar_gradient.get(guid) {
-                                                gradient = g;
-                                                break 'gradient_lookup;
-                                            }
-                                        }
-                                    }
-                                    // Fallback: some files embed <x14:dataBar>
-                                    // directly in the cfRule's extLst.
-                                    for x14_bar in ext
-                                        .descendants()
-                                        .filter(|n| n.tag_name().name() == "dataBar")
-                                    {
-                                        if let Some(g) = x14_bar.attribute("gradient") {
-                                            gradient = !(g == "0" || g == "false");
-                                            break 'gradient_lookup;
-                                        }
-                                    }
-                                }
+                            let (link, multiple_ids) = standard_cf_link(cf);
+                            let ambiguous_link = multiple_ids
+                                || link.as_ref().is_some_and(|id| {
+                                    repeated_standard_links.get(id) == Some(&true)
+                                });
+                            let linked_facts =
+                                link.as_ref().and_then(|id| x14_data_bar_facts.get(id));
+                            let mut ext_threshold_formula =
+                                ambiguous_link || matches!(linked_facts, Some(None));
+                            if let Some(Some(facts)) = linked_facts.filter(|_| !ambiguous_link) {
+                                gradient = facts.gradient.unwrap_or(true);
+                                // Effective extension facts, MS-XLSX 2.6.30;
+                                // never fall back to a stale standard threshold.
+                                cfvos.clone_from(&facts.cfvos);
+                                active_formula.clone_from(&facts.activity_formula);
+                                ext_threshold_formula |= facts.malformed
+                                    || facts.cfvos.iter().any(|(kind, _)| kind == "formula");
                             }
+                            if ambiguous_link
+                                || matches!(linked_facts, Some(None))
+                                || linked_facts
+                                    .is_some_and(|f| f.as_ref().is_some_and(|v| v.malformed))
+                            {
+                                // Ambiguous/malformed facts cannot prove the
+                                // standard activity inactive. Preserve a reached
+                                // unsupported boundary, without selecting one.
+                                rules.push(CfRule::Other {
+                                    kind: "dataBar".into(),
+                                    priority,
+                                    stop_if_true,
+                                    unsupported_formula_phases: 8,
+                                });
+                                continue;
+                            }
+                            // Unsupported autoMin/autoMax retain their distinct
+                            // kinds; renderer does not guess the required zero clamp.
                             let min = cfvos
                                 .first()
                                 .map(|(k, v)| CfValue {
@@ -2164,6 +2614,9 @@ fn parse_projected_worksheet(
                                 max,
                                 priority,
                                 gradient,
+                                active_formula,
+                                ext_threshold_formula,
+                                stop_if_true,
                             });
                         }
                         "top10" => {
@@ -2185,6 +2638,7 @@ fn parse_projected_worksheet(
                                 rank,
                                 dxf_id,
                                 priority,
+                                stop_if_true,
                             });
                         }
                         "aboveAverage" => {
@@ -2209,11 +2663,15 @@ fn parse_projected_worksheet(
                                 std_dev,
                                 dxf_id,
                                 priority,
+                                stop_if_true,
                             });
                         }
                         "iconSet" => {
-                            let icon_set_node =
-                                cf.children().find(|n| n.tag_name().name() == "iconSet");
+                            let icon_set_node = cf.children().find(|n| {
+                                n.is_element()
+                                    && is_x_ns(n.tag_name().namespace())
+                                    && n.tag_name().name() == "iconSet"
+                            });
                             let icon_set = icon_set_node
                                 .and_then(|n| n.attribute("iconSet"))
                                 .unwrap_or("3TrafficLights1")
@@ -2242,12 +2700,23 @@ fn parse_projected_worksheet(
                                 reverse,
                                 priority,
                                 custom_icons: None,
+                                active_formula,
+                                stop_if_true,
                             });
                         }
                         other => {
                             rules.push(CfRule::Other {
                                 kind: other.to_string(),
+                                // Provenance, not new rule semantics: report a
+                                // directly authored formula of an unimplemented
+                                // non-scale kind; no formula body copy.
+                                unsupported_formula_phases: u8::from(cf.children().any(|n| {
+                                    n.is_element()
+                                        && is_x_ns(n.tag_name().namespace())
+                                        && n.tag_name().name() == "formula"
+                                })),
                                 priority,
+                                stop_if_true,
                             });
                         }
                     }
@@ -2301,27 +2770,34 @@ fn parse_projected_worksheet(
     // ECMA-376 §18.3.1.13: a column style is the default XF for cells in that
     // column. Resolve it onto sparse authored cells only after every `<col>`
     // declaration is known; an explicit `c/@s="0"` remains `Some(0)` and wins.
+    // The last declaration covering a column wins, as before; resolving it
+    // once per column keeps this linear in cells plus declarations.
+    let column_styles = last_column_style_by_column(&authored_col_styles);
     for row in &mut rows {
         for cell in &mut row.cells {
             if cell.style_index.is_some() {
                 continue;
             }
-            cell.style_index = authored_col_styles
-                .iter()
-                .rev()
-                .find(|range| cell.col >= range.min && cell.col <= range.max)
-                .map(|range| range.style_index);
+            cell.style_index = column_styles.get(cell.col as usize).copied().flatten();
         }
     }
 
-    conditional_formats.extend(x14_icon_formats);
+    conditional_formats.extend(x14_formats);
 
     if rows_hidden_by_default {
+        // ECMA-376 §18.3.1.81 `zeroHeight` hides only *unspecified* rows. An
+        // explicit, visible `<row>` without `@ht` keeps the authored default
+        // band. The bounded cursor has already emitted (and dropped) its rows
+        // by the time this shell is parsed, so the band is resolved from the
+        // row-geometry facts recorded while streaming, never from `rows`.
+        // This keeps the full, cursor and preview paths identical regardless
+        // of where `sheetFormatPr` appears. `row.height` stays the authored
+        // `@ht` fact; the renderer's auto-fit already treats a `rowHeights`
+        // entry as authoritative.
         let visible_default_height = default_row_height;
-        for row in &mut rows {
-            if !row.hidden && row.height.is_none() {
-                row.height = Some(visible_default_height);
-                row_heights.insert(row.index, visible_default_height);
+        for &(first, last) in &unspecified_visible {
+            for index in first..=last {
+                row_heights.insert(index, visible_default_height);
             }
         }
         // Unspecified rows remain hidden. The sparse grid axis represents the
@@ -2345,9 +2821,11 @@ fn parse_projected_worksheet(
         col_collapsed,
         col_hidden,
         default_col_width,
+        base_col_width,
+        default_col_width_is_ui,
         default_row_height,
         default_row_height_custom,
-        merge_cells,
+        merge_cells: without_repeated_merge_ranges(merge_cells),
         freeze_rows,
         freeze_cols,
         conditional_formats,
@@ -2372,6 +2850,11 @@ fn parse_projected_worksheet(
         sparkline_groups: Vec::new(),
         default_font_family: None,
         default_font_size: None,
+        default_font_bold: None,
+        default_font_italic: None,
+        normal_font_size: None,
+        theme_japanese_major_font: None,
+        theme_japanese_minor_font: None,
         // Set by `parse_sheet_with` from the workbook-level `<workbookPr
         // date1904>` (ECMA-376 §18.2.28); a bare `parse_worksheet` (tests)
         // defaults to the 1900 date system.
@@ -2399,7 +2882,7 @@ fn parse_projected_worksheet_tail(
         StreamedSheetData {
             shell_xml: tail.shell_xml,
             rows: Vec::new(),
-            row_heights: tail.row_heights,
+            row_geometry: tail.row_geometry,
         },
         theme_colors,
         name,
@@ -2496,7 +2979,7 @@ fn load_sheet_comments(
     }
 
     let threaded_comments = if let Some(target) = threaded_target {
-        let tc_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let tc_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         let comments = if let Ok(tc_xml) = read_zip_string(archive, &tc_path) {
             let persons = load_persons(archive, workbook_rels_xml);
             parse_threaded_comments_xml(&tc_xml, &persons)
@@ -2510,13 +2993,34 @@ fn load_sheet_comments(
 
     let mut classic_comments = Vec::new();
     if let Some(target) = classic_target {
-        let comments_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
+        let comments_path = resolve_zip_path(&format!("xl/{sheet_path}"), &target);
         if let Ok(comments_xml) = read_zip_string(archive, &comments_path) {
             classic_comments = parse_comments_xml(&comments_xml);
         }
     }
 
     merge_sheet_comments(threaded_comments, classic_comments)
+}
+
+/// §18.3.1.55 lists the merged ranges and does not define a repeated
+/// `<mergeCell>`; a repeat of an identical (corner-normalized) range names no
+/// new cells, so it is dropped (#1958: thousands of repeats of one large
+/// range otherwise multiply every per-range consumer's work). The LAST
+/// occurrence is kept, in place: consumers that key ranges by top-left cell
+/// let a later range win (the renderer's anchor map), and keeping each
+/// range's last position preserves which range wins and the order in which
+/// distinct ranges are painted. Distinct overlapping ranges stay as authored;
+/// consumers resolve them by coverage (`buildMergeCoverageIndex`, markdown
+/// `clear_merge_continuation_cells`).
+fn without_repeated_merge_ranges(merge_cells: Vec<MergeCell>) -> Vec<MergeCell> {
+    let mut seen: HashSet<(u32, u32, u32, u32)> = HashSet::with_capacity(merge_cells.len());
+    let mut kept: Vec<MergeCell> = merge_cells
+        .into_iter()
+        .rev()
+        .filter(|m| seen.insert((m.top, m.left, m.bottom, m.right)))
+        .collect();
+    kept.reverse();
+    kept
 }
 
 /// Reconcile modern threads with the legacy placeholders required by MS-XLSX
@@ -2616,7 +3120,7 @@ fn load_persons(archive: &mut XlsxZip, workbook_rels_xml: &str) -> HashMap<Strin
     else {
         return out;
     };
-    let path = resolve_zip_path("xl", &target);
+    let path = resolve_zip_path("xl/workbook.xml", &target);
     let Ok(xml) = read_zip_string(archive, &path) else {
         return out;
     };
@@ -2974,13 +3478,13 @@ fn load_hyperlinks(
         .collect()
 }
 
-/// Resolve a relative path ("../media/image1.png") against a base dir
-/// ("xl/drawings"). Thin alias for the shared
-/// [`ooxml_common::rels::resolve_target`], which handles root-absolute Targets
-/// (openpyxl's `/xl/...`) and `..` normalization uniformly (ECMA-376 Part 2
-/// §9.3). Kept as a local name so existing call sites read unchanged.
-pub(crate) fn resolve_zip_path(base_dir: &str, target: &str) -> String {
-    ooxml_common::rels::resolve_target(base_dir, target)
+/// Resolve an internal relationship target against its source part.
+///
+/// ECMA-376 Part 2 §6.4.1 applies RFC 3986 resolution before validating and
+/// normalizing the result as an OPC part name. An invalid target becomes the
+/// empty lookup key, so callers follow their existing missing-part path.
+pub(crate) fn resolve_zip_path(source_part: &str, target: &str) -> String {
+    ooxml_common::rels::resolve_part_name(source_part, target).unwrap_or_default()
 }
 
 pub(crate) fn resolve_fill_color(
@@ -3319,8 +3823,8 @@ fn parse_row_cells(
         // Inline string: <c t="inlineStr"><is>...</is></c>
         let is_node = c_node.children().find(|n| n.tag_name().name() == "is");
 
-        // Formula text, if any (<f>…</f>). Kept so the renderer can
-        // recompute volatile builtins (TODAY, NOW) at display time.
+        // Formula text, if any (<f>…</f>). Carried as information only; the
+        // renderer never calculates it and always shows the cached <v>.
         let formula: Option<String> = c_node
             .children()
             .find(|n| n.tag_name().name() == "f")
@@ -3328,13 +3832,13 @@ fn parse_row_cells(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let v_text = c_node
-            .children()
-            .find(|n| n.tag_name().name() == "v")
-            .and_then(|n| n.text())
-            .unwrap_or("")
-            .to_string();
+        let v_node = c_node.children().find(|n| n.tag_name().name() == "v");
+        let v_text = v_node.and_then(|n| n.text()).unwrap_or("").to_string();
 
+        // ECMA-376 §§18.3.1.4/.96: CT_Cell permits an absent <v>, while
+        // a present string cache can contain empty ST_Xstring text. Preserve
+        // that value for cached-only consumers (COUNTA/ISBLANK); never infer
+        // a missing cache from <f>, including shared-formula followers.
         let value = if cell_type == "inlineStr" {
             match is_node {
                 Some(is) => {
@@ -3348,7 +3852,7 @@ fn parse_row_cells(
                 }
                 None => CellValue::Empty,
             }
-        } else if v_text.is_empty() {
+        } else if v_text.is_empty() && !(cell_type == "str" && v_node.is_some()) {
             CellValue::Empty
         } else {
             match cell_type {
@@ -3410,8 +3914,18 @@ fn parse_row_cells(
 /// Accepts `1`/`true`/`on` as true and `0`/`false`/`off` as false (case-insensitive).
 /// Returns `None` when the attribute is absent so callers can apply their own default.
 pub(crate) fn attr_bool(node: &roxmltree::Node, name: &str) -> Option<bool> {
-    node.attribute(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+    node.attribute(name).map(xml_bool_value)
+}
+
+/// Truth value of a decoded SpreadsheetML boolean attribute. The row
+/// projector (via [`attr_bool`]) and the lexical worksheet preview both use
+/// this one reader, so a lenient spelling such as `hidden="True"` cannot give
+/// a provisional frame different row geometry from the completed sheet.
+pub(crate) fn xml_bool_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on"
+    )
 }
 
 pub(crate) fn parse_cell_ref(reference: &str) -> (u32, u32) {
@@ -3524,8 +4038,13 @@ pub(crate) fn resolve_implicit_ordinal(
 /// Returns workbook overview (sheet names and metadata) as JSON.
 /// Native equivalent of `parse_xlsx` for use from the MCP server.
 pub fn parse_workbook_native(data: &[u8]) -> Result<String, String> {
-    parse_xlsx_inner(data)
-        .and_then(|wb| serde_json::to_string(&wb.workbook).map_err(|e| e.to_string()))
+    parse_workbook_model_native(data)
+        .and_then(|wb| serialize_json_string(&wb).map_err(|e| e.to_string()))
+}
+
+/// Native typed workbook overview through the same parse and resource limits.
+pub fn parse_workbook_model_native(data: &[u8]) -> Result<xlsx_model::Workbook, String> {
+    parse_xlsx_inner(data).map(|parsed| parsed.workbook)
 }
 
 /// Parse the workbook and project every sheet to GitHub-flavoured markdown:
@@ -3580,13 +4099,10 @@ pub fn extract_image(
 /// poison state are retained by that same session across public operations.
 #[wasm_bindgen]
 pub struct XlsxArchive {
-    /// The opened archive, or the container-open error string when the ZIP itself
-    /// was truncated / corrupt (#774, RB7 MAJOR). Deferring the failure here —
-    /// instead of erroring out of `new` — lets `parse()` and worksheet cursors return a
-    /// degraded placeholder (symmetric with a corrupt inner sheet) rather than the
-    /// constructor throwing an opaque error the viewer can't turn into a
-    /// placeholder tab.
-    archive: Result<XlsxZip, String>,
+    /// The admitted OPC package. Construction fails closed when the input is not
+    /// a ZIP, not an OPC package, or lacks `xl/workbook.xml`
+    /// (`ooxml_common::opc`), so every method operates on a real workbook.
+    archive: XlsxZip,
     /// Workbook-level parts parsed once and reused across sheet switches. Loaded
     /// lazily on the first workbook-index or worksheet operation.
     shared: Option<WorkbookShared>,
@@ -3600,23 +4116,131 @@ pub struct XlsxArchive {
 
 struct ActiveWorksheetCursor {
     source: ActiveWorksheetSource,
+    preview: Option<Vec<u8>>,
+    /// Parts the preview finalized; the terminal product reuses them.
+    preview_parts: Option<FinalizedSheetParts>,
     sheet_index: u32,
     name: String,
     sheet_path: String,
     reference_index: Option<WorksheetCellLookupBuilder>,
+    // Building this optional cache may stop without losing streamed rows. Keep
+    // the refusal so a later chart/sparkline that needs it fails closed instead
+    // of treating an incomplete index as an unavailable or empty source.
+    reference_index_failure: Option<ReferenceIndexLimit>,
+}
+
+fn serialize_cursor_preview(
+    worksheet: Option<&Worksheet>,
+    reason: Option<&'static str>,
+    max_row: u32,
+    max_col: u32,
+    reporter: &PackageLimitReporter,
+    part: &str,
+) -> Result<Vec<u8>, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Preview<'a> {
+        kind: &'static str,
+        worksheet: Option<&'a Worksheet>,
+        reason: Option<&'static str>,
+        max_row: u32,
+        max_col: u32,
+    }
+    serialize_json_with_limit(
+        &Preview {
+            kind: "preview",
+            worksheet,
+            reason,
+            max_row,
+            max_col,
+        },
+        Some(reporter),
+        HardResourceLimitKind::WorksheetJsonBytes,
+        Some(part),
+        HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
+        "worksheet preview JSON exceeds its hard ceiling",
+    )
+}
+
+/// ECMA-376 §18.3.1.99 places mergeCells, conditionalFormatting, drawings and
+/// extensions after sheetData. A metadata-only pass reaches these before any
+/// bounded row pull. Cross-row or ancillary content stays on the full-model
+/// path until its dependencies can be proven independent of unloaded cells.
+fn cursor_preview_blocker(
+    has_row_outline: bool,
+    ordered_rows: bool,
+    worksheet: &Worksheet,
+) -> Result<Option<&'static str>, String> {
+    if !ordered_rows {
+        return Ok(Some("unordered-rows"));
+    }
+    // Outline levels anywhere on the sheet set the viewer's gutter width and
+    // therefore shift even the first viewport; row bands are not complete
+    // until the terminal model exists.
+    if has_row_outline || !worksheet.col_outline_levels.is_empty() {
+        return Ok(Some("outline"));
+    }
+    Ok(None)
+}
+
+fn build_cursor_preview(
+    zip: &mut XlsxZip,
+    shared: &WorkbookShared,
+    sheet_index: u32,
+    name: &str,
+    sheet_path: &str,
+    part: &str,
+) -> Result<(Vec<u8>, Option<FinalizedSheetParts>), String> {
+    let scanned = zip.scan_worksheet_preview(
+        part,
+        Rc::clone(&shared.shared_strings),
+        Rc::clone(&shared.theme_colors),
+    )?;
+    let max_row = scanned.max_row;
+    let max_col = scanned.max_col;
+    let has_row_outline = scanned.has_row_outline;
+    let ordered_rows = scanned.ordered_rows;
+    let reporter = zip.active_operation()?.limit_reporter()?;
+    let Some(tail) = scanned.tail else {
+        return serialize_cursor_preview(None, Some("metadata-unavailable"), 0, 0, &reporter, part)
+            .map(|bytes| (bytes, None));
+    };
+    let parsed = parse_projected_worksheet_tail(tail, shared.theme_colors.as_ref(), name)?;
+    if let Some(reason) = cursor_preview_blocker(has_row_outline, ordered_rows, &parsed.0)? {
+        return serialize_cursor_preview(None, Some(reason), max_row, max_col, &reporter, part)
+            .map(|bytes| (bytes, None));
+    }
+    let (hyperlink_rids, sheet_shell_xml) = (parsed.1.clone(), parsed.2.clone());
+    let (mut worksheet, saw_chart_frame) = finalize_projected_sheet_reusing(
+        zip,
+        shared,
+        sheet_index,
+        name,
+        sheet_path,
+        parsed,
+        CurrentSheetLookup::Seed(None),
+        None,
+    )?;
+    let bytes =
+        serialize_cursor_preview(Some(&worksheet), None, max_row, max_col, &reporter, part)?;
+    let parts = FinalizedSheetParts::take_from(
+        &mut worksheet,
+        hyperlink_rids,
+        sheet_shell_xml,
+        saw_chart_frame,
+    );
+    Ok((bytes, Some(parts)))
 }
 
 enum ActiveWorksheetSource {
     Streaming(Box<WorksheetCursor>),
     Ready(Box<Worksheet>),
-    DeferredFailure(CursorOpenFailure),
+    /// A metadata scan crossed a package limit. The first pull reports the
+    /// latched error, preserving the cursor-open contract.
+    Poisoned(String),
+    /// A sheet part that could not be opened; pulled as a part-tagged placeholder.
+    DeferredFailure(String),
     Prepared,
-}
-
-#[derive(Clone)]
-enum CursorOpenFailure {
-    Container(String),
-    Sheet(String),
 }
 
 fn serialize_cursor_finished(
@@ -3633,17 +4257,19 @@ fn serialize_cursor_finished(
         kind: "finished",
         worksheet,
     };
-    let json_bytes = measure_json(&finished)?.json_bytes;
-    if let Some(reporter) = limit_reporter {
-        reporter.observe_hard_limit(
-            HardResourceLimitKind::WorksheetJsonBytes,
-            part,
-            HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
-            json_bytes,
-        )?;
-    }
-    serde_json::to_vec(&finished).map_err(|error| format!("serialize error: {error}"))
+    serialize_json_with_limit(
+        &finished,
+        limit_reporter,
+        HardResourceLimitKind::WorksheetJsonBytes,
+        part,
+        HARD_MAX_XLSX_WORKSHEET_JSON_BYTES,
+        "worksheet JSON exceeds its hard ceiling",
+    )
 }
+// The cursor preview and finished envelopes above deliberately keep the
+// independent hard 64 MiB transport/shell cap (configurable:false). They measure
+// envelope bytes, not the worksheet graph, so the adjustable maxJsonBytes policy
+// is never passed to them.
 
 #[wasm_bindgen]
 impl XlsxArchive {
@@ -3666,20 +4292,13 @@ impl XlsxArchive {
         max_archive_entries: Option<u64>,
     ) -> Result<XlsxArchive, JsValue> {
         console_error_panic_hook::set_once();
-        // #774 (RB7 MAJOR): a truncated / corrupt CONTAINER is deferred, not
-        // thrown, so `parse()` / `parse_sheet()` can degrade it to a placeholder
-        // instead of the constructor failing with an opaque error.
-        let archive = open_zip_with_policy(
+        let archive = open_workbook_package(
             data,
             max_archive_entry_bytes,
             max_total_inflated_bytes,
             max_archive_entries,
-        );
-        if let Err(error) = &archive {
-            if error.starts_with("OOXML_RESOURCE_LIMIT:") {
-                return Err(JsValue::from_str(error));
-            }
-        }
+        )
+        .map_err(|error| JsValue::from_str(&error))?;
         Ok(XlsxArchive {
             archive,
             shared: None,
@@ -3690,58 +4309,62 @@ impl XlsxArchive {
         })
     }
 
+    /// Configure the per-archive worksheet limits once. This must happen after
+    /// construction and before any parse or cursor operation. Later calls are
+    /// refused. The constructor and the ZIP scalar limits do not change.
+    pub fn set_worksheet_limits(
+        &mut self,
+        max_rows: u64,
+        max_cells: u64,
+        max_owned_utf8_bytes: u64,
+        max_json_bytes: u64,
+    ) -> Result<(), JsValue> {
+        let policy =
+            WorksheetResourcePolicy::new(max_rows, max_cells, max_owned_utf8_bytes, max_json_bytes)
+                .map_err(|error| JsValue::from_str(&error))?;
+        self.archive
+            .configure_worksheet_policy(policy)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     /// Parse (once) and return the workbook-level shared parts, caching them for
     /// reuse. Borrows `self` split so the cached `shared` and the `archive` can be
-    /// used together by callers. Assumes the container opened; the corrupt-container
-    /// case is short-circuited by the callers before they reach here.
+    /// used together by callers.
     fn ensure_shared(&mut self) -> Result<(), String> {
         if self.shared.is_none() {
-            let zip = self
-                .archive
-                .as_mut()
-                .map_err(|error| format!("xlsx-parser error: {error}"))?;
-            let shared = WorkbookShared::load(zip)?;
+            let shared = WorkbookShared::load(&mut self.archive)?;
             self.shared = Some(shared);
         }
         Ok(())
     }
 
     /// Parse the workbook index (sheet list + styles + shared strings) and return
-    /// it as UTF-8 JSON bytes. Byte-for-byte identical to `parse_xlsx`. When the
-    /// CONTAINER failed to open (#774) the model is a degraded placeholder
-    /// workbook tagged with the container.
+    /// it as UTF-8 JSON bytes. Byte-for-byte identical to `parse_xlsx`.
     pub fn parse(&mut self) -> Result<Vec<u8>, JsValue> {
-        if let Err(error) = &self.archive {
-            let workbook = degraded_container_workbook(error.clone());
-            return serde_json::to_vec(&workbook)
-                .map_err(|error| JsValue::from_str(&format!("serialize error: {error}")));
-        }
         self.archive
-            .as_mut()
-            .expect("container open checked above")
             .begin_operation("parse")
             .map_err(|error| JsValue::from_str(&error))?;
         let result = (|| -> Result<Vec<u8>, String> {
+            // Scope every shared-part parse as well as serialization: optional
+            // part fallback cannot clear a proven depth/resource crossing.
+            let _resource_scope = self.archive.operation()?.resource_scope()?;
             let styles = if let Some(shared) = &self.shared {
                 // A sheet cursor may have initialized only the lightweight style
                 // projection. Parse the full style model only when the caller
                 // later asks for the workbook index, and move it directly into
                 // the serialized result.
                 let theme_colors = Rc::clone(&shared.theme_colors);
-                let zip = self.archive.as_mut().expect("container open checked above");
-                parse_styles(zip, theme_colors.as_ref()).map(|parsed| parsed.styles)
+                parse_styles(&mut self.archive, theme_colors.as_ref()).map(|parsed| parsed.styles)
             } else {
-                let zip = self.archive.as_mut().expect("container open checked above");
-                let (shared, styles) = WorkbookShared::load_with_styles(zip)?;
+                let (shared, styles) = WorkbookShared::load_with_styles(&mut self.archive)?;
                 self.shared = Some(shared);
                 styles
             };
             let shared = self.shared.as_ref().expect("shared loaded above");
-            let zip = self.archive.as_mut().expect("container open checked above");
-            let workbook = parse_xlsx_inner_with(zip, shared, styles)?;
-            serde_json::to_vec(&workbook).map_err(|error| format!("serialize error: {error}"))
+            let workbook = parse_xlsx_inner_with(&mut self.archive, shared, styles)?;
+            serialize_json(&workbook).map_err(|error| format!("serialize error: {error}"))
         })();
-        let zip = self.archive.as_mut().expect("container open checked above");
+        let zip = &mut self.archive;
         let result = settle_xlsx_operation(zip, result);
         if result.is_err() && zip.assert_healthy().is_err() {
             self.shared = None;
@@ -3751,54 +4374,36 @@ impl XlsxArchive {
 
     /// Fail cached worker operations after this package session was poisoned.
     pub fn assert_healthy(&self) -> Result<(), JsValue> {
-        match &self.archive {
-            Ok(archive) => archive
-                .assert_healthy()
-                .map_err(|error| JsValue::from_str(&error)),
-            Err(_) => Ok(()),
-        }
+        self.archive
+            .assert_healthy()
+            .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Session-wide archive accounting after workbook bootstrap or any later
     /// operation. This is diagnostic data, not an allocator-memory estimate.
     pub fn resource_usage(&self) -> Result<Vec<u8>, JsValue> {
-        let usage = self
-            .archive
-            .as_ref()
-            .map(XlsxZip::usage)
-            .map_err(|_| JsValue::from_str("xlsx resource usage is unavailable"))?;
-        serde_json::to_vec(&usage)
+        let usage = self.archive.usage();
+        serialize_json(&usage)
             .map_err(|error| JsValue::from_str(&format!("serialize error: {error}")))
     }
 
     /// Open the resumable production worksheet pipeline. Only one cursor may
     /// hold the archive's decoder lease at a time.
     pub fn open_sheet_cursor(&mut self, sheet_index: u32, name: &str) -> Result<(), JsValue> {
+        self.open_sheet_cursor_inner(sheet_index, name)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    fn open_sheet_cursor_inner(&mut self, sheet_index: u32, name: &str) -> Result<(), String> {
         if self.active_worksheet.is_some() {
-            return Err(JsValue::from_str("worksheet cursor is already open"));
+            return Err("worksheet cursor is already open".to_string());
         }
         self.last_cursor_pull_terminal = false;
         self.terminal_awaiting_ack = false;
         self.last_cursor_usage = None;
-        if let Err(error) = &self.archive {
-            self.active_worksheet = Some(ActiveWorksheetCursor {
-                source: ActiveWorksheetSource::DeferredFailure(CursorOpenFailure::Container(
-                    error.clone(),
-                )),
-                sheet_index,
-                name: CONTAINER_PART.to_string(),
-                sheet_path: String::new(),
-                reference_index: None,
-            });
-            return Ok(());
-        }
-        let zip = self
-            .archive
-            .as_mut()
-            .map_err(|error| JsValue::from_str(&format!("xlsx-parser error: {error}")))?;
-        zip.begin_operation("worksheet-cursor")
-            .map_err(|error| JsValue::from_str(&error))?;
+        self.archive.begin_operation("worksheet-cursor")?;
         let result = (|| -> Result<ActiveWorksheetCursor, String> {
+            let _resource_scope = self.archive.operation()?.resource_scope()?;
             self.ensure_shared()?;
             let shared = self.shared.as_ref().expect("shared loaded above");
             let rels_doc = parse_guarded(&shared.rels_xml).map_err(|error| error.to_string())?;
@@ -3809,8 +4414,10 @@ impl XlsxArchive {
             let sheet_path = resolve_sheet_path(&rels_doc, &sheet.r_id)
                 .ok_or_else(|| format!("rId {} not found in rels", sheet.r_id))?;
             let part = format!("xl/{sheet_path}");
-            let zip = self.archive.as_mut().expect("container open checked above");
+            let zip = &mut self.archive;
             let sheet_part_kind = resolve_sheet_part_kind(&rels_doc, &sheet.r_id);
+            let mut preview = None;
+            let mut preview_parts = None;
             let source = match sheet_part_kind {
                 SheetPartKind::ChartSheet => {
                     match parse_chart_sheet_shell(zip, &part, name).and_then(|parsed| {
@@ -3827,7 +4434,7 @@ impl XlsxArchive {
                         Ok(worksheet) => ActiveWorksheetSource::Ready(Box::new(worksheet)),
                         Err(error) => {
                             zip.assert_healthy()?;
-                            ActiveWorksheetSource::DeferredFailure(CursorOpenFailure::Sheet(error))
+                            ActiveWorksheetSource::DeferredFailure(error)
                         }
                     }
                 }
@@ -3835,39 +4442,69 @@ impl XlsxArchive {
                     Ok((worksheet, _, _)) => ActiveWorksheetSource::Ready(Box::new(worksheet)),
                     Err(error) => {
                         zip.assert_healthy()?;
-                        ActiveWorksheetSource::DeferredFailure(CursorOpenFailure::Sheet(error))
+                        ActiveWorksheetSource::DeferredFailure(error)
                     }
                 },
-                SheetPartKind::Worksheet => match zip.open_worksheet_cursor(
-                    &part,
-                    Rc::clone(&shared.shared_strings),
-                    Rc::clone(&shared.theme_colors),
-                ) {
-                    Ok(cursor) => ActiveWorksheetSource::Streaming(Box::new(cursor)),
-                    Err(error) => {
-                        zip.assert_healthy()?;
-                        ActiveWorksheetSource::DeferredFailure(CursorOpenFailure::Sheet(error))
+                SheetPartKind::Worksheet => {
+                    let preview_result =
+                        build_cursor_preview(zip, shared, sheet_index, name, &sheet_path, &part);
+                    match preview_result {
+                        Ok((bytes, parts)) => {
+                            preview = Some(bytes);
+                            preview_parts = parts;
+                        }
+                        Err(_) if zip.assert_healthy().is_ok() => {
+                            let reporter = zip.active_operation()?.limit_reporter()?;
+                            preview = Some(serialize_cursor_preview(
+                                None,
+                                Some("metadata-unavailable"),
+                                0,
+                                0,
+                                &reporter,
+                                &part,
+                            )?);
+                        }
+                        Err(_) => {}
                     }
-                },
+                    if let Err(resource_error) = zip.assert_healthy() {
+                        ActiveWorksheetSource::Poisoned(resource_error)
+                    } else {
+                        let cursor_result = zip.open_worksheet_cursor(
+                            &part,
+                            Rc::clone(&shared.shared_strings),
+                            Rc::clone(&shared.theme_colors),
+                        );
+                        match cursor_result {
+                            Ok(cursor) => ActiveWorksheetSource::Streaming(Box::new(cursor)),
+                            Err(error) => {
+                                zip.assert_healthy()?;
+                                ActiveWorksheetSource::DeferredFailure(error)
+                            }
+                        }
+                    }
+                }
             };
             Ok(ActiveWorksheetCursor {
                 source,
+                preview,
+                preview_parts,
                 sheet_index,
                 name: name.to_string(),
                 sheet_path,
                 reference_index: (sheet_part_kind == SheetPartKind::Worksheet)
                     .then(WorksheetCellLookupBuilder::bounded),
+                reference_index_failure: None,
             })
         })();
+        let result = self.archive.assert_healthy().and(result);
         match result {
             Ok(cursor) => {
                 self.active_worksheet = Some(cursor);
                 Ok(())
             }
             Err(error) => {
-                let zip = self.archive.as_mut().expect("container open checked above");
-                zip.cancel_operation();
-                Err(JsValue::from_str(&error))
+                self.archive.cancel_operation();
+                Err(error)
             }
         }
     }
@@ -3880,42 +4517,64 @@ impl XlsxArchive {
     }
 
     fn pull_sheet_cursor_inner(&mut self, row_credit: usize) -> Result<Vec<u8>, String> {
+        let _resource_scope = self.archive.operation()?.resource_scope()?;
+        let result = self.pull_sheet_cursor_scoped(row_credit);
+        if let Err(error) = self.archive.assert_healthy() {
+            self.active_worksheet.take();
+            self.archive.cancel_operation();
+            return Err(error);
+        }
+        result
+    }
+
+    fn pull_sheet_cursor_scoped(&mut self, row_credit: usize) -> Result<Vec<u8>, String> {
         if self.terminal_awaiting_ack {
             return Err(
                 "worksheet terminal product must be acknowledged before pulling".to_string(),
             );
         }
         self.last_cursor_pull_terminal = false;
+        if let Some(preview) = self
+            .active_worksheet
+            .as_mut()
+            .and_then(|active| active.preview.take())
+        {
+            return Ok(preview);
+        }
+        if let Some(error) =
+            self.active_worksheet
+                .as_ref()
+                .and_then(|active| match &active.source {
+                    ActiveWorksheetSource::Poisoned(error) => Some(error.clone()),
+                    _ => None,
+                })
+        {
+            self.active_worksheet.take();
+            self.archive.cancel_operation();
+            return Err(error);
+        }
         let deferred = match &self
             .active_worksheet
             .as_ref()
             .ok_or_else(|| "worksheet cursor is not open".to_string())?
             .source
         {
-            ActiveWorksheetSource::DeferredFailure(failure) => Some(failure.clone()),
+            ActiveWorksheetSource::DeferredFailure(error) => Some(error.clone()),
             ActiveWorksheetSource::Streaming(_) | ActiveWorksheetSource::Ready(_) => None,
+            ActiveWorksheetSource::Poisoned(_) => unreachable!("poison handled above"),
             ActiveWorksheetSource::Prepared => {
                 return Err("worksheet terminal product is prepared".to_string());
             }
         };
-        if let Some(failure) = deferred {
+        if let Some(error) = deferred {
             let active = self
                 .active_worksheet
                 .as_ref()
                 .expect("cursor checked above");
-            let part = (!active.sheet_path.is_empty()).then(|| format!("xl/{}", active.sheet_path));
-            let worksheet = match failure {
-                CursorOpenFailure::Container(error) => degraded_container_sheet(error),
-                CursorOpenFailure::Sheet(error) => Worksheet::placeholder(
-                    &active.name,
-                    format!("xl/{}: {error}", active.sheet_path),
-                ),
-            };
-            let reporter = match self.archive.as_ref() {
-                Ok(zip) => Some(zip.active_operation()?.limit_reporter()?),
-                Err(_) => None,
-            };
-            let bytes = serialize_cursor_finished(worksheet, reporter.as_ref(), part.as_deref())?;
+            let part = format!("xl/{}", active.sheet_path);
+            let worksheet = Worksheet::placeholder(&active.name, format!("{part}: {error}"));
+            let reporter = self.archive.active_operation()?.limit_reporter()?;
+            let bytes = serialize_cursor_finished(worksheet, Some(&reporter), Some(&part))?;
             self.active_worksheet
                 .as_mut()
                 .expect("cursor checked above")
@@ -3943,12 +4602,7 @@ impl XlsxArchive {
                 .as_ref()
                 .expect("cursor checked above");
             let part = format!("xl/{}", active.sheet_path);
-            let reporter = self
-                .archive
-                .as_ref()
-                .expect("container open checked above")
-                .active_operation()?
-                .limit_reporter()?;
+            let reporter = self.archive.active_operation()?.limit_reporter()?;
             let bytes = serialize_cursor_finished(*worksheet, Some(&reporter), Some(&part))?;
             self.last_cursor_pull_terminal = true;
             self.terminal_awaiting_ack = true;
@@ -3961,6 +4615,12 @@ impl XlsxArchive {
                 .ok_or_else(|| "worksheet cursor shared state is missing".to_string())?
                 .shared_strings,
         );
+        let normal_font_color = self
+            .shared
+            .as_ref()
+            .ok_or_else(|| "worksheet cursor shared state is missing".to_string())?
+            .normal_font_color
+            .clone();
         let source = &mut self
             .active_worksheet
             .as_mut()
@@ -3973,22 +4633,25 @@ impl XlsxArchive {
             _ => unreachable!("source checked above"),
         };
         match pull {
-            Ok(WorksheetCursorPull::Rows { rows, .. }) => {
-                extend_lookup_transactionally(
-                    &mut self
-                        .active_worksheet
-                        .as_mut()
-                        .expect("cursor checked above")
-                        .reference_index,
+            Ok(WorksheetCursorPull::Rows { mut rows, .. }) => {
+                mark_rows_run_colors(&mut rows, normal_font_color.as_ref());
+                let active = self
+                    .active_worksheet
+                    .as_mut()
+                    .expect("cursor checked above");
+                if let Some(failure) = extend_lookup_transactionally(
+                    &mut active.reference_index,
                     &rows,
                     shared_strings.as_ref(),
-                );
+                ) {
+                    active.reference_index_failure = Some(failure);
+                }
                 #[derive(serde::Serialize)]
                 struct Rows<'a> {
                     kind: &'static str,
                     rows: &'a [Row],
                 }
-                serde_json::to_vec(&Rows {
+                serialize_json(&Rows {
                     kind: "rows",
                     rows: &rows,
                 })
@@ -4006,19 +4669,31 @@ impl XlsxArchive {
                         shared.theme_colors.as_ref(),
                         &active.name,
                     )?;
-                    let current_index = active.reference_index.take().and_then(|mut builder| {
-                        builder.mark_hidden_columns(&parsed.0.col_hidden)?;
-                        Some(builder.finish())
-                    });
-                    let zip = self.archive.as_mut().expect("container open checked above");
-                    let worksheet = finalize_projected_sheet(
+                    let current_index = if let Some(failure) = active.reference_index_failure {
+                        CurrentSheetLookup::LimitExceeded(failure)
+                    } else if let Some(mut builder) = active.reference_index.take() {
+                        if builder.mark_hidden_columns(&parsed.0.col_hidden).is_none() {
+                            CurrentSheetLookup::LimitExceeded(
+                                builder
+                                    .limit_failure()
+                                    .expect("bounded builder records its refusal"),
+                            )
+                        } else {
+                            CurrentSheetLookup::Seed(Some(builder.finish()))
+                        }
+                    } else {
+                        CurrentSheetLookup::Seed(None)
+                    };
+                    let zip = &mut self.archive;
+                    let (worksheet, _) = finalize_projected_sheet_reusing(
                         zip,
                         shared,
                         active.sheet_index,
                         &active.name,
                         &active.sheet_path,
                         parsed,
-                        CurrentSheetLookup::Seed(current_index),
+                        current_index,
+                        active.preview_parts.take(),
                     )?;
                     // Ancillary parsers intentionally degrade malformed parts to
                     // placeholders, but a resource-limit violation is terminal
@@ -4031,7 +4706,7 @@ impl XlsxArchive {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        let zip = self.archive.as_mut().expect("container open checked above");
+                        let zip = &mut self.archive;
                         if let Err(resource_error) = zip.assert_healthy() {
                             self.active_worksheet.take();
                             zip.cancel_operation();
@@ -4042,12 +4717,7 @@ impl XlsxArchive {
                             .as_ref()
                             .expect("cursor checked above");
                         let part = format!("xl/{}", active.sheet_path);
-                        let reporter = self
-                            .archive
-                            .as_ref()
-                            .expect("container open checked above")
-                            .active_operation()?
-                            .limit_reporter()?;
+                        let reporter = self.archive.active_operation()?.limit_reporter()?;
                         serialize_cursor_finished(
                             Worksheet::placeholder(&active.name, format!("{part}: {error}")),
                             Some(&reporter),
@@ -4064,7 +4734,7 @@ impl XlsxArchive {
                 Ok(bytes)
             }
             Err(error) => {
-                let zip = self.archive.as_mut().expect("container open checked above");
+                let zip = &mut self.archive;
                 if let Err(resource_error) = zip.assert_healthy() {
                     self.active_worksheet.take();
                     zip.cancel_operation();
@@ -4075,12 +4745,7 @@ impl XlsxArchive {
                     .as_ref()
                     .expect("cursor checked above");
                 let part = format!("xl/{}", active.sheet_path);
-                let reporter = self
-                    .archive
-                    .as_ref()
-                    .expect("container open checked above")
-                    .active_operation()?
-                    .limit_reporter()?;
+                let reporter = self.archive.active_operation()?.limit_reporter()?;
                 let bytes = serialize_cursor_finished(
                     Worksheet::placeholder(&active.name, format!("{part}: {error}")),
                     Some(&reporter),
@@ -4107,12 +4772,11 @@ impl XlsxArchive {
     pub fn sheet_cursor_resource_usage(&self) -> Result<Vec<u8>, JsValue> {
         let usage = self
             .archive
-            .as_ref()
-            .ok()
-            .and_then(|zip| zip.operation.usage())
+            .operation
+            .usage()
             .or(self.last_cursor_usage)
             .ok_or_else(|| JsValue::from_str("worksheet cursor usage is unavailable"))?;
-        serde_json::to_vec(&usage)
+        serialize_json(&usage)
             .map_err(|error| JsValue::from_str(&format!("serialize error: {error}")))
     }
 
@@ -4127,12 +4791,7 @@ impl XlsxArchive {
         if !self.terminal_awaiting_ack {
             return Err("worksheet terminal product is not awaiting acknowledgement".to_string());
         }
-        if self.archive.is_err() {
-            self.active_worksheet.take();
-            self.terminal_awaiting_ack = false;
-            return Ok(());
-        }
-        let zip = self.archive.as_mut().expect("container open checked above");
+        let zip = &mut self.archive;
         self.last_cursor_usage = zip.operation.usage();
         let result = zip.finish_operation();
         if let Err(resource_error) = zip.assert_healthy() {
@@ -4156,10 +4815,8 @@ impl XlsxArchive {
         }
         self.terminal_awaiting_ack = false;
         self.last_cursor_pull_terminal = false;
-        if let Ok(zip) = self.archive.as_mut() {
-            self.last_cursor_usage = zip.operation.usage().or(self.last_cursor_usage);
-            zip.cancel_operation();
-        }
+        self.last_cursor_usage = self.archive.operation.usage().or(self.last_cursor_usage);
+        self.archive.cancel_operation();
     }
 
     /// Close an open cursor and release its decoder lease. Idempotent.
@@ -4170,35 +4827,33 @@ impl XlsxArchive {
             if let ActiveWorksheetSource::Streaming(cursor) = &mut active.source {
                 cursor.close();
             }
-            if let Ok(zip) = self.archive.as_mut() {
-                self.last_cursor_usage = zip.operation.usage().or(self.last_cursor_usage);
-                zip.cancel_operation();
-            }
+            self.last_cursor_usage = self.archive.operation.usage().or(self.last_cursor_usage);
+            self.archive.cancel_operation();
             self.last_cursor_pull_terminal = false;
         }
     }
 
     /// Extract raw bytes for one embedded image entry (e.g.
     /// "xl/media/image1.png") from the retained archive. Twin of the free
-    /// `extract_image`, but reads through the already-open archive. A corrupt
-    /// container has no entries, so this surfaces the container-open error.
+    /// `extract_image`, but reads through the already-open archive.
     pub fn extract_image(&mut self, path: &str) -> Result<Vec<u8>, JsValue> {
-        let zip = self
-            .archive
-            .as_mut()
-            .map_err(|e| JsValue::from_str(&format!("xlsx-parser error: {e}")))?;
-        zip.run_operation("extract-image", |zip| read_zip_bytes(zip, path))
-            .map_err(|error| JsValue::from_str(&error))
+        let result = if self.active_worksheet.is_some() {
+            // A provisional viewport may need a DrawingML blip while the
+            // worksheet cursor owns its operation. Charge it to that same
+            // operation, then let terminal ACK commit the combined usage.
+            read_zip_bytes(&mut self.archive, path)
+        } else {
+            self.archive
+                .run_operation("extract-image", |zip| read_zip_bytes(zip, path))
+        };
+        result.map_err(|error| JsValue::from_str(&error))
     }
 
     /// GitHub-flavoured markdown projection of the retained archive. Mirrors the
-    /// free `xlsx_to_markdown`. A corrupt container degrades to an empty document.
+    /// free `xlsx_to_markdown`.
     pub fn to_markdown(&mut self) -> Result<String, JsValue> {
-        let zip = self
-            .archive
-            .as_mut()
-            .map_err(|error| JsValue::from_str(&format!("xlsx-parser error: {error}")))?;
-        zip.run_operation("markdown", to_markdown_from_archive)
+        self.archive
+            .run_operation("markdown", to_markdown_from_archive)
             .map_err(|error| JsValue::from_str(&error))
     }
 }
@@ -4221,17 +4876,12 @@ fn to_markdown_impl_with_limits(
     max_archive_entry_bytes: Option<u64>,
     max_total_inflated_bytes: Option<u64>,
 ) -> Result<String, String> {
-    // #774: a corrupt CONTAINER has no sheets to render — degrade to an empty
-    // markdown document instead of erroring, symmetric with the JSON path.
-    let mut archive = match open_zip_with_limits(
+    let mut archive = open_workbook_package(
         data.to_vec(),
         max_archive_entry_bytes,
         max_total_inflated_bytes,
-    ) {
-        Ok(zip) => zip,
-        Err(error) if error.starts_with("OOXML_RESOURCE_LIMIT:") => return Err(error),
-        Err(_) => return Ok(String::new()),
-    };
+        None,
+    )?;
     archive.run_operation("markdown", to_markdown_from_archive)
 }
 
@@ -4255,11 +4905,59 @@ fn to_markdown_from_archive(archive: &mut XlsxZip) -> Result<String, String> {
             })?;
         let sheet: serde_json::Value =
             serde_json::from_slice(&sheet_json).map_err(|e| e.to_string())?;
-        markdown::render_sheet(&sheet, &shared.shared_strings, &mut out);
-        markdown::render_sheet_comments(&sheet, &mut review_comments, &mut has_comments);
+        // Comments are retained for the end of the document, so they share
+        // the budget every later table is checked against.
+        let table_budget = MAX_XLSX_MARKDOWN_BYTES.saturating_sub(review_comments.len() as u64);
+        let rendered =
+            markdown::render_sheet(&sheet, &shared.shared_strings, &mut out, table_budget);
+        if let Err(observed) = rendered {
+            let projected = observed.saturating_add(review_comments.len() as u64);
+            return Err(markdown_limit_error(archive, projected));
+        }
+        // Comments are appended after every table; charge them to the same
+        // budget as they are written, so they cannot accumulate past it.
+        let comment_budget = MAX_XLSX_MARKDOWN_BYTES.saturating_sub(out.len() as u64);
+        if let Err(observed) = markdown::render_sheet_comments(
+            &sheet,
+            &mut review_comments,
+            &mut has_comments,
+            comment_budget,
+        ) {
+            let projected = (out.len() as u64).saturating_add(observed);
+            return Err(markdown_limit_error(archive, projected));
+        }
+    }
+    let total = (out.len() as u64).saturating_add(review_comments.len() as u64);
+    if total > MAX_XLSX_MARKDOWN_BYTES {
+        return Err(markdown_limit_error(archive, total));
     }
     out.push_str(&review_comments);
     Ok(out)
+}
+
+/// Markdown output ceiling, matching the DOCX and PPTX markdown hard ceilings.
+/// Implementation resource policy: a projection larger than this fails with a
+/// typed `xlsx-markdown:bytes` violation instead of exhausting WASM memory.
+const MAX_XLSX_MARKDOWN_BYTES: u64 = ooxml_common::resource::HARD_MAX_PPTX_MARKDOWN_BYTES;
+
+fn markdown_limit_error(archive: &mut XlsxZip, observed: u64) -> String {
+    let reported = archive
+        .operation()
+        .and_then(|operation| operation.limit_reporter())
+        .and_then(|reporter| {
+            reporter.observe_hard_limit(
+                HardResourceLimitKind::XlsxMarkdownBytes,
+                None,
+                MAX_XLSX_MARKDOWN_BYTES,
+                observed,
+            )
+        });
+    match reported {
+        Err(error) => error,
+        Ok(()) => {
+            format!("xlsx markdown projection exceeds {MAX_XLSX_MARKDOWN_BYTES} bytes ({observed})")
+        }
+    }
 }
 
 /// Parses a single worksheet by 0-based index and returns it as JSON.
@@ -4268,19 +4966,69 @@ fn to_markdown_from_archive(archive: &mut XlsxZip) -> Result<String, String> {
 /// the WASM `parse_sheet`, then decodes the JSON bytes to a `String` — so the
 /// native and WASM paths can never drift.
 pub fn parse_sheet_native(data: &[u8], sheet_index: u32, name: &str) -> Result<String, String> {
-    // #774: mirror the WASM `parse_sheet` — a corrupt CONTAINER degrades to the
-    // container-tagged placeholder sheet rather than erroring.
-    let mut archive = match open_zip(data.to_vec()) {
-        Ok(zip) => zip,
-        Err(e) => {
-            let ws = degraded_container_sheet(e);
-            return serde_json::to_string(&ws).map_err(|e| e.to_string());
-        }
-    };
+    let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    parse_sheet_native_in(&mut archive, sheet_index, name)
+}
+
+/// Same as `parse_sheet_native`, but with an explicit per-archive worksheet
+/// policy. The policy is configured after admission and before the operation.
+pub fn parse_sheet_native_with_worksheet_limits(
+    data: &[u8],
+    sheet_index: u32,
+    name: &str,
+    policy: WorksheetResourcePolicy,
+) -> Result<String, String> {
+    let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    archive.configure_worksheet_policy(policy)?;
+    parse_sheet_native_in(&mut archive, sheet_index, name)
+}
+
+fn parse_sheet_native_in(
+    archive: &mut XlsxZip,
+    sheet_index: u32,
+    name: &str,
+) -> Result<String, String> {
     archive.run_operation("parse-sheet", |archive| {
         let shared = WorkbookShared::load(archive)?;
         let json = parse_sheet_with(archive, &shared, sheet_index, name)?;
         String::from_utf8(json).map_err(|error| error.to_string())
+    })
+}
+
+/// Native typed worksheet through the same parse operation and bounded JSON
+/// projection check as `parse_sheet_native`.
+pub fn parse_sheet_model_native(
+    data: &[u8],
+    sheet_index: u32,
+    name: &str,
+) -> Result<xlsx_model::Worksheet, String> {
+    let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    parse_sheet_model_native_in(&mut archive, sheet_index, name)
+}
+
+/// Same as `parse_sheet_model_native`, but with an explicit per-archive
+/// worksheet policy.
+pub fn parse_sheet_model_native_with_worksheet_limits(
+    data: &[u8],
+    sheet_index: u32,
+    name: &str,
+    policy: WorksheetResourcePolicy,
+) -> Result<xlsx_model::Worksheet, String> {
+    let mut archive = open_workbook_package(data.to_vec(), None, None, None)?;
+    archive.configure_worksheet_policy(policy)?;
+    parse_sheet_model_native_in(&mut archive, sheet_index, name)
+}
+
+fn parse_sheet_model_native_in(
+    archive: &mut XlsxZip,
+    sheet_index: u32,
+    name: &str,
+) -> Result<xlsx_model::Worksheet, String> {
+    archive.run_operation("parse-sheet", |archive| {
+        let shared = WorkbookShared::load(archive)?;
+        let (worksheet, part) = parse_sheet_model_with(archive, &shared, sheet_index, name)?;
+        serialize_worksheet_bounded(archive, &part, &worksheet)?;
+        Ok(worksheet)
     })
 }
 
@@ -4332,6 +5080,132 @@ mod tab_color_tests {
         let head =
             r#"<worksheet><sheetPr/><sheetData><c><is><t>tabColor rgb="00FF00"</t></is></c>"#;
         assert_eq!(extract_tab_color_from_head(head, &theme()), None);
+    }
+
+    #[test]
+    fn tab_color_that_is_not_a_color_is_dropped() {
+        // #1957: the tab color is painted into CSS, so text after the hex
+        // (here a second declaration loading a URL) must never survive.
+        let head = r#"<worksheet><sheetPr><tabColor rgb="FF0000;background-image:url(http://tabcolor-beacon.invalid/pixel)"/></sheetPr><sheetData/></worksheet>"#;
+        assert_eq!(extract_tab_color_from_head(head, &theme()), None);
+        // The same text arriving through a theme slot.
+        let theme = super::XlsxThemeData::parse(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="x">
+              <a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+              <a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+              <a:accent1><a:srgbClr val="4472C4;background-image:url(http://x.invalid/p)"/></a:accent1>
+            </a:clrScheme></a:themeElements></a:theme>"#,
+        )
+        .colors;
+        let head = r#"<worksheet><sheetPr><tabColor theme="4"/></sheetPr><sheetData/></worksheet>"#;
+        assert_eq!(extract_tab_color_from_head(head, &theme), None);
+    }
+}
+
+#[cfg(test)]
+mod color_tint_tests {
+    use super::resolve_color_attrs;
+
+    #[test]
+    fn explicit_rgb_uses_the_same_sml_luminance_tint_as_theme_colors() {
+        for (tint, expected) in [
+            ("-1", "#000000"),
+            ("-0.5", "#404040"),
+            ("0", "#808080"),
+            ("0.5", "#C0C0C0"),
+            ("1", "#FFFFFF"),
+        ] {
+            for rgb in ["FF808080", "808080"] {
+                assert_eq!(
+                    resolve_color_attrs(Some(rgb), None, Some(tint), None, &[]).as_deref(),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_colors_also_receive_tint_after_resolving_the_palette() {
+        assert_eq!(
+            resolve_color_attrs(None, None, Some("1"), Some("0"), &[]).as_deref(),
+            Some("#FFFFFF")
+        );
+        assert_eq!(
+            resolve_color_attrs(None, None, Some("-1"), Some("1"), &[]).as_deref(),
+            Some("#000000")
+        );
+    }
+
+    #[test]
+    fn rgb_tint_reaches_fonts_pattern_fills_borders_and_differential_styles() {
+        let source = r##"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+            <fonts><font><color rgb="FF808080" tint="-0.5"/></font></fonts>
+            <fills><fill><patternFill patternType="solid"><fgColor rgb="FF808080" tint="0.5"/><bgColor indexed="0" tint="1"/></patternFill></fill></fills>
+            <borders><border><bottom style="thin"><color rgb="FF808080" tint="-0.5"/></bottom></border></borders>
+            <dxfs><dxf><font><color rgb="FF808080" tint="0.5"/></font><fill><patternFill patternType="solid"><fgColor rgb="FF808080" tint="-0.5"/></patternFill></fill><border><bottom style="thin"><color rgb="FF808080" tint="0.5"/></bottom></border></dxf></dxfs>
+        </styleSheet>"##;
+        let doc = roxmltree::Document::parse(source).unwrap();
+        assert_eq!(
+            super::styles::parse_fonts(&doc, &[])[0].color.as_deref(),
+            Some("#404040")
+        );
+        let fills = super::styles::parse_fills(&doc, &[]);
+        assert_eq!(fills[0].fg_color.as_deref(), Some("#C0C0C0"));
+        assert_eq!(fills[0].bg_color.as_deref(), Some("#FFFFFF"));
+        assert_eq!(
+            super::styles::parse_borders(&doc, &[])[0]
+                .bottom
+                .as_ref()
+                .unwrap()
+                .color
+                .as_deref(),
+            Some("#404040")
+        );
+        let dxf = super::styles::parse_dxfs(&doc, &[]).remove(0);
+        assert_eq!(dxf.font.unwrap().color.as_deref(), Some("#C0C0C0"));
+        assert_eq!(dxf.fill.unwrap().fg_color.as_deref(), Some("#404040"));
+        assert_eq!(
+            dxf.border.unwrap().bottom.unwrap().color.as_deref(),
+            Some("#C0C0C0")
+        );
+        assert_eq!(
+            super::extract_tab_color_from_head(
+                r#"<worksheet><sheetPr><tabColor rgb="FF808080" tint="0.5"/></sheetPr><sheetData>"#,
+                &[]
+            )
+            .as_deref(),
+            Some("#C0C0C0")
+        );
+    }
+
+    #[test]
+    fn source_kind_does_not_change_hue_preserving_tint_and_invalid_metadata_is_not_clamped() {
+        let theme = vec!["#4472C4".to_owned(); 12];
+        for tint in [
+            "-1", "-0.75", "-0.5", "-0.25", "-0.00001", "0", "0.00001", "0.25", "0.5", "0.75", "1",
+        ] {
+            assert_eq!(
+                resolve_color_attrs(Some("FF4472C4"), None, Some(tint), None, &[]),
+                resolve_color_attrs(None, Some("4"), Some(tint), None, &theme)
+            );
+        }
+        for tint in ["NaN", "inf", "-inf", "1.01", "-1.01", "invalid"] {
+            assert_eq!(
+                resolve_color_attrs(Some("FF4472C4"), None, Some(tint), None, &[]).as_deref(),
+                Some("#4472C4")
+            );
+            assert_eq!(
+                resolve_color_attrs(None, Some("4"), Some(tint), None, &theme).as_deref(),
+                Some("#4472C4")
+            );
+        }
+        assert_eq!(
+            resolve_color_attrs(Some("FF808080"), None, Some(" 0.5 "), None, &[]).as_deref(),
+            Some("#C0C0C0")
+        );
+        // Malformed non-hex RGB is not a color (#1957), whatever its length.
+        assert!(resolve_color_attrs(Some("あ12345"), None, Some("0.5"), None, &[]).is_none());
+        assert!(resolve_color_attrs(Some("あ123"), None, Some("0.5"), None, &[]).is_none());
     }
 }
 
@@ -4566,7 +5440,9 @@ mod sheet_view_tests {
         let (ws, _) = parse_worksheet(&xml, &[], &[], "Sheet1").expect("worksheet parses");
         assert_eq!(ws.default_row_height, 0.0, "unspecified rows are hidden");
         assert_eq!(ws.row_heights.get(&3).copied(), Some(22.0));
-        assert_eq!(ws.rows[0].height, Some(22.0));
+        // `row.height` remains the authored `@ht` fact on every parse path;
+        // the resolved band lives in `row_heights`.
+        assert_eq!(ws.rows[0].height, None);
         assert!(!ws.rows[0].hidden);
     }
 
@@ -4587,6 +5463,156 @@ mod sheet_view_tests {
         assert_eq!(ws.default_row_height, 15.0);
         assert_eq!(ws.col_widths.get(&1).copied(), Some(8.43));
         assert!(ws.row_heights.is_empty());
+    }
+
+    #[test]
+    fn sheet_base_width_is_retained_only_without_authored_default_width() {
+        let base = format!(
+            r#"<worksheet xmlns="{NS}"><sheetFormatPr baseColWidth="10" defaultRowHeight="16"/><sheetData/></worksheet>"#
+        );
+        let (ws, _) = parse_worksheet(&base, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, Some(10));
+
+        let explicit = format!(
+            r#"<worksheet xmlns="{NS}"><sheetFormatPr baseColWidth="10" defaultColWidth="12.5" defaultRowHeight="16"/><sheetData/></worksheet>"#
+        );
+        let (ws, _) = parse_worksheet(&explicit, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, None);
+        assert_eq!(ws.default_col_width, 12.5);
+    }
+
+    #[test]
+    fn sheet_format_pr_omitted_base_col_width_uses_schema_default_8() {
+        // CT_SheetFormatPr: baseColWidth is xsd:unsignedInt, use="optional",
+        // default="8" (Strict and Transitional). defaultColWidth is optional
+        // with no schema default. sheetFormatPr itself is minOccurs="0".
+        const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+
+        // sheetFormatPr is present, and both baseColWidth and
+        // defaultColWidth are omitted. The effective base must equal an
+        // explicit baseColWidth="8" under both namespaces. Explicit column
+        // widths must survive alongside it.
+        for ns in [NS, STRICT_NS] {
+            let omitted = format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="12" customWidth="1"/></cols><sheetData/></worksheet>"#
+            );
+            let explicit8 = format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr baseColWidth="8" defaultRowHeight="15"/><cols><col min="1" max="1" width="12" customWidth="1"/></cols><sheetData/></worksheet>"#
+            );
+            let (ws_omitted, _) =
+                parse_worksheet(&omitted, &[], &[], "Sheet1").expect("worksheet parses");
+            let (ws_explicit, _) =
+                parse_worksheet(&explicit8, &[], &[], "Sheet1").expect("worksheet parses");
+
+            assert_eq!(
+                ws_omitted.col_widths.get(&1).copied(),
+                Some(12.0),
+                "ns={ns}"
+            );
+            assert_eq!(
+                ws_explicit.col_widths.get(&1).copied(),
+                Some(12.0),
+                "ns={ns}"
+            );
+
+            assert_eq!(ws_explicit.base_col_width, Some(8), "ns={ns}");
+            assert_eq!(
+                ws_omitted.base_col_width, ws_explicit.base_col_width,
+                "omitted baseColWidth must equal explicit 8; ns={ns}"
+            );
+            assert_eq!(
+                ws_omitted.default_col_width, ws_explicit.default_col_width,
+                "ns={ns}"
+            );
+        }
+
+        // Control: sheetFormatPr absent. The attribute default does not apply.
+        let absent = format!(r#"<worksheet xmlns="{NS}"><sheetData/></worksheet>"#);
+        let (ws, _) = parse_worksheet(&absent, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, None);
+        assert_eq!(ws.default_col_width, 8.43);
+
+        // Control: authored defaultColWidth takes priority, so base stays unset.
+        for default in [0.0, 12.5] {
+            let authored = format!(
+                r#"<worksheet xmlns="{NS}"><sheetFormatPr defaultColWidth="{default}" defaultRowHeight="15"/><sheetData/></worksheet>"#
+            );
+            let (ws, _) = parse_worksheet(&authored, &[], &[], "Sheet1").expect("worksheet parses");
+            assert_eq!(ws.base_col_width, None);
+            assert_eq!(ws.default_col_width, default);
+        }
+
+        // Control: explicit zero is a real value and must not be replaced by 8.
+        let zero = format!(
+            r#"<worksheet xmlns="{NS}"><sheetFormatPr baseColWidth="0" defaultRowHeight="15"/><sheetData/></worksheet>"#
+        );
+        let (ws, _) = parse_worksheet(&zero, &[], &[], "Sheet1").expect("worksheet parses");
+        assert_eq!(ws.base_col_width, Some(0));
+    }
+
+    /// XLSX1709: when `<sheetFormatPr>` is absent, the 8.43 fallback is a UI
+    /// character count (ECMA-376 §18.3.1.13), not a stored `<col width>`.
+    /// Numeric `defaultColWidth` stays 8.43. A serde-only marker
+    /// `defaultColWidthIsUi` (omitted when false) is set only when the element
+    /// is absent. The test asserts through JSON so it compiles before the field exists.
+    #[test]
+    fn absent_sheet_format_pr_marks_default_col_width_as_ui_characters() {
+        const STRICT_NS: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+        let ui_flag = |xml: &str| {
+            let (ws, _) = parse_worksheet(xml, &[], &[], "Sheet1").expect("worksheet parses");
+            let flag = serde_json::to_value(&ws)
+                .expect("worksheet serializes")
+                .get("defaultColWidthIsUi")
+                .cloned();
+            (ws, flag)
+        };
+
+        for ns in [NS, STRICT_NS] {
+            // Element absent: flagged; numeric fallback and fixed widths unchanged.
+            let (ws, flag) = ui_flag(&format!(
+                r#"<worksheet xmlns="{ns}"><cols><col min="4" max="4" width="20" customWidth="1"/></cols><sheetData/></worksheet>"#
+            ));
+            assert_eq!(flag, Some(serde_json::Value::Bool(true)), "ns={ns}");
+            assert_eq!(ws.default_col_width, 8.43, "ns={ns}");
+            assert_eq!(ws.base_col_width, None, "ns={ns}");
+            assert_eq!(ws.col_widths.get(&4).copied(), Some(20.0), "ns={ns}");
+
+            // Authored stored defaults, including 8.43 itself, are never flagged.
+            for (attr, value) in [
+                ("8.43", 8.43),
+                ("0", 0.0),
+                ("12.5", 12.5),
+                ("10.7109375", 10.7109375),
+            ] {
+                let (ws, flag) = ui_flag(&format!(
+                    r#"<worksheet xmlns="{ns}"><sheetFormatPr defaultColWidth="{attr}" defaultRowHeight="15"/><sheetData/></worksheet>"#
+                ));
+                assert_eq!(flag, None, "defaultColWidth={attr}; ns={ns}");
+                assert_eq!(ws.default_col_width, value, "ns={ns}");
+                assert_eq!(ws.base_col_width, None, "ns={ns}");
+            }
+
+            // Present element: an omitted base uses schema 8, and explicit 0/10 are kept. Never flagged.
+            for (attrs, base) in [
+                ("", 8),
+                (r#" baseColWidth="0""#, 0),
+                (r#" baseColWidth="10""#, 10),
+            ] {
+                let (ws, flag) = ui_flag(&format!(
+                    r#"<worksheet xmlns="{ns}"><sheetFormatPr{attrs} defaultRowHeight="15"/><cols><col min="4" max="4" width="20" customWidth="1"/></cols><sheetData/></worksheet>"#
+                ));
+                assert_eq!(flag, None, "attrs={attrs:?}; ns={ns}");
+                assert_eq!(ws.base_col_width, Some(base), "ns={ns}");
+                assert_eq!(ws.col_widths.get(&4).copied(), Some(20.0), "ns={ns}");
+            }
+
+            // A malformed present element keeps the old unflagged policy.
+            let (ws, flag) = ui_flag(&format!(
+                r#"<worksheet xmlns="{ns}"><sheetFormatPr defaultColWidth="NaN" defaultRowHeight="15"/><sheetData/></worksheet>"#
+            ));
+            assert_eq!(flag, None, "ns={ns}");
+            assert_eq!(ws.default_col_width, 8.43, "ns={ns}");
+        }
     }
 
     /// The serialized worksheet JSON is deterministic: `colWidths` keys come out
@@ -4821,11 +5847,11 @@ mod resolve_zip_path_tests {
     #[test]
     fn relative_target_resolves_against_base() {
         assert_eq!(
-            resolve_zip_path("xl/worksheets", "../drawings/drawing1.xml"),
+            resolve_zip_path("xl/worksheets/sheet1.xml", "../drawings/drawing1.xml"),
             "xl/drawings/drawing1.xml"
         );
         assert_eq!(
-            resolve_zip_path("xl/drawings", "../media/image1.png"),
+            resolve_zip_path("xl/drawings/drawing1.xml", "../media/image1.png"),
             "xl/media/image1.png"
         );
     }
@@ -4835,13 +5861,35 @@ mod resolve_zip_path_tests {
     #[test]
     fn absolute_target_ignores_base() {
         assert_eq!(
-            resolve_zip_path("xl/worksheets", "/xl/drawings/drawing1.xml"),
+            resolve_zip_path("xl/worksheets/sheet1.xml", "/xl/drawings/drawing1.xml"),
             "xl/drawings/drawing1.xml"
         );
         assert_eq!(
-            resolve_zip_path("xl/drawings", "/xl/charts/chart1.xml"),
+            resolve_zip_path("xl/drawings/drawing1.xml", "/xl/charts/chart1.xml"),
             "xl/charts/chart1.xml"
         );
+    }
+
+    #[test]
+    fn opc_forms_and_external_mode_are_preserved() {
+        assert_eq!(
+            resolve_zip_path("xl/worksheets/sheet1.xml", "./drawing.xml"),
+            "xl/worksheets/drawing.xml"
+        );
+        assert_eq!(
+            resolve_zip_path("xl/worksheets/sheet1.xml", "../media/%69mage.png"),
+            "xl/media/image.png"
+        );
+        assert_eq!(
+            resolve_zip_path("xl/worksheets/sheet1.xml", "../media/%ZZ.png"),
+            ""
+        );
+        let external = ooxml_common::rels::RelTarget {
+            target: "https://example.invalid/image.png".to_owned(),
+            relationship_type: None,
+            mode: ooxml_common::rels::TargetMode::External,
+        };
+        assert_eq!(external.resolve_part("xl/worksheets/sheet1.xml"), None);
     }
 }
 
@@ -4914,6 +5962,269 @@ mod conditional_format_tests {
             }
             other => panic!("expected one AboveAverage rule, got {other:?}"),
         }
+    }
+
+    /// §18.3.1.10 `stopIfTrue` survives on every rule type (see `CfRule`).
+    #[test]
+    fn stop_if_true_kept_for_every_rule_type() {
+        let rule = |attrs: &str, body: &str| {
+            format!(r#"<cfRule {attrs} dxfId="0" priority="1" stopIfTrue="1">{body}</cfRule>"#)
+        };
+        let f = "<formula>TRUE</formula>";
+        let cf = [
+            rule(r#"type="cellIs" operator="greaterThan""#, "<formula>0</formula>"),
+            rule(r#"type="expression""#, f),
+            rule(r#"type="containsText" operator="containsText" text="a""#, f),
+            rule(r#"type="notContainsBlanks""#, f),
+            rule(r#"type="containsErrors""#, f),
+            rule(r#"type="top10" rank="3""#, ""),
+            rule(r#"type="aboveAverage""#, ""),
+            rule(r#"type="duplicateValues""#, ""),
+            rule(r#"type="uniqueValues""#, ""),
+            rule(r#"type="timePeriod" timePeriod="today""#, f),
+            rule(
+                r#"type="colorScale""#,
+                r#"<colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FF000000"/><color rgb="FFFFFFFF"/></colorScale>"#,
+            ),
+            rule(
+                r#"type="dataBar""#,
+                r#"<dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar>"#,
+            ),
+            rule(
+                r#"type="iconSet""#,
+                r#"<iconSet iconSet="3Arrows"><cfvo type="percent" val="0"/><cfvo type="percent" val="33"/><cfvo type="percent" val="67"/></iconSet>"#,
+            ),
+        ]
+        .concat();
+        let rules = parse_cf_rules(&format!(
+            r#"<conditionalFormatting sqref="A1:A5">{cf}</conditionalFormatting>"#
+        ));
+        let json = serde_json::to_value(&rules).expect("rules serialize");
+        let flags: Vec<(String, Option<bool>)> = json
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|r| {
+                let kind = r["kind"].as_str().or(r["type"].as_str()).unwrap_or("");
+                (kind.to_string(), r["stopIfTrue"].as_bool())
+            })
+            .collect();
+        let expected_on = [
+            "cellIs",
+            "expression",
+            "expression",
+            "expression",
+            "expression",
+            "top10",
+            "aboveAverage",
+            "duplicateValues",
+            "uniqueValues",
+            "timePeriod",
+            "colorScale",
+            "dataBar",
+            "iconSet",
+        ];
+        assert_eq!(flags.len(), expected_on.len());
+        for (i, kind) in expected_on.iter().enumerate() {
+            assert_eq!(flags[i], (kind.to_string(), Some(true)), "rule {i}");
+        }
+    }
+
+    /// The activity formula of a scale rule is kept from the SpreadsheetML
+    /// `<formula>` child and from the x14 rule's own `xm:f` (not the cfvo
+    /// `xm:f`s), and is absent when the rule has none.
+    #[test]
+    fn scale_rule_activity_formula() {
+        let x14 = r#"<extLst><ext uri="{78C0D931-6437-407D-A8EE-F0AAD7539E65}"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="iconSet" priority="1" stopIfTrue="1" activePresent="1"><xm:f>0</xm:f><x14:iconSet iconSet="3Arrows"><x14:cfvo type="num"><xm:f>0</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>3</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>7</xm:f></x14:cfvo></x14:iconSet></x14:cfRule><xm:sqref>A1</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#;
+        let xml = format!(
+            r#"<worksheet xmlns="{NS}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><sheetData/><conditionalFormatting sqref="A2"><cfRule type="colorScale" priority="2"><formula>$B$1&gt;0</formula><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FF000000"/><color rgb="FFFFFFFF"/></colorScale></cfRule><cfRule type="dataBar" priority="3"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting>{x14}</worksheet>"#
+        );
+        let (ws, _) = parse_worksheet(&xml, &[], &[], "Sheet1").expect("worksheet parses");
+        let json = serde_json::to_value(&ws.conditional_formats).expect("serialize");
+        let formulas: Vec<(String, Option<String>)> = json
+            .as_array()
+            .expect("array")
+            .iter()
+            .flat_map(|cf| cf["rules"].as_array().expect("rules").clone())
+            .map(|r| {
+                (
+                    r["type"].as_str().unwrap_or("").to_string(),
+                    r["activeFormula"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        assert!(formulas.contains(&("colorScale".into(), Some("$B$1>0".into()))));
+        assert!(formulas.contains(&("dataBar".into(), None)));
+        assert!(formulas.contains(&("iconSet".into(), Some("0".into()))));
+    }
+
+    /// An absent or false `stopIfTrue` is omitted from the wire on the
+    /// variants that serialize it only when set.
+    #[test]
+    fn stop_if_true_defaults_off() {
+        let rules = parse_cf_rules(
+            r#"<conditionalFormatting sqref="A1"><cfRule type="cellIs" operator="equal" dxfId="0" priority="1"><formula>1</formula></cfRule><cfRule type="top10" rank="1" dxfId="0" priority="2" stopIfTrue="0"/></conditionalFormatting>"#,
+        );
+        let json = serde_json::to_value(&rules).expect("rules serialize");
+        assert!(json[0].get("stopIfTrue").is_none());
+        assert!(json[1].get("stopIfTrue").is_none());
+    }
+
+    const X14_NS: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+    const XM_NS: &str = "http://schemas.microsoft.com/office/excel/2006/main";
+
+    const LINK_GUID: &str = "{12345678-1234-1234-1234-123456789ABC}";
+
+    fn extension_rules(xml_body: &str) -> serde_json::Value {
+        let xml = format!(
+            r#"<worksheet xmlns="{NS}" xmlns:x14="{X14_NS}" xmlns:xm="{XM_NS}" xmlns:bad="urn:not-x14"><sheetData/>{xml_body}</worksheet>"#
+        );
+        let (ws, _) = parse_worksheet(&xml, &[], &[], "Sheet1").expect("worksheet parses");
+        serde_json::to_value(&ws.conditional_formats).expect("serialize")
+    }
+
+    fn linked_data_bar(x14_rule_body: &str) -> serde_json::Value {
+        let body = format!(
+            r#"<conditionalFormatting sqref="A1:A3"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="link"><x14:id>{LINK_GUID}</x14:id></ext></extLst></cfRule></conditionalFormatting><extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="{LINK_GUID}">{x14_rule_body}</x14:cfRule><xm:sqref>A1:A3</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+        );
+        extension_rules(&body)[0]["rules"][0].clone()
+    }
+
+    #[test]
+    fn linked_x14_thresholds_are_effective_not_string_comparisons() {
+        let control = linked_data_bar(
+            r#"<x14:dataBar><x14:cfvo type="num"><xm:f>4</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>10</xm:f></x14:cfvo></x14:dataBar>"#,
+        );
+        assert_eq!(control["min"]["kind"], "num");
+        assert_eq!(control["min"]["value"], "4");
+        assert_eq!(control["max"]["value"], "10");
+        assert!(control.get("extThresholdFormula").is_none());
+        let automatic = linked_data_bar(
+            r#"<x14:dataBar><x14:cfvo type="autoMin"/><x14:cfvo type="autoMax"/></x14:dataBar>"#,
+        );
+        assert_eq!(automatic["min"]["kind"], "autoMin");
+        assert_eq!(automatic["max"]["kind"], "autoMax");
+        let formula = linked_data_bar(
+            r#"<xm:f>$B$1&gt;0</xm:f><x14:dataBar gradient="0"><x14:cfvo type="formula"><xm:f>4</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>10</xm:f></x14:cfvo></x14:dataBar>"#,
+        );
+        assert_eq!(formula["extThresholdFormula"], true);
+        assert_eq!(formula["min"]["kind"], "formula");
+        assert!(formula["min"]["value"].is_null());
+        assert_eq!(formula["activeFormula"], "$B$1>0");
+        assert_eq!(formula["gradient"], false);
+    }
+
+    #[test]
+    fn standalone_x14_formula_provenance_preserves_order_priority_and_no_raw_payload() {
+        let json = extension_rules(
+            r#"<extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="expression" priority="8" stopIfTrue="1"><xm:f>SUMPRODUCT(A1:A3)</xm:f></x14:cfRule><x14:cfRule type="cellIs" priority="2"><xm:f>1</xm:f></x14:cfRule><x14:cfRule type="dataBar" priority="3"><xm:f>1</xm:f><x14:dataBar><x14:cfvo type="formula"><xm:f>A1</xm:f></x14:cfvo><x14:cfvo type="max"/></x14:dataBar></x14:cfRule><x14:cfRule type="timePeriod" priority="4"/><x14:cfRule type="timePeriod" priority="5"><xm:f>TODAY()</xm:f></x14:cfRule><xm:sqref>A1:A3</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#,
+        );
+        let rules = json[0]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[3]["unsupportedFormulaPhases"], 1);
+        assert_eq!(rules[0]["priority"], 8);
+        assert_eq!(rules[0]["stopIfTrue"], true);
+        assert_eq!(rules[0]["unsupportedFormulaPhases"], 1);
+        assert_eq!(rules[1]["unsupportedFormulaPhases"], 2);
+        assert_eq!(rules[2]["unsupportedFormulaPhases"], 12);
+        assert_eq!(json[0]["sqref"][0]["bottom"], 3);
+        assert!(rules.iter().all(|r| r.get("formula").is_none()));
+    }
+
+    #[test]
+    fn x14_namespace_container_sqref_and_positive_priority_bound_the_inlet() {
+        let json = extension_rules(
+            r#"<bad:conditionalFormatting><bad:cfRule type="expression" priority="1"><xm:f>1</xm:f></bad:cfRule><xm:sqref>A1</xm:sqref></bad:conditionalFormatting><x14:conditionalFormatting><x14:cfRule type="expression" priority="1"><xm:f>1</xm:f></x14:cfRule><xm:sqref>A1</xm:sqref></x14:conditionalFormatting><extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="expression" priority="0"><xm:f>1</xm:f></x14:cfRule><x14:cfRule type="expression" priority="-1"><xm:f>1</xm:f></x14:cfRule><x14:cfRule type="expression"><xm:f>1</xm:f></x14:cfRule><bad:cfRule type="expression" priority="1"><xm:f>1</xm:f></bad:cfRule><xm:sqref>A1</xm:sqref></x14:conditionalFormatting><x14:conditionalFormatting><x14:cfRule type="expression" priority="1"><xm:f>1</xm:f></x14:cfRule></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#,
+        );
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    #[test]
+    fn x14_icon_numeric_values_survive_but_formula_literals_do_not_masquerade_as_numeric() {
+        let json = extension_rules(
+            r#"<extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="iconSet" priority="1" id="ignored"><x14:iconSet iconSet="3Arrows"><x14:cfvo type="percent"><xm:f>0</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>4</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>9</xm:f></x14:cfvo></x14:iconSet></x14:cfRule><x14:cfRule type="iconSet" priority="2"><x14:iconSet><x14:cfvo type="formula"><xm:f>4</xm:f></x14:cfvo></x14:iconSet></x14:cfRule><xm:sqref>A1:A3</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#,
+        );
+        assert_eq!(json[0]["rules"][0]["type"], "iconSet");
+        assert_eq!(json[0]["rules"][0]["cfvos"][1]["value"], "4");
+        assert_eq!(json[0]["rules"][1]["type"], "other");
+        assert_eq!(json[0]["rules"][1]["unsupportedFormulaPhases"], 8);
+    }
+
+    #[test]
+    fn malformed_actual_id_elements_refuse_instead_of_becoming_absent_links() {
+        for ids in [
+            "<x14:id>not-a-guid</x14:id>".to_string(),
+            "<x14:id/>".to_string(),
+            format!("<x14:id>{LINK_GUID}</x14:id><x14:id>not-a-guid</x14:id>"),
+            format!("<x14:id>{LINK_GUID}</x14:id><x14:id/>"),
+            format!("<x14:id>{LINK_GUID}</x14:id><x14:id>{LINK_GUID}</x14:id>"),
+        ] {
+            let xml = format!(
+                r#"<conditionalFormatting sqref="A1"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/></dataBar><extLst><ext uri="link">{ids}</ext></extLst></cfRule></conditionalFormatting>"#
+            );
+            let json = extension_rules(&xml);
+            assert_eq!(json[0]["rules"][0]["type"], "other", "{ids}");
+            assert_eq!(json[0]["rules"][0]["unsupportedFormulaPhases"], 8);
+        }
+        // Foreign ids and unmatched extension records are not owned links;
+        // this malformed-standard policy must not warn on ignored extensions.
+        let json = extension_rules(
+            r#"<conditionalFormatting sqref="A1"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/></dataBar><extLst><ext uri="link"><bad:id>not-a-guid</bad:id></ext></extLst></cfRule></conditionalFormatting><extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="not-a-guid"><xm:f>1</xm:f><x14:dataBar/></x14:cfRule><xm:sqref>A1</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#,
+        );
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["rules"][0]["type"], "dataBar");
+        assert!(json[0]["rules"][0]
+            .get("unsupportedFormulaPhases")
+            .is_none());
+    }
+
+    #[test]
+    fn repeated_standard_links_do_not_multiply_extension_payload() {
+        let rule = format!(
+            r#"<cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/></dataBar><extLst><ext uri="link"><x14:id>{LINK_GUID}</x14:id></ext></extLst></cfRule>"#
+        );
+        let xml = format!(
+            r#"<conditionalFormatting sqref="A1:A3">{rule}{rule}</conditionalFormatting><extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="{LINK_GUID}"><xm:f>$B$1</xm:f><x14:dataBar><x14:cfvo type="num"><xm:f>4</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>10</xm:f></x14:cfvo></x14:dataBar></x14:cfRule><xm:sqref>A1:A3</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+        );
+        let json = extension_rules(&xml);
+        for rule in json[0]["rules"].as_array().unwrap() {
+            assert_eq!(rule["type"], "other");
+            assert_eq!(rule["unsupportedFormulaPhases"], 8);
+            assert!(rule.get("activeFormula").is_none());
+            assert!(rule.get("min").is_none());
+        }
+        let standard = parse_cf_rules(
+            r#"<conditionalFormatting sqref="A1"><cfRule type="timePeriod" priority="1"><formula>TODAY()</formula></cfRule><cfRule type="timePeriod" priority="2"/></conditionalFormatting>"#,
+        );
+        let rules = serde_json::to_value(standard).unwrap();
+        assert_eq!(rules[0]["unsupportedFormulaPhases"], 1);
+        assert!(rules[1].get("unsupportedFormulaPhases").is_none());
+    }
+
+    #[test]
+    fn duplicate_link_guid_and_malformed_thresholds_fail_closed() {
+        let json = linked_data_bar(
+            r#"<x14:dataBar><x14:cfvo type="num"/><x14:cfvo type="num"/><x14:cfvo type="num"/></x14:dataBar>"#,
+        );
+        assert_eq!(json["type"], "other");
+        assert_eq!(json["unsupportedFormulaPhases"], 8);
+        let standard = format!(
+            r#"<conditionalFormatting sqref="A1"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="link"><x14:id>{LINK_GUID}</x14:id></ext></extLst></cfRule></conditionalFormatting>"#
+        );
+        let bar = r#"<x14:dataBar gradient="0"><x14:cfvo type="num"><xm:f>4</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>10</xm:f></x14:cfvo></x14:dataBar>"#;
+        let duplicate = format!(
+            r#"{standard}<extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="{LINK_GUID}">{bar}</x14:cfRule><x14:cfRule type="dataBar" id="{LINK_GUID}">{bar}</x14:cfRule><xm:sqref>A1</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+        );
+        let json = extension_rules(&duplicate);
+        assert_eq!(json[0]["rules"][0]["type"], "other");
+        assert_eq!(json[0]["rules"][0]["unsupportedFormulaPhases"], 8);
+        let standalone = format!(
+            r#"{standard}<extLst><ext uri="x14"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" priority="2" id="{LINK_GUID}">{bar}</x14:cfRule><xm:sqref>A1</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+        );
+        assert_eq!(
+            extension_rules(&standalone)[0]["rules"][0]["min"]["kind"],
+            "min"
+        );
     }
 }
 
@@ -5095,6 +6406,7 @@ mod threaded_comment_tests {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         bytes
@@ -5141,6 +6453,118 @@ mod threaded_comment_tests {
         assert!(markdown.contains("### Sheet1 — A1"), "{markdown}");
         assert!(
             markdown.contains("> **Referenced Reviewer**\n>\n> Review this."),
+            "{markdown}"
+        );
+    }
+
+    /// Sheet names, cell values and review comments are document text. The
+    /// output, parsed as GFM (tables, strikethrough, extended autolinks), may
+    /// contain only the converter's own heading, table and quote structure:
+    /// the document text forms no extra table, link, autolink, heading, list,
+    /// strikethrough, code or HTML node, and a lone CR cannot end the quote.
+    #[test]
+    fn markdown_sheet_names_cells_and_comments_form_no_markdown_structure() {
+        const INLINE: &str = "&lt;img src=x onerror=alert(1)&gt; [x](javascript:alert(1)) https://evil.example/ www.evil.example a@evil.example ~~del~~ &amp;copy; `c`";
+        const INLINE_TEXT: &str = "<img src=x onerror=alert(1)> [x](javascript:alert(1)) https://evil.example/ www.evil.example a@evil.example ~~del~~ &copy; `c`";
+        const LINES: &str = "alpha&#13;&#13;```&#13;| a | b |&#13;| :-- | --: |&#13;forged | row&#13;# h&#13;&#160;# nbsp&#13;&#xFEFF;# bom&#13;&gt; q&#13;- item&#13;1. item&#13;===&#13;    Cost: 50% &amp; tax&#13;&#9;Tabbed: 2&#13;&#160;&#160;Kept nbsp&#13;&#x3000;Kept ideographic&#13;&#x2003;# Kept em";
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="&lt;b&gt;_x_ # www.evil.example" sheetId="1" r:id="rSheet1"/></sheets></workbook>"#;
+        let workbook_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rSheet1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rPersons" Type="http://schemas.microsoft.com/office/2017/10/relationships/person" Target="persons/person.xml"/></Relationships>"#;
+        let cell = |reference: &str, text: &str| {
+            format!(
+                r#"<c r="{reference}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>"#
+            )
+        };
+        let worksheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">{}{}{}</row><row r="2">{}{}{}</row></sheetData></worksheet>"#,
+            cell("A1", INLINE),
+            cell("B1", "a|b&#13;# c&#10;d, 50% done"),
+            cell("C1", "&#160;# nbsp"),
+            cell("A2", "| :-- | --: |"),
+            cell("B2", "- item"),
+            cell("C2", "#DIV/0!"),
+        );
+        let worksheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rThread" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/></Relationships>"#;
+        let threaded_comments = format!(
+            r#"<ThreadedComments xmlns="{TC_NS}"><threadedComment ref="A1" personId="{{p1}}" id="thread-1"><text>{INLINE}&#13;{LINES}</text></threadedComment></ThreadedComments>"#,
+        );
+        let persons = r#"<personList><person id="{p1}" displayName="[a](javascript:alert(1)) a@evil.example"/></personList>"#;
+
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = zip::write::SimpleFileOptions::default();
+            for (path, body) in [
+                ("xl/workbook.xml", workbook),
+                ("xl/_rels/workbook.xml.rels", workbook_rels),
+                ("xl/worksheets/sheet1.xml", worksheet.as_str()),
+                ("xl/worksheets/_rels/sheet1.xml.rels", worksheet_rels),
+                (
+                    "xl/threadedComments/threadedComment1.xml",
+                    threaded_comments.as_str(),
+                ),
+                ("xl/persons/person.xml", persons),
+            ] {
+                writer.start_file(path, options).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            crate::write_test_content_types(&mut writer);
+            writer.finish().unwrap();
+        }
+
+        let markdown = to_markdown_native(&bytes).expect("markdown projects");
+        let gfm = ooxml_common::markdown::gfm_check::summarize(&markdown);
+
+        assert_eq!(
+            gfm.headings,
+            [
+                "<b>_x_ # www.evil.example",
+                "Review comments",
+                "<b>_x_ # www.evil.example — A1",
+            ],
+            "{markdown}"
+        );
+        assert_eq!(gfm.tables, 1, "{markdown}");
+        assert_eq!(
+            gfm.table_cells,
+            [
+                INLINE_TEXT,
+                "a|b# cd, 50% done",
+                "\u{a0}# nbsp",
+                "| :-- | --: |",
+                "- item",
+                "#DIV/0!",
+            ],
+            "{markdown}"
+        );
+        assert_eq!(gfm.block_quotes, 1, "{markdown}");
+        assert_eq!(
+            (gfm.links, gfm.images, gfm.html, gfm.strikethrough, gfm.code),
+            (0, 0, 0, 0, 0),
+            "{markdown}"
+        );
+        assert_eq!((gfm.list_items, gfm.thematic_breaks), (0, 0), "{markdown}");
+        for literal in [
+            INLINE_TEXT,
+            "[a](javascript:alert(1)) a@evil.example",
+            "```",
+            "| a | b |",
+            "forged | row",
+            "# h",
+            "# bom",
+            "> q",
+            "1. item",
+            "===",
+            "Cost: 50% & tax",
+            "Tabbed: 2",
+            "\u{a0}\u{a0}Kept nbsp",
+            "\u{3000}Kept ideographic",
+            "\u{2003}# Kept em",
+        ] {
+            assert!(gfm.text.contains(literal), "{literal:?} in {markdown}");
+        }
+        // The lone CRs in the comment keep every line inside the quote.
+        assert!(
+            markdown.contains("> alpha\n> \n> \\`\\`\\`\n"),
             "{markdown}"
         );
     }
@@ -5359,12 +6783,18 @@ mod extract_image_tests {
             let o = zip::write::SimpleFileOptions::default();
             w.start_file("xl/media/i.png", o).unwrap();
             w.write_all(b"X").unwrap();
+            crate::write_test_content_types(&mut w);
             w.finish().unwrap();
         }
         assert_eq!(
             extract_image(&buf, "xl/media/i.png", None, None).unwrap(),
             b"X"
         );
+        // ECMA-376 Part 2 §6.2.2.3 part-name equivalence (shared package
+        // lookup): ASCII case and percent-encoded unreserved characters.
+        for spelling in ["XL/Media/I.PNG", "xl/%6Dedia/%69.png"] {
+            assert_eq!(extract_image(&buf, spelling, None, None).unwrap(), b"X");
+        }
     }
 }
 
@@ -5386,6 +6816,47 @@ mod sheet_visibility_tests {
 }
 
 #[cfg(test)]
+mod defined_name_scope_tests {
+    use super::*;
+
+    fn projected(doc: &roxmltree::Document, sheet_index: u32) -> Vec<(String, String)> {
+        parse_defined_names_for_sheet(doc, sheet_index)
+            .into_iter()
+            .map(|dn| (dn.name, dn.formula))
+            .collect()
+    }
+
+    #[test]
+    fn sheet_names_keep_workbook_globals_and_order_current_sheet_locals_last() {
+        // `Rate` is global before its local twin, `Tax` after it. Both
+        // globals stay in the sheet's inventory; the locals follow them.
+        let xml = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><definedNames><definedName name="Rate">Sheet1!$A$1</definedName><definedName name="rate" localSheetId="0">Sheet1!$B$1</definedName><definedName name="Tax" localSheetId="0">Sheet1!$C$1</definedName><definedName name="Tax">Sheet1!$D$1</definedName><definedName name="Other" localSheetId="1">Sheet2!$A$1</definedName><definedName name="Base">Sheet1!$E$1</definedName></definedNames></workbook>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let pair = |name: &str, formula: &str| (name.to_string(), formula.to_string());
+        assert_eq!(
+            projected(&doc, 0),
+            vec![
+                pair("Rate", "Sheet1!$A$1"),
+                pair("Tax", "Sheet1!$D$1"),
+                pair("Base", "Sheet1!$E$1"),
+                pair("rate", "Sheet1!$B$1"),
+                pair("Tax", "Sheet1!$C$1"),
+            ]
+        );
+        // Another sheet's local names are out of scope; its own come last.
+        assert_eq!(
+            projected(&doc, 1),
+            vec![
+                pair("Rate", "Sheet1!$A$1"),
+                pair("Tax", "Sheet1!$D$1"),
+                pair("Base", "Sheet1!$E$1"),
+                pair("Other", "Sheet2!$A$1"),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod workbook_theme_tests {
     use super::*;
     use std::io::{Cursor, Write};
@@ -5393,7 +6864,7 @@ mod workbook_theme_tests {
     #[test]
     fn loads_the_theme_target_declared_by_workbook_relationships_once() {
         let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rTheme" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="themes/custom.xml"/></Relationships>"#;
-        let custom = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="custom"><a:dk1><a:srgbClr val="010203"/></a:dk1></a:clrScheme><a:fontScheme name="custom"><a:majorFont><a:latin typeface="Major Custom"/></a:majorFont><a:minorFont><a:latin typeface="Minor Custom"/></a:minorFont></a:fontScheme><a:fmtScheme name="custom"><a:fillStyleLst><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill></a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#;
+        let custom = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="custom"><a:dk1><a:srgbClr val="010203"/></a:dk1></a:clrScheme><a:fontScheme name="custom"><a:majorFont><a:latin typeface="Major Custom"/><a:font script="Jpan" typeface="Major Japanese"/></a:majorFont><a:minorFont><a:latin typeface="Minor Custom"/><a:font script="Jpan" typeface="Minor Japanese"/></a:minorFont></a:fontScheme><a:fmtScheme name="custom"><a:fillStyleLst><a:solidFill><a:srgbClr val="ABCDEF"/></a:solidFill></a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#;
         let decoy = r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:clrScheme name="decoy"><a:dk1><a:srgbClr val="FFFFFF"/></a:dk1></a:clrScheme></a:themeElements></a:theme>"#;
         let mut bytes = Vec::new();
         {
@@ -5406,6 +6877,7 @@ mod workbook_theme_tests {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         let mut archive = XlsxZip::new(Cursor::new(bytes)).unwrap();
@@ -5415,6 +6887,8 @@ mod workbook_theme_tests {
         assert_eq!(theme.colors.first().map(String::as_str), Some("#010203"));
         assert_eq!(theme.fonts.0.as_deref(), Some("Major Custom"));
         assert_eq!(theme.fonts.1.as_deref(), Some("Minor Custom"));
+        assert_eq!(theme.japanese_fonts.0.as_deref(), Some("Major Japanese"));
+        assert_eq!(theme.japanese_fonts.1.as_deref(), Some("Minor Japanese"));
         assert!(matches!(
             theme.format_scheme.lookup_fill_ref(1),
             ooxml_common::theme::StyleMatrixLookup::Entry(_)
@@ -5435,6 +6909,7 @@ mod workbook_theme_tests {
             let options = zip::write::SimpleFileOptions::default();
             writer.start_file("placeholder", options).unwrap();
             writer.write_all(b"x").unwrap();
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         let mut archive = XlsxZip::new(Cursor::new(bytes)).unwrap();
@@ -5540,6 +7015,7 @@ mod chartsheet_tests {
                 zip.start_file(path, options).unwrap();
                 zip.write_all(content.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut zip);
             zip.finish().unwrap();
         }
         bytes
@@ -5625,6 +7101,7 @@ mod dialogsheet_tests {
                 zip.start_file(path, options).unwrap();
                 zip.write_all(content.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut zip);
             zip.finish().unwrap();
         }
         bytes
@@ -5754,8 +7231,11 @@ mod dialogsheet_tests {
         let mut archive = XlsxArchive::new(bytes, None, None, None).unwrap();
         archive.open_sheet_cursor(0, "Dialog").unwrap();
 
-        let bytes = archive.pull_sheet_cursor_inner(1).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        if value["kind"] == "preview" {
+            value = serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        }
         let worksheet = value.get("worksheet").expect("terminal worksheet model");
         assert!(worksheet.get("isDialogSheet").is_none());
         assert!(worksheet["parseError"]
@@ -5896,6 +7376,54 @@ mod phonetic_tests {
     use super::*;
 
     const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+    /// Rich-text runs are marked `normal_color` exactly when their `<rPr>`
+    /// carries a `<color>` authored like the Normal style font's (typed
+    /// comparison). Runs without `<rPr>`, without `<color>` (even when Normal
+    /// has none), or with another color, and every run when Normal cannot be
+    /// resolved, stay unmarked and keep their own color.
+    #[test]
+    fn rich_runs_mark_only_colors_authored_like_normal() {
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts><font><color theme="1"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let normal = styles::normal_font_color_key(&roxmltree::Document::parse(styles).unwrap());
+        let xml = format!(
+            r#"<si xmlns="{ns}"><r><t>a</t></r><r><rPr><color theme="1"/></rPr><t>b</t></r><r><rPr><color theme="01"/></rPr><t>c</t></r><r><rPr><sz val="11"/></rPr><t>d</t></r><r><rPr><color rgb="FF000000"/></rPr><t>e</t></r></si>"#,
+            ns = NS,
+        );
+        let doc = roxmltree::Document::parse(&xml).expect("parse");
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_run_colors(ss.runs.as_deref_mut(), normal.as_ref());
+        let marked: Vec<Option<bool>> = ss
+            .runs
+            .unwrap()
+            .iter()
+            .map(|run| run.font.as_ref().map(|font| font.normal_color))
+            .collect();
+        assert_eq!(
+            marked,
+            [None, Some(true), Some(true), Some(false), Some(false)]
+        );
+
+        // Without a resolvable Normal style no run is marked.
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_run_colors(ss.runs.as_deref_mut(), None);
+        assert!(ss
+            .runs
+            .unwrap()
+            .iter()
+            .all(|run| run.font.as_ref().is_none_or(|f| !f.normal_color)));
+
+        // Normal without <color>: a run without <color> is not confirmed.
+        let bare = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts><font><sz val="11"/></font></fonts><cellStyleXfs><xf fontId="0"/></cellStyleXfs><cellStyles><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#;
+        let bare_normal = styles::normal_font_color_key(&roxmltree::Document::parse(bare).unwrap());
+        let mut ss = parse_si_node(&doc.root_element(), &[]);
+        mark_run_colors(ss.runs.as_deref_mut(), bare_normal.as_ref());
+        assert!(ss
+            .runs
+            .unwrap()
+            .iter()
+            .all(|run| run.font.as_ref().is_none_or(|f| !f.normal_color)));
+    }
 
     /// ECMA-376 §18.4.6 / §18.4.3: a `<si>` with `<rPh>` runs and a
     /// `<phoneticPr>` must parse the furigana runs (sb/eb + hint text) and the
@@ -6441,6 +7969,7 @@ mod package_streaming_integration_tests {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(body).unwrap();
             }
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
 
@@ -6532,6 +8061,7 @@ mod rb7_partial_degradation_tests {
                 w.start_file(name.as_str(), o).unwrap();
                 w.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut w);
             w.finish().unwrap();
         }
         buf
@@ -6599,77 +8129,334 @@ mod rb7_partial_degradation_tests {
         );
     }
 
-    // ── #774: whole-container degradation ────────────────────────────────────
-
-    /// #774 MAJOR: a truncated / corrupt ZIP CONTAINER — the most common way a
-    /// xlsx is broken — degrades to a placeholder workbook (one tab) tagged with
-    /// the container, rather than throwing an opaque `ZipArchive::new` error before
-    /// any part is read. Symmetric with docx / pptx container degradation.
     #[test]
-    fn corrupt_zip_container_degrades_to_placeholder_workbook() {
-        // Truncated container: a valid workbook cut off partway is not a readable zip.
-        let full = build_three_sheet_workbook(9, None); // 9 ⇒ no sheet is broken
-        let truncated = &full[..full.len() / 2];
+    fn partial_local_sizes_with_data_descriptors_parse() {
+        let main = br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet name="Descriptor" sheetId="1"/></sheets></workbook>"#;
+        let mut writer = zip::ZipWriter::new_stream(Vec::new());
+        writer
+            .start_file("xl/workbook.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(main).unwrap();
+        writer
+            .start_file("xl/styles.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#).unwrap();
+        write_test_content_types(&mut writer);
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // Exercise the format's public admission and workbook projection too.
+        bytes[22..26].copy_from_slice(&(main.len() as u32).to_le_bytes());
+        let workbook =
+            parse_workbook_model_native(&bytes).expect("partial local sizes are compatible");
+        assert_eq!(workbook.sheets.len(), 1);
+        assert_eq!(workbook.sheets[0].name, "Descriptor");
+    }
 
-        // Workbook index opens with a single placeholder sheet + a container error.
-        let wb_json =
-            parse_workbook_native(truncated).expect("a corrupt container must open, not error out");
-        let wb: serde_json::Value = serde_json::from_str(&wb_json).unwrap();
-        let sheets = wb["sheets"]
-            .as_array()
-            .expect("placeholder workbook has sheets");
-        assert_eq!(sheets.len(), 1, "one placeholder tab for the whole file");
-        let wb_err = wb["parseError"]
-            .as_str()
-            .expect("degraded workbook carries a container-tagged parseError");
-        assert!(
-            wb_err.starts_with("(zip container): "),
-            "workbook error is tagged with the container exactly once (one paren pair); got {wb_err:?}"
-        );
-        assert_eq!(
-            wb_err.matches("zip container").count(),
-            1,
-            "the container tag must not be doubled; got {wb_err:?}"
-        );
+    #[test]
+    fn reserved_local_zip64_fields_parse() {
+        let main = br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet name="Reserved" sheetId="1"/></sheets></workbook>"#;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("xl/workbook.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(main).unwrap();
+        writer
+            .start_file("xl/styles.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#).unwrap();
+        write_test_content_types(&mut writer);
+        let bytes = reserve_local_zip64_fields(&writer.finish().unwrap().into_inner());
+        let workbook = parse_workbook_model_native(&bytes)
+            .expect("reserved ZIP64 local fields are compatible");
+        assert_eq!(workbook.sheets.len(), 1);
+        assert_eq!(workbook.sheets[0].name, "Reserved");
+    }
+    /// Rewrite every local header of a classic, descriptor-free ZIP as a
+    /// version 4.5 header with a reserved (zero) 16-byte ZIP64 field, keeping
+    /// the central directory with no extra field (#1976).
+    fn reserve_local_zip64_fields(bytes: &[u8]) -> Vec<u8> {
+        let le16 = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let le32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let eocd = bytes.len() - 22;
+        let directory = le32(eocd + 16);
+        let mut out = Vec::new();
+        let mut offsets = Vec::new();
+        let mut cursor = 0;
+        while cursor < directory {
+            assert_eq!(le16(cursor + 6) & (1 << 3), 0, "no data descriptors");
+            let header_end = cursor + 30 + le16(cursor + 26) + le16(cursor + 28);
+            let data_end = header_end + le32(cursor + 18);
+            offsets.push(out.len() as u32);
+            let mut header = bytes[cursor..header_end].to_vec();
+            header[4..6].copy_from_slice(&45u16.to_le_bytes());
+            header[28..30].copy_from_slice(&(le16(cursor + 28) as u16 + 20).to_le_bytes());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&[1, 0, 16, 0]);
+            out.extend_from_slice(&[0; 16]);
+            out.extend_from_slice(&bytes[header_end..data_end]);
+            cursor = data_end;
+        }
+        let new_directory = out.len() as u32;
+        let mut cursor = directory;
+        for offset in offsets {
+            assert!(le16(cursor + 6) < 45);
+            let end = cursor + 46 + le16(cursor + 28) + le16(cursor + 30) + le16(cursor + 32);
+            let mut header = bytes[cursor..end].to_vec();
+            header[42..46].copy_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&header);
+            cursor = end;
+        }
+        let mut footer = bytes[eocd..].to_vec();
+        footer[16..20].copy_from_slice(&new_directory.to_le_bytes());
+        out.extend_from_slice(&footer);
+        out
+    }
 
-        // The lazily-parsed sheet 0 is the container-tagged placeholder overlay.
-        let ws = parse_sheet_json(truncated, 0, "(zip container)");
-        let ws_err = ws["parseError"]
-            .as_str()
-            .expect("placeholder sheet carries a parseError");
-        assert!(
-            ws_err.starts_with("(zip container): "),
-            "sheet error is tagged with the container exactly once (one paren pair); got {ws_err:?}"
-        );
-        assert_eq!(
-            ws_err.matches("zip container").count(),
-            1,
-            "the container tag must not be doubled; got {ws_err:?}"
-        );
-        assert!(
-            ws["rows"].as_array().unwrap().is_empty(),
-            "placeholder sheet has no rows"
-        );
-
-        // Not-a-zip-at-all also degrades (no local file header).
-        let garbage =
-            parse_workbook_native(b"this is definitely not a zip file").expect("non-zip opens");
-        let gv: serde_json::Value = serde_json::from_str(&garbage).unwrap();
-        let garbage_err = gv["parseError"]
-            .as_str()
-            .expect("non-zip degrades with a container-tagged error");
-        assert!(
-            garbage_err.starts_with("(zip container): "),
-            "error is tagged with the container exactly once (one paren pair); got {garbage_err:?}"
-        );
-        assert_eq!(
-            garbage_err.matches("zip container").count(),
-            1,
-            "the container tag must not be doubled; got {garbage_err:?}"
-        );
+    /// Input that is not a SpreadsheetML package fails closed at every public
+    /// Rust boundary instead of materializing a placeholder workbook.
+    #[test]
+    fn non_ooxml_input_is_rejected_at_every_public_boundary() {
+        let zip_of = |entries: &[&str]| {
+            let mut buf = Vec::new();
+            {
+                let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+                for name in entries {
+                    w.start_file(*name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    w.write_all(b"<x/>").unwrap();
+                }
+                w.finish().unwrap();
+            }
+            buf
+        };
+        let not_opc = zip_of(&["xl/workbook.xml"]);
+        let missing_main = zip_of(&[ooxml_common::opc::CONTENT_TYPES_ITEM, "_rels/.rels"]);
+        let cases: [(&str, &[u8], &str); 4] = [
+            ("garbage", &[1, 2, 3], "not a readable ZIP package"),
+            ("empty", &[], "not a readable ZIP package"),
+            ("zip-not-opc", &not_opc, "[Content_Types].xml"),
+            ("opc-missing-main-part", &missing_main, "xl/workbook.xml"),
+        ];
+        for (name, bytes, detail) in cases {
+            let assert_rejected = |boundary: &str, error: String| {
+                assert!(
+                    ooxml_common::opc::is_not_ooxml_error(&error) && error.contains(detail),
+                    "{name} via {boundary}: {error}"
+                );
+            };
+            assert_rejected(
+                "archive",
+                open_workbook_package(bytes.to_vec(), None, None, None)
+                    .err()
+                    .expect("archive rejects"),
+            );
+            assert_rejected(
+                "parse",
+                parse_workbook_native(bytes).expect_err("parse rejects"),
+            );
+            assert_rejected(
+                "sheet",
+                parse_sheet_native(bytes, 0, "Sheet1").expect_err("sheet rejects"),
+            );
+            assert_rejected(
+                "markdown",
+                to_markdown_native(bytes).expect_err("markdown rejects"),
+            );
+        }
     }
 
     // ── #832 / #833-1: implicit references through the whole-archive path ─────
+
+    fn build_single_sheet_workbook(sheet: &str) -> Vec<u8> {
+        build_workbook_with_parts(
+            r#"<sheet name="Sheet1" sheetId="1" r:id="rId1"/>"#,
+            sheet,
+            None,
+            None,
+        )
+    }
+
+    /// `sheets` may reference `rId1` (sheet1.xml, with the optional comments
+    /// part) and, when `second_sheet` is given, `rId2` (sheet2.xml).
+    fn build_workbook_with_parts(
+        sheets: &str,
+        sheet: &str,
+        comments: Option<&str>,
+        second_sheet: Option<&str>,
+    ) -> Vec<u8> {
+        let workbook = format!(
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheets}</sheets></workbook>"#
+        );
+        let second_rel = if second_sheet.is_some() {
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>"#
+        } else {
+            ""
+        };
+        let wb_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>{second_rel}</Relationships>"#
+        );
+        let wb_rels = wb_rels.as_str();
+        let sheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdC" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/></Relationships>"#;
+        let mut parts: Vec<(&str, &str)> = vec![
+            ("xl/workbook.xml", workbook.as_str()),
+            ("xl/_rels/workbook.xml.rels", wb_rels),
+            ("xl/worksheets/sheet1.xml", sheet),
+        ];
+        if let Some(comments) = comments {
+            parts.push(("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels));
+            parts.push(("xl/comments1.xml", comments));
+        }
+        if let Some(second) = second_sheet {
+            parts.push(("xl/worksheets/sheet2.xml", second));
+        }
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let o = zip::write::SimpleFileOptions::default();
+            for (name, body) in parts {
+                w.start_file(name, o).unwrap();
+                w.write_all(body.as_bytes()).unwrap();
+            }
+            crate::write_test_content_types(&mut w);
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    /// A merge corner outside the A1..XFD1048576 grid is not an ST_Ref cell,
+    /// so the range is not retained; in-grid ranges are kept (normalized).
+    #[test]
+    fn merge_cells_outside_the_grid_are_not_merges() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c></row></sheetData><mergeCells count="4"><mergeCell ref="A1:ZZZZZZ4294967295"/><mergeCell ref="A1:XFD1048577"/><mergeCell ref="C3:B2"/><mergeCell ref="A1:XFD1048576"/></mergeCells></worksheet>"#;
+        let json = parse_sheet_native(&build_single_sheet_workbook(sheet), 0, "Sheet1")
+            .expect("sheet parses");
+        let sheet: serde_json::Value = serde_json::from_str(&json).expect("sheet JSON");
+        let merges = sheet["mergeCells"].as_array().expect("merges");
+        assert_eq!(merges.len(), 2, "{merges:?}");
+        assert_eq!(
+            (merges[0]["top"].as_u64(), merges[0]["left"].as_u64()),
+            (Some(2), Some(2))
+        );
+        assert_eq!(
+            (merges[0]["bottom"].as_u64(), merges[0]["right"].as_u64()),
+            (Some(3), Some(3))
+        );
+        assert_eq!(merges[1]["bottom"], 1_048_576);
+        assert_eq!(merges[1]["right"], 16_384);
+    }
+
+    /// Repeated identical ranges (#1958) — including the same range written
+    /// with swapped corners — collapse to their last occurrence, while
+    /// distinct overlapping ranges stay as authored, in document order. For
+    /// a shared top-left cell the last-authored range stays last.
+    #[test]
+    fn repeated_identical_merge_cells_collapse_to_one() {
+        let mut merges = String::new();
+        for _ in 0..1200 {
+            merges.push_str(r#"<mergeCell ref="A1:ZZ300"/>"#);
+        }
+        let sheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/><mergeCells count="1207">{merges}<mergeCell ref="C3:B2"/><mergeCell ref="B2:C3"/><mergeCell ref="A1:ZZ299"/><mergeCell ref="ZZ300:A1"/><mergeCell ref="E5:F5"/><mergeCell ref="E5:G5"/><mergeCell ref="E5:F5"/></mergeCells></worksheet>"#
+        );
+        let json = parse_sheet_native(&build_single_sheet_workbook(&sheet), 0, "Sheet1")
+            .expect("sheet parses");
+        let sheet: serde_json::Value = serde_json::from_str(&json).expect("sheet JSON");
+        let merges: Vec<(u64, u64, u64, u64)> = sheet["mergeCells"]
+            .as_array()
+            .expect("merges")
+            .iter()
+            .map(|m| {
+                let n = |k: &str| m[k].as_u64().expect("coordinate");
+                (n("top"), n("left"), n("bottom"), n("right"))
+            })
+            .collect();
+        assert_eq!(
+            merges,
+            vec![
+                (2, 2, 3, 3),
+                (1, 1, 299, 702),
+                (1, 1, 300, 702),
+                (5, 5, 5, 7),
+                (5, 5, 5, 6),
+            ]
+        );
+    }
+
+    /// Far-apart cells project to rows of 16384 columns each; past the
+    /// markdown ceiling the projection fails with a typed resource error
+    /// instead of exhausting memory.
+    #[test]
+    fn oversized_markdown_projection_fails_with_a_typed_resource_error() {
+        let rows: String = (1..=2000)
+            .map(|row| {
+                format!(
+                    r#"<row r="{row}"><c r="A{row}"><v>1</v></c><c r="XFD{row}"><v>2</v></c></row>"#
+                )
+            })
+            .collect();
+        let sheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>"#
+        );
+        let error = to_markdown_native(&build_single_sheet_workbook(&sheet))
+            .expect_err("oversized markdown rejected");
+        let json: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .unwrap_or_else(|| panic!("typed prefix: {error}")),
+        )
+        .expect("typed JSON");
+        let violation = &json["details"]["violation"];
+        assert_eq!(violation["resource"], "xlsx-markdown");
+        assert_eq!(violation["metric"], "bytes");
+        assert_eq!(violation["limit"], MAX_XLSX_MARKDOWN_BYTES);
+
+        // Review comments are charged to the same budget as they accumulate
+        // across sheets, before the final copy.
+        let comment = "c".repeat(1 << 20);
+        let workbook_sheets: String = (1..=70)
+            .map(|i| format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId1"/>"#))
+            .collect();
+        let package = build_workbook_with_parts(
+            &workbook_sheets,
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
+            Some(&format!(
+                r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>a</author></authors><commentList><comment ref="A1" authorId="0"><text><t>{comment}</t></text></comment></commentList></comments>"#
+            )),
+            None,
+        );
+        let error = to_markdown_native(&package).expect_err("oversized comments rejected");
+        assert!(error.contains("xlsx-markdown"), "{error}");
+
+        // Comments retained from earlier sheets count against a later table
+        // (and the final document) even when that sheet has no comments:
+        // ~60 MiB of comments plus a ~10 MiB table must fail, although each
+        // part alone fits.
+        let wide_rows: String = (1..=200)
+            .map(|row| {
+                format!(
+                    r#"<row r="{row}"><c r="A{row}"><v>1</v></c><c r="XFD{row}"><v>2</v></c></row>"#
+                )
+            })
+            .collect();
+        let comment_sheets: String = (1..=60)
+            .map(|i| format!(r#"<sheet name="C{i}" sheetId="{i}" r:id="rId1"/>"#))
+            .collect();
+        let package = build_workbook_with_parts(
+            &format!(r#"{comment_sheets}<sheet name="Wide" sheetId="99" r:id="rId2"/>"#),
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#,
+            Some(&format!(
+                r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>a</author></authors><commentList><comment ref="A1" authorId="0"><text><t>{comment}</t></text></comment></commentList></comments>"#
+            )),
+            Some(&format!(
+                r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{wide_rows}</sheetData></worksheet>"#
+            )),
+        );
+        let error = to_markdown_native(&package).expect_err("combined size rejected");
+        assert!(error.contains("xlsx-markdown"), "{error}");
+
+        let small = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="1048576"><c r="XFD1048576"><v>2</v></c></row></sheetData></worksheet>"#;
+        let markdown = to_markdown_native(&build_single_sheet_workbook(small)).expect("fits");
+        assert!(markdown.contains("| 1 |") && markdown.contains("| 2 |"));
+    }
 
     /// Build a 1-sheet workbook that OMITS `@r` on both `<row>` and every `<c>`
     /// (the minimal enterprise-exporter shape from #832 / #833-1), backed by a
@@ -6708,6 +8495,7 @@ mod rb7_partial_degradation_tests {
                 w.start_file(name.as_str(), o).unwrap();
                 w.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut w);
             w.finish().unwrap();
         }
         buf
@@ -6727,6 +8515,7 @@ mod rb7_partial_degradation_tests {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         bytes
@@ -6748,6 +8537,7 @@ mod rb7_partial_degradation_tests {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         bytes
@@ -6777,6 +8567,7 @@ mod rb7_partial_degradation_tests {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
 
@@ -6812,6 +8603,9 @@ mod rb7_partial_degradation_tests {
                 rows.append(envelope["rows"].as_array_mut().unwrap());
                 continue;
             }
+            if envelope["kind"] == "preview" {
+                continue;
+            }
             let mut worksheet = envelope["worksheet"].take();
             if worksheet["parseError"].is_null() {
                 worksheet["rows"] = serde_json::Value::Array(rows);
@@ -6841,7 +8635,7 @@ mod rb7_partial_degradation_tests {
         let sheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
         let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="1" name="Chart"/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rChart"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
         let drawing_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#;
-        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="165" formatCode="0.0000"/></numFmts><fonts count="1"><font><sz val="13"/><name val="Cursor Test Font"/></font></fonts><fills count="0"/><borders count="0"/><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0"/><xf numFmtId="165" fontId="0"/></cellXfs></styleSheet>"#;
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="165" formatCode="0.0000"/></numFmts><fonts count="1"><font><b/><i/><sz val="13"/><name val="Cursor Test Font"/></font></fonts><fills count="0"/><borders count="0"/><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0"/><xf numFmtId="165" fontId="0"/></cellXfs></styleSheet>"#;
         let mut entries = vec![
             ("xl/workbook.xml", workbook.as_str()),
             ("xl/_rels/workbook.xml.rels", workbook_rels.as_str()),
@@ -6863,6 +8657,7 @@ mod rb7_partial_degradation_tests {
                 writer.start_file(path, options).unwrap();
                 writer.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut writer);
             writer.finish().unwrap();
         }
         bytes
@@ -6876,6 +8671,41 @@ mod rb7_partial_degradation_tests {
         streamed
     }
 
+    /// Inline rich text reaches the viewer through cursor row batches, so its
+    /// runs must be marked there too, exactly as a full parse marks them.
+    #[test]
+    fn cursor_rows_mark_inline_rich_run_colors_like_a_full_parse() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let sheet = format!(
+            r#"<worksheet xmlns="{ns}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><r><rPr><color theme="1"/></rPr><t>n</t></r><r><rPr><color rgb="FFFF0000"/></rPr><t>r</t></r></is></c></row></sheetData></worksheet>"#
+        );
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let styles = format!(
+            r#"<styleSheet xmlns="{ns}"><fonts count="1"><font><sz val="11"/><color theme="1"/><name val="Calibri"/></font></fonts><cellStyleXfs count="1"><xf fontId="0"/></cellStyleXfs><cellXfs count="1"><xf fontId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
+        );
+        let mut data = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut data));
+            let o = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("xl/workbook.xml", workbook.to_string()),
+                ("xl/_rels/workbook.xml.rels", wb_rels.to_string()),
+                ("xl/worksheets/sheet1.xml", sheet),
+                ("xl/styles.xml", styles),
+            ] {
+                w.start_file(name, o).unwrap();
+                w.write_all(body.as_bytes()).unwrap();
+            }
+            crate::write_test_content_types(&mut w);
+            w.finish().unwrap();
+        }
+        let streamed = assert_cursor_parity(data);
+        let runs = &streamed["rows"][0]["cells"][0]["value"]["runs"];
+        assert_eq!(runs[0]["font"]["normalColor"], serde_json::json!(true));
+        assert!(runs[1]["font"].get("normalColor").is_none());
+    }
+
     #[test]
     fn wasm_cursor_commits_operation_only_after_terminal_ack() {
         let mut archive =
@@ -6886,7 +8716,7 @@ mod rb7_partial_degradation_tests {
             let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
             if value["kind"] == "finished" {
                 assert!(archive.terminal_awaiting_ack);
-                assert!(archive.archive.as_ref().unwrap().operation.is_active());
+                assert!(archive.archive.operation.is_active());
                 assert_eq!(value["worksheet"]["rows"], serde_json::json!([]));
                 let usage: serde_json::Value =
                     serde_json::from_slice(&archive.sheet_cursor_resource_usage().unwrap())
@@ -6898,9 +8728,180 @@ mod rb7_partial_degradation_tests {
         archive.acknowledge_sheet_cursor_terminal().unwrap();
         assert!(!archive.terminal_awaiting_ack);
         assert!(archive.active_worksheet.is_none());
-        assert!(!archive.archive.as_ref().unwrap().operation.is_active());
+        assert!(!archive.archive.operation.is_active());
         assert!(archive.sheet_cursor_resource_usage().is_ok());
         archive.close_sheet_cursor();
+    }
+
+    #[test]
+    fn cursor_preview_has_final_shell_and_implicit_scroll_bounds_before_rows() {
+        let padding = "x".repeat(550_000);
+        let sheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{padding}</t></is></c></row><row r="2"><c r="C2" t="inlineStr"><is><t>{padding}</t></is></c></row></sheetData></worksheet>"#
+        );
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(&sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(first["kind"], "preview");
+        assert!(first["reason"].is_null());
+        assert_eq!(first["maxRow"], 2);
+        assert_eq!(first["maxCol"], 3);
+        let mut terminal = loop {
+            let unit: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+            if unit["kind"] == "finished" {
+                break unit;
+            }
+        };
+        assert_eq!(first["worksheet"], terminal["worksheet"].take());
+        archive.acknowledge_sheet_cursor_terminal_inner().unwrap();
+    }
+
+    #[test]
+    fn small_worksheet_emits_preview_before_rows() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B2"/></mergeCells><conditionalFormatting sqref="A1:A3"><cfRule type="top10" rank="1" priority="1"/></conditionalFormatting></worksheet>"#;
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(first["kind"], "preview");
+        assert!(first["reason"].is_null());
+        assert!(first["worksheet"].is_object());
+        assert_eq!(first["worksheet"]["mergeCells"][0]["bottom"], 2);
+        assert_eq!(
+            first["worksheet"]["conditionalFormats"][0]["sqref"][0]["bottom"],
+            3
+        );
+        archive.cancel_sheet_cursor();
+    }
+
+    #[test]
+    fn encoded_row_height_preview_matches_completed_sheet() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="&#49;" ht="&#51;0"><c r="A&#49;"><v>1</v></c></row><row r="2" ht="3&amp;0"><c r="A2"><v>2</v></c></row></sheetData></worksheet>"#;
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let preview: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(preview["kind"], "preview");
+        assert_eq!(preview["worksheet"]["rowHeights"]["1"], 30.0);
+        assert!(preview["worksheet"]["rowHeights"].get("2").is_none());
+
+        loop {
+            let unit: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+            if unit["kind"] == "finished" {
+                assert_eq!(
+                    unit["worksheet"]["rowHeights"],
+                    preview["worksheet"]["rowHeights"]
+                );
+                break;
+            }
+        }
+        archive.cancel_sheet_cursor();
+    }
+
+    /// Pull a cursor to completion, returning the provisional preview unit and
+    /// the terminal worksheet with its streamed rows attached.
+    fn cursor_preview_and_terminal(sheet: &str) -> (serde_json::Value, serde_json::Value) {
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let preview: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(preview["kind"], "preview");
+        let mut rows = Vec::new();
+        let terminal = loop {
+            let mut unit: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(128).unwrap()).unwrap();
+            if unit["kind"] == "rows" {
+                rows.append(unit["rows"].as_array_mut().unwrap());
+                continue;
+            }
+            assert_eq!(unit["kind"], "finished");
+            let mut worksheet = unit["worksheet"].take();
+            worksheet["rows"] = serde_json::Value::Array(rows);
+            break worksheet;
+        };
+        archive.acknowledge_sheet_cursor_terminal_inner().unwrap();
+        (preview, terminal)
+    }
+
+    /// ECMA-376 §18.3.1.81: `zeroHeight` hides unspecified rows only. A visible
+    /// explicit row without `@ht` keeps the default band on the preview, the
+    /// bounded cursor and the full parse alike, so the first frame cannot
+    /// collapse a row that the completed sheet shows.
+    #[test]
+    fn zero_height_visible_rows_without_ht_keep_the_default_band_on_every_path() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetFormatPr defaultRowHeight="22" zeroHeight="1"/><sheetData><row r="1" ht="30"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3" hidden="1"><c r="A3"><v>3</v></c></row><row r="4" hidden="0"><c r="A4"><v>4</v></c></row><row r="5"><c r="A5"><v>5</v></c></row></sheetData></worksheet>"#;
+        let expected = serde_json::json!({"1": 30.0, "2": 22.0, "3": 0.0, "4": 22.0, "5": 22.0});
+        let (preview, terminal) = cursor_preview_and_terminal(sheet);
+        assert!(preview["reason"].is_null());
+        assert_eq!(preview["worksheet"]["rowHeights"], expected);
+        assert_eq!(preview["worksheet"]["defaultRowHeight"], 0.0);
+        assert_eq!(terminal["rowHeights"], expected);
+        assert_eq!(terminal["defaultRowHeight"], 0.0);
+
+        let (full, _) = parse_worksheet(sheet, &[], &[], "Sheet1").unwrap();
+        let full = serde_json::to_value(full).unwrap();
+        assert_eq!(full["rowHeights"], expected);
+        assert_eq!(full["rows"], terminal["rows"]);
+    }
+
+    /// The row projector reads booleans leniently (`attr_bool`). The lexical
+    /// preview must use the same reader, or a `hidden="True"` row would paint
+    /// at the default height first and collapse when loading completes.
+    #[test]
+    fn lenient_row_booleans_give_the_preview_the_terminal_row_geometry() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" hidden="True"><c r="A1"><v>1</v></c></row><row r="2" hidden=" on "><c r="A2"><v>2</v></c></row><row r="3" hidden="false" ht="40"><c r="A3"><v>3</v></c></row></sheetData></worksheet>"#;
+        let (preview, terminal) = cursor_preview_and_terminal(sheet);
+        let expected = serde_json::json!({"1": 0.0, "2": 0.0, "3": 40.0});
+        assert_eq!(preview["worksheet"]["rowHeights"], expected);
+        assert_eq!(terminal["rowHeights"], expected);
+
+        // A lenient `collapsed` spelling is still an outline, which the
+        // viewer's gutter needs the complete sheet to lay out.
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" collapsed="TRUE"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
+        let (preview, _) = cursor_preview_and_terminal(sheet);
+        assert_eq!(preview["reason"], "outline");
+    }
+
+    /// The lexical preview identifies elements by unprefixed name. When that
+    /// cannot mean SpreadsheetML, or `sheetData` is not the root child the
+    /// projector requires, the sheet waits for the complete model.
+    #[test]
+    fn preview_requires_the_projector_namespace_and_sheet_data_position() {
+        for sheet in [
+            r#"<worksheet xmlns="urn:example:other"><sheetData><row r="1" ht="30"/></sheetData></worksheet>"#,
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1" ht="30" xmlns="urn:example:other"/></sheetData></worksheet>"#,
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr><sheetData/></sheetPr><sheetData><row r="1" ht="30"/></sheetData></worksheet>"#,
+        ] {
+            let mut archive =
+                XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+            archive.open_sheet_cursor(0, "Sheet1").unwrap();
+            let preview: serde_json::Value =
+                serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+            assert_eq!(preview["kind"], "preview", "{sheet}");
+            assert_eq!(preview["reason"], "metadata-unavailable", "{sheet}");
+            assert!(preview["worksheet"].is_null(), "{sheet}");
+            archive.cancel_sheet_cursor();
+        }
+    }
+
+    #[test]
+    fn row_outline_requires_complete_sheet_before_paint() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="200" outlineLevel="1"><c r="A200"><v>2</v></c></row></sheetData></worksheet>"#;
+        let mut archive =
+            XlsxArchive::new(build_sheet_xml_workbook(sheet), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(1).unwrap()).unwrap();
+        assert_eq!(first["reason"], "outline");
+        assert!(first["worksheet"].is_null());
+        archive.cancel_sheet_cursor();
     }
 
     #[test]
@@ -6925,6 +8926,8 @@ mod rb7_partial_degradation_tests {
             terminal["worksheet"]["defaultFontFamily"],
             "Cursor Test Font"
         );
+        assert_eq!(terminal["worksheet"]["defaultFontBold"], true);
+        assert_eq!(terminal["worksheet"]["defaultFontItalic"], true);
         assert_eq!(
             terminal["worksheet"]["charts"][0]["chart"]["series"][0]["catFormatBuiltinId"],
             165
@@ -6952,7 +8955,7 @@ mod rb7_partial_degradation_tests {
         archive.cancel_sheet_cursor();
         assert!(!archive.terminal_awaiting_ack);
         assert!(archive.active_worksheet.is_none());
-        assert!(!archive.archive.as_ref().unwrap().operation.is_active());
+        assert!(!archive.archive.operation.is_active());
         assert_eq!(archive.sheet_cursor_resource_usage().unwrap(), usage);
     }
 
@@ -6961,50 +8964,33 @@ mod rb7_partial_degradation_tests {
         let mut archive =
             XlsxArchive::new(build_missing_sheet_workbook(), None, None, None).unwrap();
         archive.open_sheet_cursor(0, "Sheet1").unwrap();
-        let payload = archive.pull_sheet_cursor(128).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let value: serde_json::Value = loop {
+            let payload = archive.pull_sheet_cursor(128).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            if value["kind"] == "finished" {
+                break value;
+            }
+        };
         assert_eq!(value["kind"], "finished");
         assert!(value["worksheet"]["parseError"]
             .as_str()
             .unwrap()
             .starts_with("xl/worksheets/missing.xml: "));
-        assert!(archive.archive.as_ref().unwrap().operation.is_active());
+        assert!(archive.archive.operation.is_active());
         archive.acknowledge_sheet_cursor_terminal().unwrap();
-        assert!(!archive.archive.as_ref().unwrap().operation.is_active());
-    }
-
-    #[test]
-    fn wasm_cursor_corrupt_container_matches_legacy_placeholder_and_commits_on_ack() {
-        let mut archive = XlsxArchive::new(b"not a zip".to_vec(), None, None, None).unwrap();
-        let container_error = match &archive.archive {
-            Err(error) => error.clone(),
-            Ok(_) => panic!("corrupt container must be deferred"),
-        };
-        archive.open_sheet_cursor(0, "ignored").unwrap();
-        assert!(!archive.sheet_cursor_pull_finished());
-        let payload = archive.pull_sheet_cursor(128).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(value["kind"], "finished");
-        assert_eq!(
-            value["worksheet"],
-            serde_json::to_value(degraded_container_sheet(container_error)).unwrap()
-        );
-        assert!(archive.terminal_awaiting_ack);
-        archive.acknowledge_sheet_cursor_terminal_inner().unwrap();
-        assert!(archive.active_worksheet.is_none());
-        assert!(!archive.terminal_awaiting_ack);
+        assert!(!archive.archive.operation.is_active());
     }
 
     #[test]
     fn wasm_cursor_resource_poison_never_prepares_or_allows_terminal_ack() {
         let data = super::package_streaming_integration_tests::forged_worksheet_package();
         let mut archive = XlsxArchive::new(data, Some(1024), Some(16 * 1024), None).unwrap();
-        archive.open_sheet_cursor(0, "Sheet1").unwrap();
-        assert!(archive.pull_sheet_cursor_inner(128).is_err());
+        let error = archive.open_sheet_cursor_inner(0, "Sheet1").unwrap_err();
+        assert!(error.starts_with("OOXML_RESOURCE_LIMIT:"), "{error}");
         assert!(!archive.sheet_cursor_pull_finished());
         assert!(!archive.terminal_awaiting_ack);
         assert!(archive.active_worksheet.is_none());
-        assert!(!archive.archive.as_ref().unwrap().operation.is_active());
+        assert!(!archive.archive.operation.is_active());
         assert!(archive.acknowledge_sheet_cursor_terminal_inner().is_err());
         archive.cancel_sheet_cursor();
         archive.close_sheet_cursor();
@@ -7019,22 +9005,12 @@ mod rb7_partial_degradation_tests {
             None,
         )
         .expect("forged ancillary declaration passes metadata preflight");
-        archive.open_sheet_cursor(0, "Sheet1").unwrap();
-
-        let error = loop {
-            match archive.pull_sheet_cursor_inner(128) {
-                Ok(payload) => {
-                    let envelope: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-                    assert_eq!(envelope["kind"], "rows");
-                }
-                Err(error) => break error,
-            }
-        };
+        let error = archive.open_sheet_cursor_inner(0, "Sheet1").unwrap_err();
         assert!(error.starts_with("OOXML_RESOURCE_LIMIT:"), "{error}");
         assert!(!archive.sheet_cursor_pull_finished());
         assert!(!archive.terminal_awaiting_ack);
         assert!(archive.active_worksheet.is_none());
-        assert!(!archive.archive.as_ref().unwrap().operation.is_active());
+        assert!(!archive.archive.operation.is_active());
         assert!(archive.acknowledge_sheet_cursor_terminal_inner().is_err());
     }
 
@@ -7057,6 +9033,74 @@ mod rb7_partial_degradation_tests {
             serde_json::from_str(&parse_sheet_native(&data, 0, "Sheet1").unwrap()).unwrap();
         assert_eq!(drain_cursor_model(data), legacy);
         assert!(!legacy["parseError"].is_null());
+    }
+
+    /// The terminal product reuses the drawing, hyperlink and comment parts the
+    /// preview already finalized, and still equals a full parse.
+    #[test]
+    fn wasm_cursor_terminal_reuses_preview_parts_with_full_parse_parity() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row></sheetData><hyperlinks><hyperlink ref="A1" r:id="rLink"/></hyperlinks><drawing r:id="rDrawing"/></worksheet>"#;
+        let sheet_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/><Relationship Id="rComments" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/></Relationships>"#;
+        let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:sp><xdr:nvSpPr><xdr:cNvPr id="2" name="Box"/><xdr:cNvSpPr/></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></xdr:spPr><xdr:txBody><a:bodyPr/><a:p><a:r><a:t>Note</a:t></a:r></a:p></xdr:txBody></xdr:sp><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+        let comments = r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors><author>A</author></authors><commentList><comment ref="A2" authorId="0"><text><t>Hello</t></text></comment></commentList></comments>"#;
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let workbook_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let mut data = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut data));
+            let options = zip::write::SimpleFileOptions::default();
+            for (path, body) in [
+                ("xl/workbook.xml", workbook),
+                ("xl/_rels/workbook.xml.rels", workbook_rels),
+                ("xl/worksheets/sheet1.xml", sheet),
+                ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+                ("xl/drawings/drawing1.xml", drawing),
+                ("xl/comments1.xml", comments),
+            ] {
+                writer.start_file(path, options).unwrap();
+                writer.write_all(body.as_bytes()).unwrap();
+            }
+            crate::write_test_content_types(&mut writer);
+            writer.finish().unwrap();
+        }
+
+        let mut archive = XlsxArchive::new(data.clone(), None, None, None).unwrap();
+        archive.open_sheet_cursor(0, "Sheet1").unwrap();
+        let parts = archive
+            .active_worksheet
+            .as_ref()
+            .and_then(|active| active.preview_parts.as_ref())
+            .expect("the preview finalized reusable parts");
+        assert_eq!(parts.shape_groups.len(), 1);
+        assert_eq!(parts.hyperlinks.len(), 1);
+        assert_eq!(parts.comments.len(), 1);
+        assert_eq!(
+            parts.charts_without_frames.as_deref().map(<[_]>::len),
+            Some(0)
+        );
+        let preview: serde_json::Value =
+            serde_json::from_slice(&archive.pull_sheet_cursor_inner(128).unwrap()).unwrap();
+        assert_eq!(preview["kind"], "preview");
+        loop {
+            let payload = archive.pull_sheet_cursor_inner(128).unwrap();
+            if archive.sheet_cursor_pull_finished() {
+                let terminal: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(
+                    terminal["worksheet"]["shapeGroups"],
+                    preview["worksheet"]["shapeGroups"]
+                );
+                break;
+            }
+        }
+        assert!(archive
+            .active_worksheet
+            .as_ref()
+            .is_some_and(|active| active.preview_parts.is_none()));
+
+        let model = assert_cursor_parity(data);
+        assert_eq!(model["shapeGroups"].as_array().map(Vec::len), Some(1));
+        assert_eq!(model["hyperlinks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(model["comments"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -7090,6 +9134,16 @@ mod rb7_partial_degradation_tests {
         assert_eq!(
             model["charts"][0]["chart"]["series"][0]["values"],
             serde_json::json!([99.0])
+        );
+    }
+
+    #[test]
+    fn unresolved_oversized_sparkline_keeps_empty_data_on_native_and_cursor_paths() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><sheetData/><extLst><ext uri="spark"><x14:sparklineGroups><x14:sparklineGroup><x14:sparklines><x14:sparkline><xm:f>Missing!A1:A1000001</xm:f><xm:sqref>B1</xm:sqref></x14:sparkline></x14:sparklines></x14:sparklineGroup></x14:sparklineGroups></ext></extLst></worksheet>"#;
+        let model = assert_cursor_parity(build_sheet_xml_workbook(sheet));
+        assert_eq!(
+            model["sparklineGroups"][0]["sparklines"][0]["values"],
+            serde_json::json!([]),
         );
     }
 
@@ -7194,6 +9248,7 @@ mod rb7_partial_degradation_tests {
                 w.start_file(name.as_str(), o).unwrap();
                 w.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut w);
             w.finish().unwrap();
         }
         buf
@@ -7234,6 +9289,7 @@ mod rb7_partial_degradation_tests {
                 w.start_file(name.as_str(), o).unwrap();
                 w.write_all(body.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut w);
             w.finish().unwrap();
         }
         buf
@@ -7276,6 +9332,42 @@ mod rb7_partial_degradation_tests {
             b1.get("showPhonetic").is_none() || b1["showPhonetic"].as_bool() == Some(false),
             "B1 has no ph → showPhonetic omitted/false; got {b1}"
         );
+    }
+
+    mod lexical_depth_cases {
+        include!("../../../ooxml-common/tests/support/lexical_depth_cases.rs");
+    }
+
+    #[test]
+    fn optional_shared_strings_distinguish_lexical_depth_from_shallow_content_errors() {
+        let baseline = build_workbook_with_shared_strings(Some("<broken"));
+        let expected_sheet = parse_sheet_native(&baseline, 0, "Alpha").unwrap();
+        for (name, xml, crossing) in lexical_depth_cases::lexical_depth_cases() {
+            let bytes = build_workbook_with_shared_strings(Some(&xml));
+            let workbook = parse_workbook_native(&bytes);
+            let sheet = parse_sheet_native(&bytes, 0, "Alpha");
+            if crossing {
+                for error in [workbook.unwrap_err(), sheet.unwrap_err()] {
+                    let payload: serde_json::Value = serde_json::from_str(
+                        error.strip_prefix("OOXML_RESOURCE_LIMIT:").expect(&error),
+                    )
+                    .unwrap();
+                    assert_eq!(payload["details"]["violation"]["metric"], "depth", "{name}");
+                }
+            } else {
+                let result: serde_json::Value =
+                    serde_json::from_str(&workbook.expect(name)).unwrap();
+                // The established tolerant path publishes the workbook with the
+                // DOM error attributed to sharedStrings, and a usable sheet.
+                let dom_error = roxmltree::Document::parse(&xml).unwrap_err().to_string();
+                assert_eq!(
+                    result["parseError"],
+                    format!("xl/sharedStrings.xml: {dom_error}"),
+                    "{name}"
+                );
+                assert_eq!(sheet.expect(name), expected_sheet, "{name}");
+            }
+        }
     }
 
     /// #773: a PRESENT-but-corrupt `xl/sharedStrings.xml` (§18.4.9) silently
@@ -7375,6 +9467,7 @@ mod pivot_metadata_tests {
                 zip.start_file(path, options).unwrap();
                 zip.write_all(xml.as_bytes()).unwrap();
             }
+            crate::write_test_content_types(&mut zip);
             zip.finish().unwrap();
         }
         bytes
@@ -7417,6 +9510,7 @@ mod pivot_metadata_tests {
                 zip.start_file(path, options).unwrap();
                 zip.write_all(content).unwrap();
             }
+            crate::write_test_content_types(&mut zip);
             zip.finish().unwrap();
         }
         bytes
@@ -8061,6 +10155,53 @@ mod pivot_metadata_tests {
         }
     }
 
+    fn workbook_with_pivot_and_styles(pivot_xml: &str, styles_xml: &str) -> Vec<u8> {
+        let base = workbook_with_pivot(pivot_xml, Some(PIVOT_RELS), Some(COMPLETE_CACHE));
+        let mut archive = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = zip::write::SimpleFileOptions::default();
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index).unwrap();
+                let mut content = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+                zip.start_file(entry.name().unwrap(), options).unwrap();
+                zip.write_all(&content).unwrap();
+            }
+            zip.start_file("xl/styles.xml", options).unwrap();
+            zip.write_all(styles_xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn unusable_pivot_style_and_overflowing_axis_items_are_reported_not_dropped() {
+        let styled = COMPLETE_PIVOT.replace(
+            "<extLst>",
+            r#"<rowItems count="1"><i r="4294967295"><x/></i></rowItems><pivotTableStyleInfo name="Custom" showRowHeaders="1"/><extLst>"#,
+        );
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dxfs count="1"><dxf/></dxfs><tableStyles><tableStyle name="Custom" pivot="1"><tableStyleElement type="wholeTable" dxfId="0"/><tableStyleElement type="headerRow" dxfId="7"/></tableStyle></tableStyles></styleSheet>"#;
+        let sheet = parse(&workbook_with_pivot_and_styles(&styled, styles));
+        let pivot = &sheet["pivotTables"][0];
+        assert_eq!(pivot["status"]["state"], "partial");
+        let fields: Vec<_> = pivot["status"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|reason| reason["kind"] == "malformedField")
+            .map(|reason| reason["field"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            fields.contains(&"tableStyleElement.dxfId".to_string()),
+            "{fields:?}"
+        );
+        assert!(fields.contains(&"rowItems.i".to_string()), "{fields:?}");
+        assert!(pivot.get("style").is_none());
+        assert!(pivot.get("rowItems").is_none());
+    }
+
     #[test]
     fn pivot_axis_data_placement_semantics_are_never_silently_complete() {
         for attributes in [" dataOnRows=\"true\"", " dataPosition=\"2\""] {
@@ -8296,5 +10437,117 @@ mod implicit_reference_tests {
             CellValue::Text { text, .. } => assert_eq!(text, "Bold tail"),
             other => panic!("expected concatenated inline rich text, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cached_empty_string_regression_tests {
+    use super::*;
+
+    #[test]
+    fn cached_formula_empty_string_is_text_while_missing_cache_stays_empty() {
+        // ECMA-376 §§18.3.1.4/.96, ST_CellType: an explicit string cache
+        // may be empty; absence of a cache does not establish a result.
+        let xml = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">
+          <c r="A1" t="str"><f>""</f><v/></c>
+          <c r="B1" t="str"><f>""</f></c>
+          <c r="C1" s="2"/>
+          <c r="D1"><f>Z1</f><v/></c>
+          <c r="E1" t="str"><f t="shared" si="0"/><v/></c>
+        </row></sheetData></worksheet>"#;
+        let (ws, _) = parse_worksheet(xml, &[], &[], "Sheet1").unwrap();
+        let cells = &ws.rows[0].cells;
+        assert!(
+            matches!(&cells[0].value, CellValue::Text { text, .. } if text.is_empty()),
+            "present empty cached string must preserve text ownership: {:?}",
+            cells[0].value
+        );
+        assert!(
+            matches!(cells[1].value, CellValue::Empty),
+            "missing v must remain absent cache"
+        );
+        assert!(
+            matches!(cells[2].value, CellValue::Empty),
+            "style-only cell stays blank"
+        );
+        assert!(
+            matches!(cells[3].value, CellValue::Empty),
+            "untyped empty cache stays blank"
+        );
+        assert!(
+            matches!(&cells[4].value, CellValue::Text { text, .. } if text.is_empty()),
+            "shared-formula follower preserves its explicit empty string cache"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_sparkline_tests {
+    use super::*;
+
+    #[test]
+    fn sparkline_reference_limit_rejects_instead_of_defaulting_to_empty_data() {
+        let writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let mut archive = XlsxZip::new(Cursor::new(writer.finish().unwrap().into_inner())).unwrap();
+        let rels = parse_guarded("<Relationships/>").unwrap();
+        let xml = r#"<worksheet><extLst><sparklineGroup><sparklines><sparkline><f>A1:A1000001</f><sqref>B1</sqref></sparkline></sparklines></sparklineGroup></extLst></worksheet>"#;
+        let error = archive
+            .run_operation("sparkline-test", |archive| {
+                let _provisional = load_sheet_sparklines(
+                    archive,
+                    xml,
+                    Some(&[]),
+                    "Sheet1",
+                    &[],
+                    &rels,
+                    &[],
+                    &[],
+                    &mut WorksheetReferenceSession::default(),
+                );
+                Ok(())
+            })
+            .unwrap_err();
+        let payload: serde_json::Value =
+            serde_json::from_str(error.strip_prefix("OOXML_RESOURCE_LIMIT:").expect(&error))
+                .unwrap();
+        assert_eq!(
+            payload["details"]["violation"]["resource"],
+            "worksheet-reference"
+        );
+        assert_eq!(payload["details"]["violation"]["limit"], 1_000_000);
+        assert_eq!(payload["details"]["violation"]["observed"], 1_000_001);
+    }
+}
+
+#[cfg(test)]
+mod column_style_resolution_tests {
+    use super::last_column_style_by_column;
+    use crate::types::ColumnStyleRange;
+
+    #[test]
+    fn last_covering_declaration_wins_for_every_column() {
+        let range = |min, max, style_index| ColumnStyleRange {
+            min,
+            max,
+            style_index,
+        };
+        let ranges = [
+            range(1, 16_384, 1),
+            range(3, 8, 2),
+            range(5, 5, 3),
+            range(7, 20, 4),
+            range(16_384, 16_384, 5),
+            range(2, 4, 6),
+        ];
+        let resolved = last_column_style_by_column(&ranges);
+        for column in 1..=16_384u32 {
+            let oracle = ranges
+                .iter()
+                .rev()
+                .find(|range| column >= range.min && column <= range.max)
+                .map(|range| range.style_index);
+            assert_eq!(resolved[column as usize], oracle, "column {column}");
+        }
+        assert!(last_column_style_by_column(&[]).is_empty());
     }
 }

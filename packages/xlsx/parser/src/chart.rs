@@ -8,7 +8,9 @@ use crate::worksheet_reference::{
 use crate::{parse_rels_map, resolve_fill_color, resolve_sheet_path, resolve_zip_path};
 use ooxml_common::depth::parse_guarded;
 use ooxml_common::ns::{is_c_ns, is_r_ns, is_x_ns, is_xdr_ns};
-use std::collections::{BTreeMap, HashMap};
+use ooxml_common::package_session::PackageLimitReporter;
+use ooxml_common::resource::HardResourceLimitKind;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CHARTEX_NS: &str = "http://schemas.microsoft.com/office/drawing/2014/chartex";
 const MAX_CHART_STYLE_FORMATS: usize = 1_048_576;
@@ -26,8 +28,15 @@ pub(crate) struct ChartNumberFormatCache {
 }
 
 impl ChartNumberFormatCache {
-    pub(crate) fn from_document(document: &roxmltree::Document<'_>) -> Self {
-        let style_num_fmt_ids = document
+    pub(crate) fn from_document(
+        document: &roxmltree::Document<'_>,
+        reporter: &PackageLimitReporter,
+    ) -> Result<Self, String> {
+        // ECMA-376 §18.8.10 indexes all cellXfs; §18.8.30–31 retains complete
+        // formatCode strings. These are library memory ceilings, not OOXML
+        // truncation rules. Latch a typed package failure before returning any
+        // partial cache so callers cannot substitute General for omitted data.
+        let style_formats = document
             .descendants()
             .find(|node| {
                 node.is_element()
@@ -41,13 +50,22 @@ impl ChartNumberFormatCache {
                         && node.tag_name().name() == "xf"
                         && is_x_ns(node.tag_name().namespace())
                 })
-            })
-            .take(MAX_CHART_STYLE_FORMATS)
-            .map(|xf| {
+            });
+        let mut style_num_fmt_ids = Vec::new();
+        for (index, xf) in style_formats.enumerate() {
+            if index >= MAX_CHART_STYLE_FORMATS {
+                reporter.observe_hard_limit(
+                    HardResourceLimitKind::ChartStyleFormats,
+                    Some("xl/styles.xml"),
+                    MAX_CHART_STYLE_FORMATS as u64,
+                    index as u64 + 1,
+                )?;
+            }
+            style_num_fmt_ids.push(
                 xf.attribute("numFmtId")
-                    .and_then(|value| value.parse::<u32>().ok())
-            })
-            .collect();
+                    .and_then(|value| value.parse::<u32>().ok()),
+            );
+        }
 
         let mut custom_num_formats = HashMap::new();
         let mut remaining_bytes = MAX_CHART_NUMBER_FORMAT_BYTES;
@@ -56,15 +74,23 @@ impl ChartNumberFormatCache {
                 && node.tag_name().name() == "numFmts"
                 && is_x_ns(node.tag_name().namespace())
         }) {
-            for num_fmt in num_fmts
+            for (index, num_fmt) in num_fmts
                 .children()
                 .filter(|node| {
                     node.is_element()
                         && node.tag_name().name() == "numFmt"
                         && is_x_ns(node.tag_name().namespace())
                 })
-                .take(MAX_CHART_CUSTOM_NUMBER_FORMATS)
+                .enumerate()
             {
+                if index >= MAX_CHART_CUSTOM_NUMBER_FORMATS {
+                    reporter.observe_hard_limit(
+                        HardResourceLimitKind::ChartCustomNumberFormats,
+                        Some("xl/styles.xml"),
+                        MAX_CHART_CUSTOM_NUMBER_FORMATS as u64,
+                        index as u64 + 1,
+                    )?;
+                }
                 let Some(id) = num_fmt
                     .attribute("numFmtId")
                     .and_then(|value| value.parse::<u32>().ok())
@@ -75,17 +101,23 @@ impl ChartNumberFormatCache {
                     continue;
                 };
                 if code.len() > remaining_bytes {
-                    break;
+                    reporter.observe_hard_limit(
+                        HardResourceLimitKind::ChartNumberFormatBytes,
+                        Some("xl/styles.xml"),
+                        MAX_CHART_NUMBER_FORMAT_BYTES as u64,
+                        (MAX_CHART_NUMBER_FORMAT_BYTES - remaining_bytes) as u64
+                            + code.len() as u64,
+                    )?;
                 }
                 remaining_bytes -= code.len();
                 custom_num_formats.insert(id, code.to_string());
             }
         }
 
-        Self {
+        Ok(Self {
             style_num_fmt_ids,
             custom_num_formats,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -93,18 +125,11 @@ impl ChartNumberFormatCache {
         let style_num_fmt_ids = styles
             .cell_xfs
             .iter()
-            .take(MAX_CHART_STYLE_FORMATS)
             .map(|xf| Some(xf.num_fmt_id))
             .collect();
         let mut custom_num_formats = HashMap::new();
-        let mut remaining_bytes = MAX_CHART_NUMBER_FORMAT_BYTES;
-        for format in styles.num_fmts.iter().take(MAX_CHART_CUSTOM_NUMBER_FORMATS) {
-            let code = &format.format_code;
-            if code.len() > remaining_bytes {
-                break;
-            }
-            remaining_bytes -= code.len();
-            custom_num_formats.insert(format.num_fmt_id, code.clone());
+        for format in &styles.num_fmts {
+            custom_num_formats.insert(format.num_fmt_id, format.format_code.clone());
         }
         Self {
             style_num_fmt_ids,
@@ -141,6 +166,50 @@ fn collect_selected_graphic_frames<'a, 'input>(
     }
 }
 
+fn is_chart_anchor(anchor: roxmltree::Node<'_, '_>) -> bool {
+    anchor.is_element()
+        && matches!(
+            anchor.tag_name().name(),
+            "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor"
+        )
+        && is_xdr_ns(anchor.tag_name().namespace())
+}
+
+/// Resolve a selected `<xdr:graphicFrame>` to its chart part and whether it is
+/// a chartEx part. `<a:graphicData uri>` and its child namespace distinguish
+/// modern `<cx:chart>` from legacy `<c:chart>`.
+fn graphic_frame_chart_part(
+    graphic_frame: roxmltree::Node<'_, '_>,
+    drawing_rels: &HashMap<String, String>,
+    drawing_path: &str,
+) -> Option<(String, bool)> {
+    let graphic_data = graphic_frame
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "graphicData")?;
+    let is_chartex = graphic_data
+        .attribute("uri")
+        .is_some_and(|uri| uri == CHARTEX_NS);
+    let rid = graphic_data
+        .descendants()
+        .find(|n| {
+            n.is_element()
+                && n.tag_name().name() == "chart"
+                && if is_chartex {
+                    n.tag_name().namespace() == Some(CHARTEX_NS)
+                } else {
+                    is_c_ns(n.tag_name().namespace())
+                }
+        })
+        .and_then(|chart| {
+            chart
+                .attributes()
+                .find(|a| a.name() == "id" && is_r_ns(a.namespace()))
+                .map(|a| a.value().to_string())
+        })?;
+    let chart_target = drawing_rels.get(&rid)?;
+    Some((resolve_zip_path(drawing_path, chart_target), is_chartex))
+}
+
 pub(crate) struct ChartReferenceContext<'a, 'input, 'session> {
     pub(crate) materialized_rows: Option<&'a [Row]>,
     pub(crate) materialized_col_hidden: Option<&'a BTreeMap<u32, bool>>,
@@ -151,6 +220,73 @@ pub(crate) struct ChartReferenceContext<'a, 'input, 'session> {
     pub(crate) defined_names: &'a [DefinedName],
     pub(crate) number_formats: &'a ChartNumberFormatCache,
     pub(crate) session: &'session mut WorksheetReferenceSession,
+}
+
+/// Cells the cache may hold per load. A drawing prefetch stops queueing at
+/// it, and a whole-part index (below) is only kept while it fits.
+const MAX_CHART_SOURCE_STYLE_CELLS: usize = crate::worksheet_reference::MAX_TOTAL_REFERENCE_CELLS;
+
+/// First-cell style indices of chart source references, shared by every
+/// chart of one worksheet load. The first lookup that needs a source part
+/// queues the first cell of every formula in the drawing's charts, so each
+/// source worksheet is parsed once for all of them instead of once per axis
+/// or series. A later miss on an already parsed part (another drawing, or a
+/// prefetch stopped by the cap) indexes every cell of that part in one more
+/// parse, so further lookups never reparse it. Entries never exceed
+/// [`MAX_CHART_SOURCE_STYLE_CELLS`] plus the cells lookups demanded; only a
+/// part that cannot be indexed within that ceiling is parsed per new cell.
+#[derive(Default)]
+pub(crate) struct ChartSourceStyleCache {
+    prefetched_drawings: HashSet<String>,
+    pending: HashMap<String, HashSet<(u32, u32)>>,
+    resolved: HashMap<String, HashMap<(u32, u32), Option<u32>>>,
+    /// Parts already parsed once for queued cells.
+    parsed_parts: HashSet<String>,
+    /// Parts whose every `<c r>` is in `resolved`; an absent cell is `None`.
+    indexed_parts: HashSet<String>,
+    entries: usize,
+    #[cfg(test)]
+    cap: Option<usize>,
+    #[cfg(test)]
+    source_parts_parsed: usize,
+}
+
+impl ChartSourceStyleCache {
+    fn cap(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.cap {
+            return cap;
+        }
+        MAX_CHART_SOURCE_STYLE_CELLS
+    }
+
+    fn lookup(&self, part: &str, cell: (u32, u32)) -> Option<Option<u32>> {
+        if let Some(style) = self.resolved.get(part).and_then(|cells| cells.get(&cell)) {
+            return Some(*style);
+        }
+        self.indexed_parts.contains(part).then_some(None)
+    }
+
+    fn queue(&mut self, part: String, cell: (u32, u32)) {
+        if self.lookup(&part, cell).is_some() {
+            return;
+        }
+        if self.pending.entry(part).or_default().insert(cell) {
+            self.entries += 1;
+        }
+    }
+}
+
+/// The drawing whose charts a style prefetch scans for source formulas.
+struct ChartStylePrefetch<'a, 'input> {
+    drawing_doc: &'a roxmltree::Document<'input>,
+    drawing_path: &'a str,
+    drawing_rels: &'a HashMap<String, String>,
+}
+
+enum SourceStyleTarget {
+    Materialized { row: u32, col: u32 },
+    Part { part: String, cell: (u32, u32) },
 }
 
 struct XlsxChartReferenceResolver<'archive, 'data, 'input, 'session> {
@@ -165,6 +301,7 @@ struct XlsxChartReferenceResolver<'archive, 'data, 'input, 'session> {
     number_formats: &'data ChartNumberFormatCache,
     session: &'session mut WorksheetReferenceSession,
     visibility_cache: HashMap<String, Vec<bool>>,
+    style_prefetch: Option<ChartStylePrefetch<'data, 'data>>,
 }
 
 impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
@@ -184,56 +321,219 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
         Some((expanded, resolved))
     }
 
+    /// The last match wins: the worksheet parser orders this sheet's local
+    /// names after workbook names, so a local name shadows its global twin,
+    /// as in CF formulas and internal hyperlinks.
     fn expand_defined_name(&self, formula: &str) -> String {
         let trimmed = formula.trim();
         self.defined_names
             .iter()
+            .rev()
             .find(|defined| defined.name.eq_ignore_ascii_case(trimmed))
             .map(|defined| defined.formula.clone())
             .unwrap_or_else(|| trimmed.to_string())
     }
 
-    fn source_style_index(&mut self, formula: &str) -> Option<u32> {
+    fn source_style_target(&self, formula: &str) -> Option<SourceStyleTarget> {
         let (formula_sheet, reference) = split_sheet_ref(formula)?;
         let range = parse_a1_range(&reference)?;
         let target_sheet = formula_sheet.as_deref().unwrap_or(self.sheet_name);
-        if target_sheet.eq_ignore_ascii_case(self.sheet_name) {
-            if let Some(rows) = self.materialized_rows {
-                return rows
-                    .iter()
-                    .find(|row| row.index == range.top)
-                    .and_then(|row| {
-                        row.cells
-                            .iter()
-                            .find(|cell| cell.row == range.top && cell.col == range.left)
-                    })
-                    .map(|cell| cell.style_index.unwrap_or(0));
-            }
+        if target_sheet.eq_ignore_ascii_case(self.sheet_name) && self.materialized_rows.is_some() {
+            return Some(SourceStyleTarget::Materialized {
+                row: range.top,
+                col: range.left,
+            });
         }
-
         let sheet = self
             .sheets
             .iter()
             .find(|sheet| sheet.name.eq_ignore_ascii_case(target_sheet))?;
         let relative_path = resolve_sheet_path(self.workbook_rels, &sheet.r_id)?;
-        let part = format!("xl/{relative_path}");
-        let xml = read_zip_string(self.archive, &part).ok()?;
-        let document = parse_guarded(&xml).ok()?;
-        document
-            .descendants()
-            .find(|node| {
-                if !node.is_element() || node.tag_name().name() != "c" {
-                    return false;
+        Some(SourceStyleTarget::Part {
+            part: format!("xl/{relative_path}"),
+            cell: (range.top, range.left),
+        })
+    }
+
+    fn source_style_index(&mut self, formula: &str) -> Option<u32> {
+        match self.source_style_target(formula)? {
+            SourceStyleTarget::Materialized { row, col } => self
+                .materialized_rows?
+                .iter()
+                .find(|candidate| candidate.index == row)
+                .and_then(|candidate| {
+                    candidate
+                        .cells
+                        .iter()
+                        .find(|cell| cell.row == row && cell.col == col)
+                })
+                .map(|cell| cell.style_index.unwrap_or(0)),
+            SourceStyleTarget::Part { part, cell } => {
+                if let Some(style) = self.session.chart_source_styles.lookup(&part, cell) {
+                    return style;
                 }
-                node.attribute("r")
-                    .and_then(parse_a1_range)
-                    .is_some_and(|cell| cell.top == range.top && cell.left == range.left)
-            })
-            .map(|cell| {
-                cell.attribute("s")
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .unwrap_or(0)
-            })
+                let reparse = self
+                    .session
+                    .chart_source_styles
+                    .parsed_parts
+                    .contains(&part);
+                if !reparse {
+                    self.prefetch_drawing_source_cells();
+                }
+                self.session.chart_source_styles.queue(part.clone(), cell);
+                self.parse_source_styles(&part, reparse);
+                self.session
+                    .chart_source_styles
+                    .lookup(&part, cell)
+                    .flatten()
+            }
+        }
+    }
+
+    /// Queue the first cell of every formula in the drawing's charts. The
+    /// `<f>` superset covers every reference the shared chart parser can ask
+    /// a style for; extra cells only cost an entry in the same single pass.
+    /// Only chart parts the drawing loader itself reads and parses are
+    /// visited (same anchors, hidden frames skipped), each once.
+    fn prefetch_drawing_source_cells(&mut self) {
+        let Some(prefetch) = self.style_prefetch.as_ref() else {
+            return;
+        };
+        if !self
+            .session
+            .chart_source_styles
+            .prefetched_drawings
+            .insert(prefetch.drawing_path.to_string())
+        {
+            return;
+        }
+        let mut chart_parts = Vec::new();
+        let mut seen_parts = HashSet::new();
+        for anchor in prefetch
+            .drawing_doc
+            .root_element()
+            .children()
+            .filter(|node| is_chart_anchor(*node))
+        {
+            let mut graphic_frames = Vec::new();
+            collect_selected_graphic_frames(anchor, &mut graphic_frames);
+            for frame in graphic_frames {
+                if crate::drawing::xdr_node_hidden(&frame) {
+                    continue;
+                }
+                if let Some((path, _)) =
+                    graphic_frame_chart_part(frame, prefetch.drawing_rels, prefetch.drawing_path)
+                {
+                    if seen_parts.insert(path.clone()) {
+                        chart_parts.push(path);
+                    }
+                }
+            }
+        }
+        for chart_path in chart_parts {
+            let Ok(chart_xml) = read_zip_string(self.archive, &chart_path) else {
+                continue;
+            };
+            let Ok(chart_doc) = parse_guarded(&chart_xml) else {
+                continue;
+            };
+            for text in chart_doc
+                .descendants()
+                .filter(|node| node.is_element() && node.tag_name().name() == "f")
+                .filter_map(|node| node.text())
+            {
+                if self.session.chart_source_styles.entries
+                    >= self.session.chart_source_styles.cap()
+                {
+                    return;
+                }
+                let formula = self.expand_defined_name(text);
+                if let Some(SourceStyleTarget::Part { part, cell }) =
+                    self.source_style_target(&formula)
+                {
+                    self.session.chart_source_styles.queue(part, cell);
+                }
+            }
+        }
+    }
+
+    /// Resolve every queued cell of `part` in one parse. The first `<c>` whose
+    /// `r` names the cell wins; a missing cell or unreadable part stays `None`.
+    /// With `index_all`, every cell of the part is kept as long as the cache
+    /// stays within its cap, so the part is never parsed again this load.
+    fn parse_source_styles(&mut self, part: &str, index_all: bool) {
+        let cache = &mut self.session.chart_source_styles;
+        let Some(pending) = cache.pending.remove(part) else {
+            return;
+        };
+        cache.parsed_parts.insert(part.to_string());
+        let previous = cache.resolved.get(part).map_or(0, HashMap::len);
+        // Everything but this part's own entries, which a full index replaces.
+        let others = cache.entries - previous - pending.len();
+        let mut index_budget = index_all.then(|| cache.cap().saturating_sub(others));
+        #[cfg(test)]
+        {
+            cache.source_parts_parsed += 1;
+        }
+        let mut styles: HashMap<(u32, u32), Option<u32>> =
+            pending.iter().map(|cell| (*cell, None)).collect();
+        let mut index: HashMap<(u32, u32), Option<u32>> = HashMap::new();
+        let mut unresolved = pending;
+        let mut parsed = false;
+        if let Ok(xml) = read_zip_string(self.archive, part) {
+            if let Ok(document) = parse_guarded(&xml) {
+                parsed = true;
+                for node in document.descendants() {
+                    if unresolved.is_empty() && index_budget.is_none() {
+                        break;
+                    }
+                    if !node.is_element() || node.tag_name().name() != "c" {
+                        continue;
+                    }
+                    let Some(cell) = node
+                        .attribute("r")
+                        .and_then(parse_a1_range)
+                        .map(|cell| (cell.top, cell.left))
+                    else {
+                        continue;
+                    };
+                    let style = Some(
+                        node.attribute("s")
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .unwrap_or(0),
+                    );
+                    if unresolved.remove(&cell) {
+                        styles.insert(cell, style);
+                    }
+                    if let Some(budget) = index_budget {
+                        if !index.contains_key(&cell) {
+                            if index.len() < budget {
+                                index.insert(cell, style);
+                            } else {
+                                index_budget = None;
+                                index = HashMap::new();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let cache = &mut self.session.chart_source_styles;
+        if !parsed {
+            // Every cell of an unreadable part resolves to `None`.
+            index = HashMap::new();
+        }
+        if !parsed || index_budget.is_some() {
+            cache.entries = others + index.len();
+            cache.resolved.insert(part.to_string(), index);
+            cache.indexed_parts.insert(part.to_string());
+        } else {
+            cache
+                .resolved
+                .entry(part.to_string())
+                .or_default()
+                .extend(styles);
+        }
     }
 
     fn number_format_id_for_style(&mut self, style_index: u32) -> Option<u32> {
@@ -274,6 +574,10 @@ impl XlsxChartReferenceResolver<'_, '_, '_, '_> {
             38 => "#,##0 ;[Red](#,##0)",
             39 => "#,##0.00;(#,##0.00)",
             40 => "#,##0.00;[Red](#,##0.00)",
+            45 => "mm:ss",
+            46 => "[h]:mm:ss",
+            // MS-OE376 §2.1.739(a): Office's built-in 47 includes a colon.
+            47 => "mm:ss.0",
             48 => "##0.0E+0",
             49 => "@",
             _ => return None,
@@ -367,99 +671,6 @@ impl ooxml_common::chart::ChartReferenceResolver for XlsxChartReferenceResolver<
     }
 }
 
-/// Read the chartStyle part (`styleN.xml`) associated with a chart part at
-/// `chart_path` (e.g. `xl/charts/chart1.xml`), following that part's own
-/// relationships (`xl/charts/_rels/chart1.xml.rels`) to the
-/// Office 2011 or MS-ODRAWXML 2012 `chartStyle` target. Returns `None` when the chart
-/// has no chartStyle relationship or the part cannot be read (the chartEx
-/// title then falls back to its inline size, or the renderer's default).
-struct ChartRelatedParts {
-    style_xml: Option<String>,
-    color_style_xml: Option<String>,
-    image_relationships: ooxml_common::chart::ChartImageRelationships,
-}
-
-fn load_chart_related_parts(archive: &mut crate::XlsxZip, chart_path: &str) -> ChartRelatedParts {
-    let mut result = ChartRelatedParts {
-        style_xml: None,
-        color_style_xml: None,
-        image_relationships: Default::default(),
-    };
-    let rels_path = ooxml_common::rels::relationship_part_path(chart_path);
-    let Ok(rels_xml) = read_zip_string(archive, &rels_path) else {
-        return result;
-    };
-    let relationships = ooxml_common::rels::parse_rels(&rels_xml);
-    result.image_relationships.insert_parsed_relationships(
-        ooxml_common::chart::ChartImageSource::Chart,
-        chart_path,
-        &relationships,
-    );
-    let base_dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let internal_target = |suffix: &str| {
-        relationships.values().find(|relationship| {
-            relationship.mode == ooxml_common::rels::TargetMode::Internal
-                && relationship
-                    .relationship_type
-                    .as_deref()
-                    .is_some_and(|kind| kind.ends_with(suffix))
-        })
-    };
-    let style_relationship = relationships.values().find(|relationship| {
-        relationship.mode == ooxml_common::rels::TargetMode::Internal
-            && relationship
-                .relationship_type
-                .as_deref()
-                .is_some_and(ooxml_common::chart::is_chart_style_relationship_type)
-    });
-    if let Some(style_relationship) = style_relationship {
-        let style_path = ooxml_common::rels::resolve_target(base_dir, &style_relationship.target);
-        result.style_xml =
-            Some(read_zip_string(archive, &style_path).unwrap_or_else(|_| "\0".to_owned()));
-        let style_rels_path = ooxml_common::rels::relationship_part_path(&style_path);
-        if let Ok(style_rels_xml) = read_zip_string(archive, &style_rels_path) {
-            let style_relationships = ooxml_common::rels::parse_rels(&style_rels_xml);
-            result.image_relationships.insert_parsed_relationships(
-                ooxml_common::chart::ChartImageSource::Style,
-                &style_path,
-                &style_relationships,
-            );
-        }
-    }
-    if let Some(color_relationship) =
-        internal_target(ooxml_common::chart::CHART_COLOR_STYLE_REL_TYPE_SUFFIX)
-    {
-        let color_path = ooxml_common::rels::resolve_target(base_dir, &color_relationship.target);
-        result.color_style_xml =
-            Some(read_zip_string(archive, &color_path).unwrap_or_else(|_| "\0".to_owned()));
-    }
-    result
-}
-
-/// Follow the owning legacy chart's `<c:userShapes r:id>` relationship to its
-/// Chart Drawing part (`cdr:CT_Drawing`, ECMA-376 dml-chartDrawing.xsd).
-fn load_chart_user_shapes_xml(
-    archive: &mut crate::XlsxZip,
-    chart_path: &str,
-    chart_xml: &str,
-) -> Option<String> {
-    let chart_doc = parse_guarded(chart_xml).ok()?;
-    let rid = chart_doc
-        .root_element()
-        .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "userShapes")?
-        .attributes()
-        .find(|attribute| attribute.name() == "id" && is_r_ns(attribute.namespace()))?
-        .value()
-        .to_string();
-    let dir = chart_path.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let rels_path = ooxml_common::rels::relationship_part_path(chart_path);
-    let rels_xml = read_zip_string(archive, &rels_path).ok()?;
-    let target = parse_rels_map(&rels_xml).remove(&rid)?;
-    let user_shapes_path = resolve_zip_path(dir, &target);
-    read_zip_string(archive, &user_shapes_path).ok()
-}
-
 /// Given a sheet path (e.g. "worksheets/sheet1.xml"), locate and parse
 /// its drawing(s) for chart anchors (`<xdr:graphicFrame>` elements).
 #[cfg(test)]
@@ -483,6 +694,7 @@ pub(crate) fn load_sheet_charts(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn load_sheet_charts_with_theme_images(
     archive: &mut crate::XlsxZip,
     sheet_path: &str,
@@ -492,45 +704,55 @@ pub(crate) fn load_sheet_charts_with_theme_images(
     theme_format_scheme: Option<&ooxml_common::theme::ThemeFormatScheme>,
     theme_images: &ooxml_common::chart::ChartImageRelationships,
 ) -> Vec<ChartAnchor> {
-    let Some((sheet_dir, sheet_file)) = sheet_path.rsplit_once('/') else {
-        return Vec::new();
-    };
-    let sheet_rels_path = format!("xl/{}/_rels/{}.rels", sheet_dir, sheet_file);
-    let Ok(sheet_rels_xml) = read_zip_string(archive, &sheet_rels_path) else {
-        return Vec::new();
-    };
-    let Ok(rels_doc) = parse_guarded(&sheet_rels_xml) else {
-        return Vec::new();
-    };
+    let mut charts = Vec::new();
+    crate::drawing::for_each_sheet_drawing(archive, sheet_path, |archive, drawing| {
+        charts.extend(load_sheet_charts_observing_frames(
+            archive,
+            std::slice::from_ref(drawing),
+            reference_context
+                .as_mut()
+                .map(|context| ChartReferenceContext {
+                    materialized_rows: context.materialized_rows,
+                    materialized_col_hidden: context.materialized_col_hidden,
+                    sheet_name: context.sheet_name,
+                    sheets: context.sheets,
+                    workbook_rels: context.workbook_rels,
+                    shared_strings: context.shared_strings,
+                    defined_names: context.defined_names,
+                    number_formats: context.number_formats,
+                    session: context.session,
+                }),
+            theme_colors,
+            theme_fonts,
+            theme_format_scheme,
+            theme_images,
+            &mut false,
+        ));
+    });
+    charts
+}
 
-    // Collect all drawing relationship targets
-    let mut drawing_targets: Vec<String> = Vec::new();
-    for rel in rels_doc
-        .root_element()
-        .children()
-        .filter(|n| n.is_element())
-    {
-        if rel.attribute("Type").unwrap_or("").ends_with("/drawing") {
-            if let Some(t) = rel.attribute("Target") {
-                drawing_targets.push(t.to_string());
-            }
-        }
-    }
-    if drawing_targets.is_empty() {
-        return Vec::new();
-    }
-
+/// Load a sheet's drawing chart anchors and report whether any drawing anchor
+/// carried a graphic frame. Without one, the result is empty for every
+/// reference context, so a caller may reuse it for the same sheet part.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_sheet_charts_observing_frames(
+    archive: &mut crate::XlsxZip,
+    drawings: &[crate::drawing::ParsedSheetDrawing<'_>],
+    mut reference_context: Option<ChartReferenceContext<'_, '_, '_>>,
+    theme_colors: &[String],
+    theme_fonts: (Option<&str>, Option<&str>),
+    theme_format_scheme: Option<&ooxml_common::theme::ThemeFormatScheme>,
+    theme_images: &ooxml_common::chart::ChartImageRelationships,
+    saw_graphic_frame: &mut bool,
+) -> Vec<ChartAnchor> {
     let mut all_charts: Vec<ChartAnchor> = Vec::new();
 
-    for target in drawing_targets {
-        // Resolve drawing path relative to the sheet directory
-        let drawing_path = resolve_zip_path(&format!("xl/{}", sheet_dir), &target);
-        let Ok(drawing_xml) = read_zip_string(archive, &drawing_path) else {
+    for drawing in drawings {
+        let Some(draw_doc) = &drawing.doc else {
             continue;
         };
-        let Ok(draw_doc) = parse_guarded(&drawing_xml) else {
-            continue;
-        };
+        let drawing_path = drawing.path;
 
         // Load drawing rels (to resolve chart rIds)
         let Some((drawing_dir, drawing_file)) = drawing_path.rsplit_once('/') else {
@@ -548,19 +770,18 @@ pub(crate) fn load_sheet_charts_with_theme_images(
         // size, ECMA-376 §20.5.2.24), or `<xdr:absoluteAnchor>` (absolute
         // `<xdr:pos x y>` + extent, §20.5.2.1; the normal chart-sheet form).
         // All three must produce the same bounded ChartAnchor wire shape.
+        let mut chart_anchor_ordinal = 0usize;
         for anchor in draw_doc
             .root_element()
             .children()
             .filter(|n| n.is_element())
         {
+            if !is_chart_anchor(anchor) {
+                continue;
+            }
             let anchor_tag = anchor.tag_name().name();
             let is_one_cell = anchor_tag == "oneCellAnchor";
             let is_absolute = anchor_tag == "absoluteAnchor";
-            if (anchor_tag != "twoCellAnchor" && !is_one_cell && !is_absolute)
-                || !is_xdr_ns(anchor.tag_name().namespace())
-            {
-                continue;
-            }
 
             let (mut from_col, mut from_col_off, mut from_row, mut from_row_off) =
                 (0u32, 0i64, 0u32, 0i64);
@@ -656,49 +877,21 @@ pub(crate) fn load_sheet_charts_with_theme_images(
             // recurse through groups without ever visiting its Fallback.
             let mut graphic_frames = Vec::new();
             collect_selected_graphic_frames(anchor, &mut graphic_frames);
+            *saw_graphic_frame |= !graphic_frames.is_empty();
             for graphic_frame in graphic_frames {
+                let retention_site = format!("anchor:{chart_anchor_ordinal}");
+                chart_anchor_ordinal = chart_anchor_ordinal.saturating_add(1);
                 // ECMA-376 §20.1.2.2.8 CT_NonVisualDrawingProps@hidden: a hidden
                 // chart's own graphicFrame is not rendered.
                 if crate::drawing::xdr_node_hidden(&graphic_frame) {
                     continue;
                 }
 
-                // `<a:graphicData uri>` and its child namespace distinguish modern
-                // `<cx:chart>` from legacy `<c:chart>`.
-                let Some(graphic_data) = graphic_frame
-                    .descendants()
-                    .find(|n| n.is_element() && n.tag_name().name() == "graphicData")
+                let Some((chart_path, is_chartex)) =
+                    graphic_frame_chart_part(graphic_frame, &drawing_rels, drawing_path)
                 else {
                     continue;
                 };
-                let is_chartex = graphic_data
-                    .attribute("uri")
-                    .is_some_and(|uri| uri == CHARTEX_NS);
-                let chart_rid = graphic_data
-                    .descendants()
-                    .find(|n| {
-                        n.is_element()
-                            && n.tag_name().name() == "chart"
-                            && if is_chartex {
-                                n.tag_name().namespace() == Some(CHARTEX_NS)
-                            } else {
-                                is_c_ns(n.tag_name().namespace())
-                            }
-                    })
-                    .and_then(|chart| {
-                        chart
-                            .attributes()
-                            .find(|a| a.name() == "id" && is_r_ns(a.namespace()))
-                            .map(|a| a.value().to_string())
-                    });
-
-                let Some(rid) = chart_rid else {
-                    continue;
-                };
-                let Some(chart_target) = drawing_rels.get(&rid) else {
-                    continue;
-                };
-                let chart_path = resolve_zip_path(drawing_dir, chart_target);
                 let Ok(chart_xml) = read_zip_string(archive, &chart_path) else {
                     continue;
                 };
@@ -708,7 +901,36 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                 // Office 2011 / MS-ODRAWXML 2012 `chartStyle`). Read it best-effort now
                 // (before the chart doc is parsed, since both borrow `archive`);
                 // legacy `<c:>` charts ignore it (their title size is inline).
-                let related_parts = load_chart_related_parts(archive, &chart_path);
+                let related_parts = ooxml_common::chart::load_chart_related_parts(
+                    |part| read_zip_string(archive, part).ok(),
+                    &chart_path,
+                );
+                // CT_BaseStylesOverride (§20.1.6.12) is chart-local: only
+                // present schemes replace the workbook's inherited schemes.
+                let schemes = related_parts
+                    .theme_override_xml
+                    .as_deref()
+                    .map(ooxml_common::theme::ThemeOverride::parse)
+                    .unwrap_or_default();
+                let local_colors = schemes.colors.as_ref().map(|colors| {
+                    colors
+                        .slots_in_order()
+                        .map(|hex| hex.map(|hex| format!("#{hex}")).unwrap_or_default())
+                        .to_vec()
+                });
+                let theme_colors = local_colors.as_deref().unwrap_or(theme_colors);
+                let theme_fonts = schemes
+                    .fonts
+                    .as_ref()
+                    .map(|fonts| (fonts.major.latin.as_deref(), fonts.minor.latin.as_deref()))
+                    .unwrap_or(theme_fonts);
+                let theme_format_scheme = schemes.format.as_ref().or(theme_format_scheme);
+                let empty_theme_images = ooxml_common::chart::ChartImageRelationships::default();
+                let theme_images = if schemes.format.is_some() {
+                    &empty_theme_images
+                } else {
+                    theme_images
+                };
                 let image_resolver = ooxml_common::chart::ChartImageResolverChain::new(
                     &related_parts.image_relationships,
                     theme_images,
@@ -716,7 +938,13 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                 let user_shapes_xml = if is_chartex {
                     None
                 } else {
-                    load_chart_user_shapes_xml(archive, &chart_path, &chart_xml)
+                    parse_guarded(&chart_xml).ok().and_then(|chart_doc| {
+                        ooxml_common::chart::load_chart_user_shapes_xml(
+                            |part| read_zip_string(archive, part).ok(),
+                            &chart_path,
+                            &chart_doc,
+                        )
+                    })
                 };
                 // Parse the chart directly through the shared `parse_chart_part`
                 // (the single superset parser for pptx + xlsx). The xlsx theme
@@ -737,55 +965,55 @@ pub(crate) fn load_sheet_charts_with_theme_images(
                     theme_minor_font_latin: theme_fonts.1,
                     theme_format_scheme,
                 };
-                let chart_opt = if let Some(context) = reference_context.as_mut() {
-                    let mut references = XlsxChartReferenceResolver {
-                        archive,
-                        materialized_rows: context.materialized_rows,
-                        materialized_col_hidden: context.materialized_col_hidden,
-                        sheet_name: context.sheet_name,
-                        sheets: context.sheets,
-                        workbook_rels: context.workbook_rels,
-                        shared_strings: context.shared_strings,
-                        defined_names: context.defined_names,
-                        number_formats: context.number_formats,
-                        session: context.session,
-                        visibility_cache: HashMap::new(),
-                    };
-                    if is_chartex {
-                        ooxml_common::chart::parse_chartex_part_with_references_style_parts_and_images(
-                            chart_doc.root_element(),
-                            &resolver,
-                            related_parts.style_xml.as_deref(),
-                            related_parts.color_style_xml.as_deref(),
-                            &mut references,
-                            &image_resolver,
-                        )
-                    } else {
-                        ooxml_common::chart::parse_chart_part_with_references_style_parts_and_images(
-                            chart_doc.root_element(),
-                            &resolver,
-                            related_parts.style_xml.as_deref(),
-                            related_parts.color_style_xml.as_deref(),
-                            &mut references,
-                            &image_resolver,
-                        )
-                    }
-                } else if is_chartex {
-                    ooxml_common::chart::parse_chartex_part_with_style_parts_and_images(
+                let Ok(reporter) = archive
+                    .operation()
+                    .and_then(|operation| operation.limit_reporter())
+                else {
+                    continue;
+                };
+                let mut references =
+                    reference_context
+                        .as_mut()
+                        .map(|context| XlsxChartReferenceResolver {
+                            archive,
+                            materialized_rows: context.materialized_rows,
+                            materialized_col_hidden: context.materialized_col_hidden,
+                            sheet_name: context.sheet_name,
+                            sheets: context.sheets,
+                            workbook_rels: context.workbook_rels,
+                            shared_strings: context.shared_strings,
+                            defined_names: context.defined_names,
+                            number_formats: context.number_formats,
+                            session: context.session,
+                            visibility_cache: HashMap::new(),
+                            style_prefetch: Some(ChartStylePrefetch {
+                                drawing_doc: draw_doc,
+                                drawing_path,
+                                drawing_rels: &drawing_rels,
+                            }),
+                        });
+                let mut chart_context = ooxml_common::chart::ChartParseContext::new(
+                    &resolver,
+                    related_parts.style_xml.as_deref(),
+                    related_parts.color_style_xml.as_deref(),
+                    Some(&image_resolver),
+                    references.as_mut().map(|resolver| {
+                        resolver as &mut dyn ooxml_common::chart::ChartReferenceResolver
+                    }),
+                );
+                chart_context.limit_reporter = Some(&reporter);
+                chart_context.retention_key = Some(ooxml_common::chart::ChartRetentionKey {
+                    source_part: drawing_path,
+                    site: &retention_site,
+                });
+                chart_context.host = ooxml_common::chart::ChartHost::Excel;
+                let chart_opt = if is_chartex {
+                    ooxml_common::chart::parse_chartex_part(
                         chart_doc.root_element(),
-                        &resolver,
-                        related_parts.style_xml.as_deref(),
-                        related_parts.color_style_xml.as_deref(),
-                        &image_resolver,
+                        &chart_context,
                     )
                 } else {
-                    ooxml_common::chart::parse_chart_part_with_style_parts_and_images(
-                        chart_doc.root_element(),
-                        &resolver,
-                        related_parts.style_xml.as_deref(),
-                        related_parts.color_style_xml.as_deref(),
-                        &image_resolver,
-                    )
+                    ooxml_common::chart::parse_chart_part(chart_doc.root_element(), &chart_context)
                 };
                 let Some(mut chart) = chart_opt else {
                     continue;
@@ -1057,8 +1285,14 @@ mod solid_fill_color_tests {
             );
             {
                 let document = Document::parse(&xml).expect("chart XML");
-                ooxml_common::chart::parse_chart_part(document.root_element(), &resolver)
-                    .expect("Excel chart")
+                ooxml_common::chart::parse_chart_part(
+                    document.root_element(),
+                    &ooxml_common::chart::ChartParseContext {
+                        color_resolver: Some(&resolver),
+                        ..Default::default()
+                    },
+                )
+                .expect("Excel chart")
             }
         };
         let chart = parse(2);
@@ -1142,7 +1376,14 @@ mod solid_fill_color_tests {
             theme_minor_font_latin: None,
             theme_format_scheme: None,
         };
-        let chart = ooxml_common::chart::parse_chart_part(doc.root_element(), &resolver).unwrap();
+        let chart = ooxml_common::chart::parse_chart_part(
+            doc.root_element(),
+            &ooxml_common::chart::ChartParseContext {
+                color_resolver: Some(&resolver),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(chart.series[0].color.as_deref(), Some("A6A6A6"));
     }
 
@@ -1173,8 +1414,14 @@ mod solid_fill_color_tests {
         };
         let doc = Document::parse(&xml).expect("chartSpace fixture");
 
-        let chart = ooxml_common::chart::parse_chart_part(doc.root_element(), &resolver)
-            .expect("chart should parse");
+        let chart = ooxml_common::chart::parse_chart_part(
+            doc.root_element(),
+            &ooxml_common::chart::ChartParseContext {
+                color_resolver: Some(&resolver),
+                ..Default::default()
+            },
+        )
+        .expect("chart should parse");
 
         assert_eq!(chart.series[0].color.as_deref(), Some("00AA00"));
     }
@@ -1199,8 +1446,14 @@ mod solid_fill_color_tests {
             theme_format_scheme: None,
         };
         let doc = Document::parse(&xml).expect("chartSpace fixture");
-        let chart = ooxml_common::chart::parse_chart_part(doc.root_element(), &resolver)
-            .expect("chart should parse");
+        let chart = ooxml_common::chart::parse_chart_part(
+            doc.root_element(),
+            &ooxml_common::chart::ChartParseContext {
+                color_resolver: Some(&resolver),
+                ..Default::default()
+            },
+        )
+        .expect("chart should parse");
         let series = &chart.series[0];
         assert_eq!(series.invert_if_negative, None);
         assert_eq!(series.automatic_negative_style, Some(true));
@@ -1512,6 +1765,57 @@ mod worksheet_reference_tests {
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
+    #[test]
+    fn chart_number_format_overflow_is_a_resource_diagnostic() {
+        for (body, resource) in [
+            (
+                format!(
+                    "<cellXfs>{}</cellXfs>",
+                    "<xf/>".repeat(MAX_CHART_STYLE_FORMATS + 1)
+                ),
+                "chart-style-formats",
+            ),
+            (
+                format!(
+                    "<numFmts>{}</numFmts>",
+                    "<numFmt numFmtId=\"164\" formatCode=\"0\"/>"
+                        .repeat(MAX_CHART_CUSTOM_NUMBER_FORMATS + 1)
+                ),
+                "chart-custom-number-formats",
+            ),
+            (
+                format!(
+                    "<numFmts><numFmt numFmtId=\"164\" formatCode=\"{}\"/></numFmts>",
+                    "0".repeat(MAX_CHART_NUMBER_FORMAT_BYTES + 1)
+                ),
+                "chart-number-format-bytes",
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+                writer
+                    .start_file("xl/styles.xml", SimpleFileOptions::default())
+                    .unwrap();
+                write!(writer, "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">{body}</styleSheet>").unwrap();
+                crate::write_test_content_types(&mut writer);
+                writer.finish().unwrap();
+            }
+            let mut archive = crate::XlsxZip::new(Cursor::new(bytes)).unwrap();
+            // Projections are the path most vulnerable to accidentally swallowing
+            // a style failure and substituting the default number format.
+            let error = crate::styles::parse_style_projection(&mut archive)
+                .err()
+                .expect("overflow must not return a truncated cache");
+            let envelope: serde_json::Value =
+                serde_json::from_str(error.strip_prefix("OOXML_RESOURCE_LIMIT:").expect(&error))
+                    .unwrap();
+            assert_eq!(envelope["details"]["violation"]["resource"], resource);
+            assert_eq!(envelope["details"]["violation"]["configurable"], false);
+            assert!(archive.session.assert_healthy().is_err());
+        }
+    }
+
     const DATA_XML: &str = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="C1" t="inlineStr"><is><t>المبيعات</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>أحمد</t></is></c><c r="C2" s="1"><v>5000</v></c><c r="D2"><v>10</v></c><c r="E2"><v>3</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>سارة</t></is></c><c r="C3" s="1"><v>6200</v></c><c r="D3"><v>20</v></c><c r="E3"><v>5</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>خالد</t></is></c><c r="C4" s="1"><v>7500</v></c><c r="D4"><v>30</v></c><c r="E4"><v>7</v></c></row></sheetData></worksheet>"#;
 
     fn chart_xml(with_cache: bool) -> String {
@@ -1571,6 +1875,386 @@ mod worksheet_reference_tests {
 
     fn archive_with_chart_and_data(chart_xml: &str) -> crate::XlsxZip {
         archive_with_chart_and_custom_data(chart_xml, DATA_XML)
+    }
+
+    /// The per-cell lookup this cache replaced (#1971): a full parse of the
+    /// source part for every reference. Kept as the parity oracle.
+    fn reparsed_source_style_index(sheet_xml: &str, row: u32, col: u32) -> Option<u32> {
+        let document = parse_guarded(sheet_xml).ok()?;
+        document
+            .descendants()
+            .find(|node| {
+                node.is_element()
+                    && node.tag_name().name() == "c"
+                    && node
+                        .attribute("r")
+                        .and_then(parse_a1_range)
+                        .is_some_and(|cell| cell.top == row && cell.left == col)
+            })
+            .map(|cell| {
+                cell.attribute("s")
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0)
+            })
+    }
+
+    // Styled, unstyled, explicit-zero, missing, duplicate, range-shaped,
+    // out-of-sheetData and invalid `s` first cells, plus unrelated filler.
+    const STYLE_EDGE_DATA_XML: &str = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="2"><c r="A2" s="2"><v>1</v></c><c r="B2" s="0"><v>2</v></c><c r="C2"><v>3</v></c><c r="E2" s="1"/><c r="E2" s="2"><v>9</v></c><c r="F2:F3" s="1"><v>4</v></c><c r="G2" s="x"><v>5</v></c><c r="H2" s="9"><v>6</v></c></row><row r="3"><c r="A3" s="1"><v>7</v></c></row><row r="40"><c r="K40" s="2"><v>0</v></c><c r="L40"><v>1</v></c></row></sheetData><extLst><ext><c r="I2" s="2"/></ext></extLst></worksheet>"#;
+
+    const STYLE_EDGE_FORMULAS: [&str; 11] = [
+        "'التقرير'!$A$2:$A$4",
+        "'التقرير'!B2:B4",
+        "'التقرير'!C2",
+        "'التقرير'!D2:D4",
+        "'التقرير'!E2:E4",
+        "'التقرير'!F2:F4",
+        "'التقرير'!G2:G4",
+        "'التقرير'!H2:H4",
+        "'التقرير'!I2:I4",
+        "'التقرير'!A3:A4",
+        "Missing!A2:A4",
+    ];
+
+    fn multi_chart_archive(chart_xmls: &[String], data_xml: &str) -> crate::XlsxZip {
+        let charts: Vec<(String, bool)> = chart_xmls
+            .iter()
+            .map(|chart_xml| (chart_xml.clone(), false))
+            .collect();
+        multi_chart_archive_with(&charts, data_xml, 1)
+    }
+
+    /// `charts` pairs each chart part with whether its frame is hidden; the
+    /// sheet lists the one drawing through `drawing_rels` relationships.
+    fn multi_chart_archive_with(
+        charts: &[(String, bool)],
+        data_xml: &str,
+        drawing_rels: usize,
+    ) -> crate::XlsxZip {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = SimpleFileOptions::default();
+            writer
+                .start_file("xl/worksheets/_rels/sheet1.xml.rels", options)
+                .unwrap();
+            let sheet_rels: String = (0..drawing_rels)
+                .map(|index| format!(r#"<Relationship Id="rDrawing{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>"#))
+                .collect();
+            write!(writer, r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{sheet_rels}</Relationships>"#).unwrap();
+            let anchors: String = charts
+                .iter()
+                .enumerate()
+                .map(|(index, (_, hidden))| format!(r#"<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{index}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="{}" name="Chart" hidden="{}"/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rChart{index}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"#, index + 1, index + 1, u8::from(*hidden)))
+                .collect();
+            writer
+                .start_file("xl/drawings/drawing1.xml", options)
+                .unwrap();
+            write!(writer, r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{anchors}</xdr:wsDr>"#).unwrap();
+            let rels: String = (0..charts.len())
+                .map(|index| format!(r#"<Relationship Id="rChart{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{index}.xml"/>"#))
+                .collect();
+            writer
+                .start_file("xl/drawings/_rels/drawing1.xml.rels", options)
+                .unwrap();
+            write!(writer, r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#).unwrap();
+            for (index, (chart_xml, _)) in charts.iter().enumerate() {
+                writer
+                    .start_file(format!("xl/charts/chart{index}.xml"), options)
+                    .unwrap();
+                writer.write_all(chart_xml.as_bytes()).unwrap();
+            }
+            writer
+                .start_file("xl/worksheets/sheet2.xml", options)
+                .unwrap();
+            writer.write_all(data_xml.as_bytes()).unwrap();
+            writer.start_file("xl/styles.xml", options).unwrap();
+            writer.write_all(br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="3"/><xf numFmtId="10"/></cellXfs></styleSheet>"#).unwrap();
+            crate::write_test_content_types(&mut writer);
+            writer.finish().unwrap();
+        }
+        crate::XlsxZip::new(Cursor::new(bytes)).unwrap()
+    }
+
+    /// A column chart whose series cover `formulas` as categories/values, with
+    /// source-linked axes (no `sourceLinked`), as XlsxWriter writes them.
+    fn column_chart_xml(formulas: &[&str]) -> String {
+        let series: String = formulas
+            .chunks(2)
+            .enumerate()
+            .map(|(index, pair)| {
+                let category = pair[0];
+                let value = pair.get(1).copied().unwrap_or(category);
+                format!(r#"<c:ser><c:idx val="{index}"/><c:order val="{index}"/><c:cat><c:numRef><c:f>{category}</c:f></c:numRef></c:cat><c:val><c:numRef><c:f>{value}</c:f></c:numRef></c:val></c:ser>"#)
+            })
+            .collect();
+        format!(
+            r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>{series}<c:axId val="1"/><c:axId val="2"/></c:barChart><c:catAx><c:axId val="1"/><c:numFmt formatCode="General"/><c:crossAx val="2"/></c:catAx><c:valAx><c:axId val="2"/><c:numFmt formatCode="General"/><c:crossAx val="1"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#
+        )
+    }
+
+    fn load_charts_with_session(
+        archive: &mut crate::XlsxZip,
+        session: &mut WorksheetReferenceSession,
+        number_formats: &ChartNumberFormatCache,
+    ) -> Vec<ChartAnchor> {
+        let rels = parse_guarded(workbook_rels_xml()).unwrap();
+        let sheet_metas = sheets();
+        let theme = vec!["#4472C4".into(); 12];
+        session.seed_current_sheet("Dashboard", None);
+        load_sheet_charts(
+            archive,
+            "worksheets/sheet1.xml",
+            Some(ChartReferenceContext {
+                materialized_rows: None,
+                materialized_col_hidden: None,
+                sheet_name: "Dashboard",
+                sheets: &sheet_metas,
+                workbook_rels: &rels,
+                shared_strings: &[],
+                defined_names: &[],
+                number_formats,
+                session,
+            }),
+            &theme,
+            (None, None),
+            None,
+        )
+    }
+
+    fn assert_style_parity(
+        archive: &mut crate::XlsxZip,
+        session: &mut WorksheetReferenceSession,
+        number_formats: &ChartNumberFormatCache,
+        data_xml: &str,
+    ) {
+        let rels = parse_guarded(workbook_rels_xml()).unwrap();
+        let sheet_metas = sheets();
+        let mut resolver = XlsxChartReferenceResolver {
+            archive,
+            materialized_rows: None,
+            materialized_col_hidden: None,
+            sheet_name: "Dashboard",
+            sheets: &sheet_metas,
+            workbook_rels: &rels,
+            shared_strings: &[],
+            defined_names: &[],
+            number_formats,
+            session,
+            visibility_cache: HashMap::new(),
+            style_prefetch: None,
+        };
+        for formula in STYLE_EDGE_FORMULAS {
+            let (sheet, reference) = split_sheet_ref(formula).unwrap();
+            let range = parse_a1_range(&reference).unwrap();
+            let expected = (sheet.as_deref() == Some("التقرير"))
+                .then(|| reparsed_source_style_index(data_xml, range.top, range.left))
+                .flatten();
+            assert_eq!(resolver.source_style_index(formula), expected, "{formula}");
+            assert_eq!(
+                ooxml_common::chart::ChartReferenceResolver::resolve_number_format_id(
+                    &mut resolver,
+                    formula,
+                ),
+                expected.and_then(|style| number_formats
+                    .style_num_fmt_ids
+                    .get(style as usize)
+                    .copied()
+                    .flatten()),
+                "{formula}",
+            );
+        }
+    }
+
+    #[test]
+    fn chart_source_styles_parse_each_source_part_once_per_load() {
+        // #1971: 24 charts × (3 series + 2 source-linked axes), each with its
+        // own first cells, over a source sheet with unrelated filler rows.
+        let filler: String = (100..2100)
+            .map(|row| format!(r#"<row r="{row}"><c r="K{row}" s="1"><v>{row}</v></c></row>"#))
+            .collect();
+        let data_xml =
+            STYLE_EDGE_DATA_XML.replace("</sheetData>", &format!("{filler}</sheetData>"));
+        let chart_xmls: Vec<String> = (0..24)
+            .map(|chart| {
+                let rotated: Vec<&str> = STYLE_EDGE_FORMULAS
+                    .iter()
+                    .cycle()
+                    .skip(chart)
+                    .take(6)
+                    .copied()
+                    .collect();
+                column_chart_xml(&rotated)
+            })
+            .collect();
+        let mut archive = multi_chart_archive(&chart_xmls, &data_xml);
+        let theme = vec!["#4472C4".into(); 12];
+        let styles = crate::styles::parse_styles(&mut archive, &theme).expect("styles");
+        let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+        let mut session = WorksheetReferenceSession::default();
+        let charts = load_charts_with_session(&mut archive, &mut session, &number_formats);
+        assert_eq!(charts.len(), 24);
+        // The data sheet is the only source part; it is parsed once, not once
+        // per axis/series reference.
+        assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
+        // That single pass resolved every formula of every chart.
+        assert_style_parity(&mut archive, &mut session, &number_formats, &data_xml);
+        assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
+    }
+
+    #[test]
+    fn chart_source_style_prefetch_skips_parts_the_loader_skips() {
+        // A hidden frame's chart part is never parsed by the loader; the
+        // prefetch must not parse it either, or its nesting-depth refusal
+        // would reject a package that loads today.
+        let deep = format!(
+            "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:f>'التقرير'!H2</c:f>{}{}</c:chartSpace>",
+            "<c:x>".repeat(400),
+            "</c:x>".repeat(400)
+        );
+        let charts = vec![
+            (column_chart_xml(&STYLE_EDGE_FORMULAS[..4]), false),
+            (deep, true),
+        ];
+        let mut archive = multi_chart_archive_with(&charts, STYLE_EDGE_DATA_XML, 1);
+        let mut session = WorksheetReferenceSession::default();
+        let loaded = archive
+            .run_operation("parse-sheet", |archive| {
+                let theme = vec!["#4472C4".into(); 12];
+                let styles = crate::styles::parse_styles(archive, &theme)?;
+                let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+                Ok(load_charts_with_session(
+                    archive,
+                    &mut session,
+                    &number_formats,
+                ))
+            })
+            .expect("the loader never parses the hidden chart part");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
+        assert!(archive.assert_healthy().is_ok());
+        let hidden_cell = (2, 8);
+        assert!(!session
+            .chart_source_styles
+            .resolved
+            .values()
+            .any(|cells| cells.contains_key(&hidden_cell)));
+    }
+
+    #[test]
+    fn chart_source_styles_survive_repeated_drawing_relationships() {
+        // Repeated `/drawing` targets reload the same charts; their lookups
+        // reuse the first visit's pass instead of reparsing the source part.
+        let charts = vec![(column_chart_xml(&STYLE_EDGE_FORMULAS), false)];
+        let mut archive = multi_chart_archive_with(&charts, STYLE_EDGE_DATA_XML, 3);
+        let theme = vec!["#4472C4".into(); 12];
+        let styles = crate::styles::parse_styles(&mut archive, &theme).expect("styles");
+        let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+        let mut session = WorksheetReferenceSession::default();
+        let loaded = load_charts_with_session(&mut archive, &mut session, &number_formats);
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(session.chart_source_styles.source_parts_parsed, 1);
+    }
+
+    fn capped_chart_load(cap: usize, extra_rows: std::ops::Range<u32>) -> Vec<String> {
+        // Formulas beyond the cap: the prefetch stops early and later charts
+        // demand cells it never queued.
+        let extra: Vec<String> = extra_rows
+            .map(|row| format!("'التقرير'!Z{row}:Z{}", row + 2))
+            .collect();
+        let mut formulas: Vec<String> = extra.clone();
+        formulas.extend(
+            STYLE_EDGE_FORMULAS
+                .iter()
+                .map(|formula| formula.to_string()),
+        );
+        let charts: Vec<(String, bool)> = formulas
+            .chunks(4)
+            .map(|chunk| {
+                let chunk: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                (column_chart_xml(&chunk), false)
+            })
+            .collect();
+        let mut archive = multi_chart_archive_with(&charts, STYLE_EDGE_DATA_XML, 1);
+        let theme = vec!["#4472C4".into(); 12];
+        let styles = crate::styles::parse_styles(&mut archive, &theme).expect("styles");
+        let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+        let mut session = WorksheetReferenceSession::default();
+        session.chart_source_styles.cap = Some(cap);
+        load_charts_with_session(&mut archive, &mut session, &number_formats);
+        let parsed_after_load = session.chart_source_styles.source_parts_parsed;
+        assert_style_parity(
+            &mut archive,
+            &mut session,
+            &number_formats,
+            STYLE_EDGE_DATA_XML,
+        );
+        let rels = parse_guarded(workbook_rels_xml()).unwrap();
+        let sheet_metas = sheets();
+        let mut resolver = XlsxChartReferenceResolver {
+            archive: &mut archive,
+            materialized_rows: None,
+            materialized_col_hidden: None,
+            sheet_name: "Dashboard",
+            sheets: &sheet_metas,
+            workbook_rels: &rels,
+            shared_strings: &[],
+            defined_names: &[],
+            number_formats: &number_formats,
+            session: &mut session,
+            visibility_cache: HashMap::new(),
+            style_prefetch: None,
+        };
+        for formula in &extra {
+            assert_eq!(resolver.source_style_index(formula), None, "{formula}");
+        }
+        let cache = &session.chart_source_styles;
+        vec![
+            format!("after-load:{parsed_after_load}"),
+            format!("total:{}", cache.source_parts_parsed),
+            format!("indexed:{}", cache.indexed_parts.len()),
+            format!(
+                "within-cap:{}",
+                cache.entries <= cap.max(1) + extra.len() + 11
+            ),
+        ]
+    }
+
+    #[test]
+    fn chart_source_styles_index_a_part_once_when_the_prefetch_cap_is_reached() {
+        // 20 missing cells queue first and exhaust a cap of 15; the first
+        // demanded cell beyond them indexes all 11 data cells in one more
+        // parse, after which no lookup reparses the part.
+        assert_eq!(
+            capped_chart_load(15, 100..120),
+            ["after-load:2", "total:2", "indexed:1", "within-cap:true"],
+        );
+    }
+
+    #[test]
+    fn chart_source_styles_keep_answers_when_no_index_fits_the_cap() {
+        // At the memory ceiling the cache trades parses for entries, but the
+        // answers still match the per-reference parse.
+        let report = capped_chart_load(2, 100..104);
+        assert_eq!(report[2], "indexed:0");
+    }
+
+    #[test]
+    fn chart_source_styles_match_the_per_reference_parse() {
+        // Without a drawing prefetch every miss parses once more; the answers
+        // must equal the original per-reference parse in every edge case.
+        let mut archive = multi_chart_archive(&[], STYLE_EDGE_DATA_XML);
+        let theme = vec!["#4472C4".into(); 12];
+        let styles = crate::styles::parse_styles(&mut archive, &theme).expect("styles");
+        let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+        let mut session = WorksheetReferenceSession::default();
+        session.seed_current_sheet("Dashboard", None);
+        assert_style_parity(
+            &mut archive,
+            &mut session,
+            &number_formats,
+            STYLE_EDGE_DATA_XML,
+        );
     }
 
     fn sheets() -> Vec<SheetMeta> {
@@ -1717,13 +2401,69 @@ mod worksheet_reference_tests {
 
     #[test]
     fn chart_reference_resolves_source_linked_builtin_number_format() {
+        for (id, expected) in [
+            (3, "#,##0"),
+            (45, "mm:ss"),
+            (46, "[h]:mm:ss"),
+            (47, "mm:ss.0"),
+        ] {
+            let mut archive = archive_with_chart_and_data(&chart_xml(false));
+            let rels = parse_guarded(workbook_rels_xml()).unwrap();
+            let sheet_metas = sheets();
+            let mut session = WorksheetReferenceSession::default();
+            let theme = vec!["#4472C4".into(); 12];
+            let styles = crate::styles::parse_styles(&mut archive, &theme)
+                .expect("styles parse for chart references");
+            let mut number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
+            // The fixture's numeric references use XF 1; retain its source lookup
+            // and substitute each built-in ID without adding a custom numFmt.
+            number_formats.style_num_fmt_ids[1] = Some(id);
+            session.seed_current_sheet("Dashboard", None);
+            let mut resolver = XlsxChartReferenceResolver {
+                archive: &mut archive,
+                materialized_rows: None,
+                materialized_col_hidden: None,
+                sheet_name: "Dashboard",
+                sheets: &sheet_metas,
+                workbook_rels: &rels,
+                shared_strings: &[],
+                defined_names: &[],
+                number_formats: &number_formats,
+                session: &mut session,
+                visibility_cache: HashMap::new(),
+                style_prefetch: None,
+            };
+            assert_eq!(
+                ooxml_common::chart::ChartReferenceResolver::resolve_number_format(
+                    &mut resolver,
+                    "'التقرير'!$C$2:$C$4",
+                )
+                .as_deref(),
+                Some(expected),
+            );
+            assert_eq!(
+                ooxml_common::chart::ChartReferenceResolver::resolve_number_format_id(
+                    &mut resolver,
+                    "'التقرير'!$C$2:$C$4",
+                ),
+                Some(id),
+            );
+        }
+    }
+
+    #[test]
+    fn chart_reference_names_prefer_current_sheet_local_over_workbook_name() {
+        // `Rate` is global before its local twin, `Tax` after it; the other
+        // sheet's `RATE` is out of scope even though it comes last.
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><definedNames><definedName name="Rate">'التقرير'!$D$2:$D$4</definedName><definedName name="rate" localSheetId="0">'التقرير'!$C$2:$C$4</definedName><definedName name="Tax" localSheetId="0">'التقرير'!$E$2:$E$4</definedName><definedName name="Tax">'التقرير'!$D$2:$D$4</definedName><definedName name="RATE" localSheetId="1">'التقرير'!$E$2:$E$4</definedName></definedNames></workbook>"#;
+        let workbook = roxmltree::Document::parse(workbook).unwrap();
+        let defined_names = crate::parse_defined_names_for_sheet(&workbook, 0);
         let mut archive = archive_with_chart_and_data(&chart_xml(false));
         let rels = parse_guarded(workbook_rels_xml()).unwrap();
         let sheet_metas = sheets();
         let mut session = WorksheetReferenceSession::default();
         let theme = vec!["#4472C4".into(); 12];
-        let styles = crate::styles::parse_styles(&mut archive, &theme)
-            .expect("styles parse for chart references");
+        let styles = crate::styles::parse_styles(&mut archive, &theme).expect("styles");
         let number_formats = ChartNumberFormatCache::from_styles(&styles.styles);
         session.seed_current_sheet("Dashboard", None);
         let mut resolver = XlsxChartReferenceResolver {
@@ -1734,25 +2474,201 @@ mod worksheet_reference_tests {
             sheets: &sheet_metas,
             workbook_rels: &rels,
             shared_strings: &[],
-            defined_names: &[],
+            defined_names: &defined_names,
             number_formats: &number_formats,
             session: &mut session,
             visibility_cache: HashMap::new(),
+            style_prefetch: None,
+        };
+        let mut numbers = |name: &str| {
+            ooxml_common::chart::ChartReferenceResolver::resolve_numbers(&mut resolver, name)
         };
         assert_eq!(
-            ooxml_common::chart::ChartReferenceResolver::resolve_number_format(
-                &mut resolver,
-                "'التقرير'!$C$2:$C$4",
-            )
-            .as_deref(),
-            Some("#,##0"),
+            numbers("Rate"),
+            Some(vec![Some(5000.0), Some(6200.0), Some(7500.0)])
+        );
+        assert_eq!(numbers("TAX"), Some(vec![Some(3.0), Some(5.0), Some(7.0)]));
+    }
+
+    #[test]
+    fn linked_value_axis_uses_worksheet_format_instead_of_chart_cache() {
+        let base = chart_xml(true)
+            .replace("<c:numCache>", "<c:numCache><c:formatCode>0.00</c:formatCode>")
+            .replace(
+            "<c:valAx><c:axId val=\"100\"/><c:axPos val=\"l\"/></c:valAx>",
+            "<c:valAx><c:axId val=\"100\"/><c:axPos val=\"l\"/><c:numFmt formatCode=\"0.00\" sourceLinked=\"1\"/></c:valAx>",
+            );
+        let linked = load_model(&base);
+        assert_eq!(linked.val_axis_format_code.as_deref(), Some("#,##0"));
+        assert_eq!(
+            linked
+                .val_axis_number_format
+                .as_ref()
+                .map(|format| (format.authored_code.as_str(), format.source_linked,)),
+            Some(("0.00", Some(true))),
+        );
+        let unlinked = base.replace("sourceLinked=\"1\"", "sourceLinked=\"0\"");
+        let unlinked = load_model(&unlinked);
+        assert_eq!(unlinked.val_axis_format_code.as_deref(), Some("0.00"));
+        assert_eq!(
+            unlinked.val_axis_number_format.unwrap().source_linked,
+            Some(false),
+        );
+        let default_linked = base.replace(" sourceLinked=\"1\"", "");
+        let default_linked = load_model(&default_linked);
+        assert_eq!(
+            default_linked.val_axis_format_code.as_deref(),
+            Some("#,##0")
         );
         assert_eq!(
-            ooxml_common::chart::ChartReferenceResolver::resolve_number_format_id(
-                &mut resolver,
-                "'التقرير'!$C$2:$C$4",
-            ),
-            Some(3),
+            default_linked.val_axis_number_format.unwrap().source_linked,
+            None,
+        );
+    }
+
+    #[test]
+    fn linked_secondary_axis_uses_its_own_series_source() {
+        let secondary_group = r#"<c:lineChart><c:ser><c:idx val="1"/><c:order val="1"/><c:cat><c:numRef><c:f>'التقرير'!$C$2:$C$4</c:f></c:numRef></c:cat><c:val><c:numRef><c:f>'التقرير'!$D$2:$D$4</c:f></c:numRef></c:val></c:ser><c:axId val="11"/><c:axId val="101"/></c:lineChart>"#;
+        let xml = chart_xml(false)
+            .replace("</c:barChart>", &format!("</c:barChart>{secondary_group}"))
+            .replace(
+                "<c:valAx><c:axId val=\"100\"/><c:axPos val=\"l\"/></c:valAx>",
+                "<c:valAx><c:axId val=\"100\"/><c:axPos val=\"l\"/><c:numFmt formatCode=\"0.00\" sourceLinked=\"1\"/></c:valAx><c:catAx><c:axId val=\"11\"/><c:axPos val=\"t\"/><c:numFmt formatCode=\"0.00\" sourceLinked=\"1\"/></c:catAx><c:valAx><c:axId val=\"101\"/><c:axPos val=\"r\"/><c:numFmt formatCode=\"0.00\" sourceLinked=\"1\"/></c:valAx>",
+            );
+        let chart = load_model(&xml);
+        assert_eq!(chart.val_axis_format_code.as_deref(), Some("#,##0"));
+        let secondary = chart.secondary_val_axis.expect("secondary value axis");
+        assert_eq!(secondary.format_code, None);
+        assert_eq!(
+            secondary
+                .number_format
+                .map(|format| (format.authored_code, format.source_linked,)),
+            Some(("0.00".to_string(), Some(true))),
+        );
+        assert_eq!(
+            chart
+                .secondary_cat_axis
+                .and_then(|axis| axis.format_code)
+                .as_deref(),
+            Some("#,##0"),
+        );
+    }
+
+    #[test]
+    fn linked_axis_uses_first_series_when_source_formats_differ() {
+        let second = r#"<c:ser><c:idx val="1"/><c:order val="1"/><c:cat><c:strRef><c:f>'التقرير'!$A$2:$A$4</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>'التقرير'!$D$2:$D$4</c:f></c:numRef></c:val></c:ser>"#;
+        let with_second = |first_formula: &str, second_series: &str| {
+            chart_xml(false)
+                .replace("$C$2:$C$4", first_formula)
+                .replace(
+                    "<c:axId val=\"10\"/><c:axId val=\"100\"/>",
+                    &format!("{second_series}<c:axId val=\"10\"/><c:axId val=\"100\"/>"),
+                )
+                .replace(
+                    "<c:valAx><c:axId val=\"100\"/><c:axPos val=\"l\"/></c:valAx>",
+                    "<c:valAx><c:axId val=\"100\"/><c:axPos val=\"l\"/><c:numFmt formatCode=\"0.00\" sourceLinked=\"1\"/></c:valAx>",
+                )
+        };
+        assert_eq!(
+            load_model(&with_second("$C$2:$C$4", second))
+                .val_axis_format_code
+                .as_deref(),
+            Some("#,##0"),
+        );
+        let reversed_order_second = second.replace(
+            "<c:idx val=\"1\"/><c:order val=\"1\"/>",
+            "<c:idx val=\"1\"/><c:order val=\"0\"/>",
+        );
+        let reversed_order = with_second("$C$2:$C$4", &reversed_order_second).replace(
+            "<c:idx val=\"0\"/><c:order val=\"0\"/>",
+            "<c:idx val=\"0\"/><c:order val=\"1\"/>",
+        );
+        assert_eq!(
+            load_model(&reversed_order).val_axis_format_code.as_deref(),
+            Some("#,##0"),
+        );
+        let second_formatted = second.replace("$D$2:$D$4", "$C$2:$C$4");
+        assert_eq!(
+            load_model(&with_second("$D$2:$D$4", &second_formatted)).val_axis_format_code,
+            None,
+        );
+    }
+
+    #[test]
+    fn linked_category_and_date_axes_resolve_numeric_source_style() {
+        for axis_tag in ["catAx", "dateAx"] {
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:lineChart><c:ser><c:idx val="0"/><c:order val="0"/><c:cat><c:numRef><c:f>'التقرير'!$C$2:$C$4</c:f></c:numRef></c:cat><c:val><c:numRef><c:f>'التقرير'!$D$2:$D$4</c:f></c:numRef></c:val></c:ser><c:axId val="10"/><c:axId val="100"/></c:lineChart><c:{axis_tag}><c:axId val="10"/><c:axPos val="b"/><c:numFmt formatCode="0.00" sourceLinked="1"/></c:{axis_tag}><c:valAx><c:axId val="100"/><c:axPos val="l"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#,
+            );
+            assert_eq!(
+                load_model(&xml).cat_axis_format_code.as_deref(),
+                Some("#,##0"),
+                "{axis_tag}",
+            );
+        }
+    }
+
+    #[test]
+    fn linked_scatter_and_bubble_axes_follow_x_and_y_sources() {
+        for kind in ["scatterChart", "bubbleChart"] {
+            let bubble_size = if kind == "bubbleChart" {
+                r#"<c:bubbleSize><c:numRef><c:f>'التقرير'!$E$2:$E$4</c:f></c:numRef></c:bubbleSize>"#
+            } else {
+                ""
+            };
+            let xml = format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:{kind}><c:ser><c:idx val="0"/><c:order val="0"/><c:xVal><c:numRef><c:f>'التقرير'!$C$2:$C$4</c:f></c:numRef></c:xVal><c:yVal><c:numRef><c:f>'التقرير'!$D$2:$D$4</c:f></c:numRef></c:yVal>{bubble_size}</c:ser><c:axId val="10"/><c:axId val="100"/></c:{kind}><c:valAx><c:axId val="10"/><c:axPos val="b"/><c:numFmt formatCode="0.00" sourceLinked="1"/></c:valAx><c:valAx><c:axId val="100"/><c:axPos val="l"/><c:numFmt formatCode="0.00" sourceLinked="1"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#,
+            );
+            let chart = load_model(&xml);
+            assert_eq!(
+                chart.cat_axis_format_code.as_deref(),
+                Some("#,##0"),
+                "{kind}"
+            );
+            assert_eq!(chart.val_axis_format_code, None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn linked_axis_uses_first_plot_group_when_chart_kinds_share_it() {
+        let group = |kind: &str, formula: &str, index: usize| {
+            format!(
+                r#"<c:{kind}><c:ser><c:idx val="{index}"/><c:order val="{index}"/><c:val><c:numRef><c:f>'التقرير'!${formula}$2:${formula}$4</c:f></c:numRef></c:val></c:ser><c:axId val="10"/><c:axId val="100"/></c:{kind}>"#,
+            )
+        };
+        let chart = |first: &str, second: &str| {
+            format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>{first}{second}<c:catAx><c:axId val="10"/><c:axPos val="b"/></c:catAx><c:valAx><c:axId val="100"/><c:axPos val="l"/><c:numFmt formatCode="0.00" sourceLinked="1"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#,
+            )
+        };
+        let general_first = chart(&group("lineChart", "D", 0), &group("barChart", "C", 1));
+        assert_eq!(load_model(&general_first).val_axis_format_code, None);
+        let formatted_first = chart(&group("barChart", "C", 0), &group("lineChart", "D", 1));
+        assert_eq!(
+            load_model(&formatted_first).val_axis_format_code.as_deref(),
+            Some("#,##0"),
+        );
+    }
+
+    #[test]
+    fn linked_axis_uses_first_literal_series_instead_of_later_worksheet_source() {
+        let chart = |literal_code: &str, linked: bool| {
+            let linkage = if linked { "1" } else { "0" };
+            format!(
+                r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:lineChart><c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numLit>{literal_code}<c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numLit></c:val></c:ser><c:ser><c:idx val="1"/><c:order val="1"/><c:val><c:numRef><c:f>'التقرير'!$C$2:$C$4</c:f></c:numRef></c:val></c:ser><c:axId val="10"/><c:axId val="100"/></c:lineChart><c:catAx><c:axId val="10"/><c:axPos val="b"/></c:catAx><c:valAx><c:axId val="100"/><c:axPos val="l"/><c:numFmt formatCode="0.00" sourceLinked="{linkage}"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"#,
+            )
+        };
+        let one_decimal = chart("<c:formatCode>0.0</c:formatCode>", true);
+        assert_eq!(
+            load_model(&one_decimal).val_axis_format_code.as_deref(),
+            Some("0.0"),
+        );
+        let no_literal_format = chart("", true);
+        assert_eq!(load_model(&no_literal_format).val_axis_format_code, None);
+        let unlinked = chart("<c:formatCode>0.0</c:formatCode>", false);
+        assert_eq!(
+            load_model(&unlinked).val_axis_format_code.as_deref(),
+            Some("0.00")
         );
     }
 
@@ -1900,6 +2816,10 @@ mod chartex_tests {
     /// → `charts/chartEx1.xml` chain Excel uses, including the Microsoft
     /// `.../2014/relationships/chartEx` relationship type.
     fn archive_with_chartex_chart() -> crate::XlsxZip {
+        archive_with_chartex_part(&waterfall_chartex_xml())
+    }
+
+    fn archive_with_chartex_part(chartex_xml: &str) -> crate::XlsxZip {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
@@ -1917,7 +2837,7 @@ mod chartex_tests {
             zw.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdChart" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx1.xml"/></Relationships>"#).unwrap();
 
             zw.start_file("xl/charts/chartEx1.xml", o).unwrap();
-            zw.write_all(waterfall_chartex_xml().as_bytes()).unwrap();
+            zw.write_all(chartex_xml.as_bytes()).unwrap();
 
             zw.start_file("xl/charts/_rels/chartEx1.xml.rels", o)
                 .unwrap();
@@ -1939,6 +2859,12 @@ mod chartex_tests {
     }
 
     fn archive_with_classic_chart_style() -> crate::XlsxZip {
+        archive_with_classic_chart_style_and_override(None)
+    }
+
+    fn archive_with_classic_chart_style_and_override(
+        theme_override: Option<&str>,
+    ) -> crate::XlsxZip {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
@@ -1968,11 +2894,90 @@ mod chartex_tests {
                 ),
             ] {
                 zw.start_file(path, o).unwrap();
+                let xml = if theme_override.is_some() && path.ends_with("chart1.xml.rels") {
+                    xml.replace("</Relationships>", r#"<Relationship Id="override" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/themeOverride" Target="../theme/chartOverride.xml"/></Relationships>"#)
+                } else {
+                    xml.to_owned()
+                };
+                zw.write_all(xml.as_bytes()).unwrap();
+            }
+            if let Some(xml) = theme_override {
+                // Use a separate chart relationship part in this fixture when
+                // probing an override, retaining the style/color sidecars.
+                zw.start_file("xl/theme/chartOverride.xml", o).unwrap();
                 zw.write_all(xml.as_bytes()).unwrap();
             }
             zw.finish().unwrap();
         }
         crate::XlsxZip::new(Cursor::new(buf)).unwrap()
+    }
+
+    #[test]
+    fn chartex_allocation_limit_poisoning_survives_chart_adapter() {
+        let series =
+            r#"<cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>"#.repeat(16);
+        let xml = format!(
+            r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="65536"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion>{series}</cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#
+        );
+        let mut archive = archive_with_chartex_part(&xml);
+        let error = archive
+            .run_operation("parse-sheet", |archive| {
+                let _ = load_sheet_charts_with_theme_images(
+                    archive,
+                    "worksheets/sheet1.xml",
+                    None,
+                    &theme(),
+                    (None, None),
+                    None,
+                    &ooxml_common::chart::ChartImageRelationships::default(),
+                );
+                Ok(())
+            })
+            .expect_err("chart adapter must not swallow resource violation");
+        assert_eq!(
+            archive.assert_healthy().expect_err("poisoned package"),
+            error
+        );
+        let json: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed prefix"),
+        )
+        .expect("typed JSON");
+        assert_eq!(
+            json["details"]["violation"]["resource"],
+            "chartex-allocation"
+        );
+        assert_eq!(json["details"]["violation"]["format"], "xlsx");
+        assert_eq!(json["details"]["violation"]["metric"], "bytes");
+        assert_eq!(
+            json["details"]["violation"]["limit"],
+            ooxml_common::resource::HARD_MAX_CHARTEX_ALLOCATION_BYTES
+        );
+        assert_eq!(json["details"]["violation"]["observed"], 12_582_913);
+    }
+
+    #[test]
+    fn chartex_allocation_accounting_is_idempotent_for_reparsed_chart_part() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="524288"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>"#;
+        let mut archive = archive_with_chartex_part(xml);
+        for operation_name in ["cursor-preview", "cursor-final"] {
+            let charts = archive
+                .run_operation(operation_name, |archive| {
+                    Ok(load_sheet_charts_with_theme_images(
+                        archive,
+                        "worksheets/sheet1.xml",
+                        None,
+                        &theme(),
+                        (None, None),
+                        None,
+                        &ooxml_common::chart::ChartImageRelationships::default(),
+                    ))
+                })
+                .expect("the same ChartEx part is charged once per package");
+            assert_eq!(charts.len(), 1);
+        }
+        archive.assert_healthy().expect("package remains usable");
     }
 
     #[test]
@@ -2039,6 +3044,88 @@ mod chartex_tests {
         ));
     }
 
+    /// The Excel adapter must pass `ChartHost::Excel`: Excel keeps only the
+    /// first clustered column and drops the unowned Pareto line's percentage
+    /// axis, unlike the PowerPoint/Word and host-neutral policies.
+    #[test]
+    fn excel_adapter_passes_its_chartex_host() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData>
+            <cx:data id="0"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">A</cx:pt><cx:pt idx="1">B</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">3</cx:pt><cx:pt idx="1">5</cx:pt></cx:lvl></cx:numDim></cx:data>
+            <cx:data id="1"><cx:strDim type="cat"><cx:lvl ptCount="2"><cx:pt idx="0">X</cx:pt><cx:pt idx="1">Y</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:lvl ptCount="2"><cx:pt idx="0">8</cx:pt><cx:pt idx="1">12</cx:pt></cx:lvl></cx:numDim></cx:data>
+          </cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="0"/></cx:series>
+            <cx:series layoutId="clusteredColumn"><cx:dataId val="1"/></cx:series>
+            <cx:series layoutId="paretoLine"><cx:dataId val="0"/><cx:axisId val="2"/></cx:series>
+          </cx:plotAreaRegion>
+            <cx:axis id="0"><cx:catScaling/></cx:axis>
+            <cx:axis id="1"><cx:valScaling/></cx:axis>
+            <cx:axis id="2"><cx:valScaling min="0" max="1"/><cx:units unit="percentage"/><cx:tickLabels/></cx:axis>
+          </cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        let mut archive = archive_with_chartex_part(xml);
+        let charts = load_sheet_charts_with_theme_images(
+            &mut archive,
+            "worksheets/sheet1.xml",
+            None,
+            &theme(),
+            (None, None),
+            None,
+            &ooxml_common::chart::ChartImageRelationships::default(),
+        );
+        assert_eq!(charts.len(), 1);
+        let chart = &charts[0].chart;
+        let columns = chart
+            .series
+            .iter()
+            .filter(|series| series.series_type.as_deref() != Some("line"))
+            .count();
+        assert_eq!(columns, 1);
+        assert_eq!(chart.chartex_show_unpaired_percentage_axis, None);
+    }
+
+    #[test]
+    fn excel_adapter_rejects_unsupported_chartex_layouts() {
+        let xml = r#"<cx:chartSpace xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex">
+          <cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:lvl ptCount="1"><cx:pt idx="0">7</cx:pt></cx:lvl></cx:numDim></cx:data></cx:chartData>
+          <cx:chart><cx:plotArea><cx:plotAreaRegion>
+            <cx:series layoutId="pie"><cx:dataId val="0"/></cx:series>
+          </cx:plotAreaRegion></cx:plotArea></cx:chart>
+        </cx:chartSpace>"#;
+        let mut archive = archive_with_chartex_part(xml);
+        let charts = load_sheet_charts_with_theme_images(
+            &mut archive,
+            "worksheets/sheet1.xml",
+            None,
+            &theme(),
+            (None, None),
+            None,
+            &ooxml_common::chart::ChartImageRelationships::default(),
+        );
+        assert!(charts.is_empty());
+    }
+
+    #[test]
+    fn chart_theme_override_is_local_to_chart_resolution() {
+        let xml = r#"<a:themeOverride xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:clrScheme name="Chart"><a:accent1><a:srgbClr val="123456"/></a:accent1></a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Chart Major"/></a:majorFont><a:minorFont><a:latin typeface="Chart Minor"/></a:minorFont></a:fontScheme></a:themeOverride>"#;
+        let mut archive = archive_with_classic_chart_style_and_override(Some(xml));
+        let colors = theme();
+        let charts = load_sheet_charts_with_theme_images(
+            &mut archive,
+            "worksheets/sheet1.xml",
+            None,
+            &colors,
+            (Some("Parent Major"), Some("Parent Minor")),
+            None,
+            &ooxml_common::chart::ChartImageRelationships::default(),
+        );
+        assert_eq!(charts.len(), 1);
+        // Numeric style 2's first series uses accent1 from the chart override.
+        assert_eq!(charts[0].chart.series[0].color.as_deref(), Some("123456"));
+        assert_ne!(colors[4], "#123456");
+    }
+
     #[test]
     fn classic_graphicframe_keeps_numeric_and_linked_chart_style_roles_separate() {
         let mut archive = archive_with_classic_chart_style();
@@ -2103,82 +3190,5 @@ mod chartex_tests {
                 .and_then(Option::as_deref),
             Some("336699"),
         );
-    }
-
-    #[test]
-    fn chart_related_parts_support_root_nested_and_root_absolute_targets() {
-        for (chart_path, style_target, expected_style_path, expected_image_path) in [
-            ("chart1.xml", "style1.xml", "style1.xml", "media/marker.png"),
-            (
-                "chart2.xml",
-                "/style2.xml",
-                "style2.xml",
-                "media/marker.png",
-            ),
-            (
-                "xl/charts/chart3.xml",
-                "style3.xml",
-                "xl/charts/style3.xml",
-                "xl/media/marker.png",
-            ),
-        ] {
-            let style_rels_path = ooxml_common::rels::relationship_part_path(expected_style_path);
-            let chart_rels_path = ooxml_common::rels::relationship_part_path(chart_path);
-            let image_target = if chart_path.contains('/') {
-                "../media/marker.png"
-            } else {
-                "media/marker.png"
-            };
-            let mut bytes = Vec::new();
-            {
-                let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
-                let options = SimpleFileOptions::default();
-                writer.start_file(&chart_rels_path, options).unwrap();
-                writer.write_all(format!(
-                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="aExternal" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="https://example.invalid/style.xml" TargetMode="External"/><Relationship Id="rStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="{style_target}"/></Relationships>"#,
-                ).as_bytes()).unwrap();
-                writer.start_file(expected_style_path, options).unwrap();
-                writer.write_all(b"<style/>").unwrap();
-                writer.start_file(&style_rels_path, options).unwrap();
-                writer.write_all(format!(
-                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{image_target}"/></Relationships>"#,
-                ).as_bytes()).unwrap();
-                writer.start_file(expected_image_path, options).unwrap();
-                writer.write_all(b"png").unwrap();
-                writer.finish().unwrap();
-            }
-            let mut archive = crate::XlsxZip::new(Cursor::new(bytes)).unwrap();
-            let related = load_chart_related_parts(&mut archive, chart_path);
-            assert_eq!(related.style_xml.as_deref(), Some("<style/>"));
-            assert_eq!(related.color_style_xml, None);
-            assert_eq!(
-                ooxml_common::chart::ChartImageResolver::resolve_image(
-                    &related.image_relationships,
-                    ooxml_common::chart::ChartImageSource::Style,
-                    "rImage",
-                ),
-                Some((expected_image_path.to_string(), "image/png".to_string())),
-            );
-        }
-    }
-
-    #[test]
-    fn chart_related_parts_preserve_missing_sidecar_relationships() {
-        let mut bytes = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
-            writer
-                .start_file(
-                    "xl/charts/_rels/chart9.xml.rels",
-                    SimpleFileOptions::default(),
-                )
-                .unwrap();
-            writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rStyle" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="missing-style.xml"/><Relationship Id="rColors" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="missing-colors.xml"/></Relationships>"#).unwrap();
-            writer.finish().unwrap();
-        }
-        let mut archive = crate::XlsxZip::new(Cursor::new(bytes)).unwrap();
-        let related = load_chart_related_parts(&mut archive, "xl/charts/chart9.xml");
-        assert_eq!(related.style_xml.as_deref(), Some("\0"));
-        assert_eq!(related.color_style_xml.as_deref(), Some("\0"));
     }
 }

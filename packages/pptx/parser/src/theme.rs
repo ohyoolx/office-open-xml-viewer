@@ -42,6 +42,94 @@ impl PptxTheme {
     }
 }
 
+/// CT_BaseStylesOverride (§20.1.6.12) replaces each *present* scheme as a
+/// whole. Absent schemes inherit; in particular an empty authored font slot
+/// must not resurrect a face from the parent scheme.
+pub(crate) fn apply_theme_override(theme: &mut PptxTheme, xml: &str) {
+    if parse_preflighted_pptx_xml(xml).is_err() {
+        return;
+    }
+    let schemes = ooxml_common::theme::ThemeOverride::parse(xml);
+    let replacement = PptxTheme::from_xml(xml);
+    if schemes.colors.is_some() {
+        theme.values.retain(|key, _| {
+            !CLR_MAP_LOGICALS.iter().any(|(logical, slot)| {
+                key == logical || key == slot || key == &format!("{RAW_SCHEME_PREFIX}{slot}")
+            })
+        });
+        theme.values.extend(
+            replacement
+                .values
+                .iter()
+                .filter(|(key, _)| !key.starts_with('+') || key.starts_with(RAW_SCHEME_PREFIX))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+    }
+    if schemes.fonts.is_some() {
+        theme
+            .values
+            .retain(|key, _| !key.starts_with("+mj") && !key.starts_with("+mn"));
+        theme.values.extend(
+            replacement
+                .values
+                .iter()
+                .filter(|(key, _)| key.starts_with("+mj") || key.starts_with("+mn"))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+    }
+    if schemes.format.is_some() {
+        theme.values.retain(|key, _| {
+            !key.starts_with("+fillStyle-")
+                && !key.starts_with("+bgFillStyle-")
+                && !key.starts_with("+effectStyle-")
+        });
+        theme.values.extend(
+            replacement
+                .values
+                .iter()
+                .filter(|(key, _)| {
+                    key.starts_with("+fillStyle-")
+                        || key.starts_with("+bgFillStyle-")
+                        || key.starts_with("+effectStyle-")
+                })
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        // §14.2.8 forbids relationships owned by a Theme Override part.
+        // A replaced matrix must never resolve its rIds in the parent theme.
+        theme
+            .values
+            .retain(|key, _| !key.starts_with(THEME_REL_PREFIX));
+        theme.chart_images = Default::default();
+        theme.format_scheme = replacement.format_scheme;
+        theme.format_scheme_present = true;
+    }
+}
+
+/// Theme overrides are implicit, internal relationships (§14.2.8). Resolve by
+/// relationship type, never by a conventional file name or target directory.
+pub(crate) fn load_theme_override(part: &str, rels_xml: &str, zip: &mut PptxZip) -> Option<String> {
+    let relationships = ooxml_common::rels::parse_rels(rels_xml);
+    let target = relationships.values().find(|rel| {
+        rel.mode == ooxml_common::rels::TargetMode::Internal
+            && rel
+                .relationship_type
+                .as_deref()
+                .is_some_and(|kind| kind.ends_with("/themeOverride"))
+    })?;
+    read_zip_str(zip, &target.resolve_part(part)?).ok()
+}
+
+impl PptxTheme {
+    pub(crate) fn from_source(source: &(impl PptxThemeSource + ?Sized)) -> Self {
+        Self {
+            values: source.colors().clone(),
+            format_scheme: source.format_scheme().cloned().unwrap_or_default(),
+            format_scheme_present: source.format_scheme().is_some(),
+            chart_images: source.chart_images().cloned().unwrap_or_default(),
+        }
+    }
+}
+
 impl Deref for PptxTheme {
     type Target = HashMap<String, String>;
 
@@ -115,7 +203,6 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     let theme_xml = read_zip_str(zip, theme_path).unwrap_or_default();
     let mut theme = PptxTheme::from_xml(&theme_xml);
     let rels_xml = read_zip_str(zip, &relationship_part_path(theme_path)).unwrap_or_default();
-    let theme_dir = theme_path.rsplit_once('/').map_or("", |(dir, _)| dir);
 
     theme.chart_images.insert_part_relationships(
         ooxml_common::chart::ChartImageSource::Theme,
@@ -124,7 +211,7 @@ pub(crate) fn parse_theme_part(theme_path: &str, zip: &mut PptxZip) -> PptxTheme
     );
 
     for (relationship_id, target) in parse_rels(&rels_xml) {
-        let path = resolve_path(theme_dir, &target);
+        let path = resolve_path(theme_path, &target);
         if zip.index_for_name(&path).is_some() {
             theme.insert(format!("{THEME_REL_PREFIX}{relationship_id}"), path);
         }
@@ -138,8 +225,55 @@ mod relationship_tests {
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
+    /// OPC Part 2 §6.4.1: a deferred fillRef retains the theme part's
+    /// relationship context, even when the consumer has a different base.
     #[test]
-    fn theme_part_relationships_are_resolved_from_the_theme_directory() {
+    fn theme_referenced_image_fill_resolves_relative_to_theme_part() {
+        let mut bytes = Vec::new();
+        {
+            let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let options = SimpleFileOptions::default();
+            archive
+                .start_file("ppt/theme/nested/theme1.xml", options)
+                .unwrap();
+            archive
+                .write_all(
+                    br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                <a:themeElements><a:fmtScheme name="S"><a:fillStyleLst>
+                <a:blipFill><a:blip r:embed="rIdImage"/><a:stretch/></a:blipFill>
+                </a:fillStyleLst></a:fmtScheme></a:themeElements></a:theme>"#,
+                )
+                .unwrap();
+            archive
+                .start_file("ppt/theme/nested/_rels/theme1.xml.rels", options)
+                .unwrap();
+            archive.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                <Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                Target="./media/background.png"/></Relationships>"#).unwrap();
+            archive
+                .start_file("ppt/theme/nested/media/background.png", options)
+                .unwrap();
+            archive.write_all(b"png").unwrap();
+            archive.finish().unwrap();
+        }
+        let mut zip = PptxZip::new(Cursor::new(bytes)).expect("open package");
+        let theme = parse_theme_part("ppt/theme/nested/theme1.xml", &mut zip);
+        let consumer = roxmltree::Document::parse(
+            r#"<a:fillRef xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" idx="1">
+            <a:srgbClr val="FFFFFF"/></a:fillRef>"#,
+        )
+        .unwrap();
+        match crate::fill::parse_style_matrix_fill(consumer.root_element(), &theme, false) {
+            Some(crate::Fill::Image { image_path, .. }) => {
+                assert_eq!(image_path, "ppt/theme/nested/media/background.png");
+            }
+            other => panic!("expected theme-relative image fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn theme_part_relationships_are_resolved_from_the_theme_part() {
         let mut bytes = Vec::new();
         {
             let mut archive = zip::ZipWriter::new(Cursor::new(&mut bytes));
@@ -175,10 +309,9 @@ mod relationship_tests {
 ///
 /// The clrScheme and fontScheme are parsed by the shared
 /// [`ooxml_common::theme`] grammar; this function keeps pptx's flat merged-map
-/// storage (colors, `+mj-lt`/`+mn-*` font keys and
-/// `+txDef`/`+spDef` object defaults all in one `HashMap<String, String>`)
-/// because ~30 call sites look these up by string key. Existing fill/effect
-/// fragment adapters and objectDefaults stay local. Structured line recipes
+/// storage (colors and `+mj-lt`/`+mn-*` font keys all in one
+/// `HashMap<String, String>`) because ~30 call sites look these up by string
+/// key. Existing fill/effect fragment adapters stay local. Structured line recipes
 /// are retained by [`PptxTheme`] instead of being flattened into width
 /// sentinels.
 pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
@@ -209,6 +342,13 @@ pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
             if let Some(typeface) = face {
                 map.insert(format!("{prefix}-{axis}"), typeface.clone());
             }
+        }
+        // CT_SupplementalFont (§20.1.4.1.16): the per-script faces a theme
+        // token resolves to for a run whose language selects that script
+        // (issue #1627). A script with conflicting duplicates is ambiguous
+        // and names no face.
+        for (script, typeface) in unique_script_faces(&group.supplemental) {
+            map.insert(theme_script_key(prefix, script), typeface.to_owned());
         }
     }
 
@@ -249,74 +389,9 @@ pub(crate) fn parse_theme_colors(xml: &str) -> HashMap<String, String> {
         }
     }
 
-    // Parse <a:objectDefaults> per ECMA-376 §20.1.6.7. PowerPoint stores
-    // `<a:txDef>` (text-box default), `<a:spDef>` (shape default) and
-    // `<a:lnDef>` (line default) here; their `<a:bodyPr>` settings are the
-    // last-resort fallback below master/layout/slide for any text body that
-    // doesn't override the attribute. Sample-2 hides a `<a:spAutoFit/>`
-    // inside its txDef — without inheriting it, every text box in the
-    // template defaults to "noAutofit + wrap=square" (the spec literal),
-    // which makes mixed-size runs like "20代" wrap unnecessarily and
-    // reproduces the slide-13 regression on every similar deck. We parse
-    // the bodyPr attributes (and the autoFit child element) into namespaced
-    // theme keys so `parse_text_body` can fall back through them without
-    // changing function signatures.
-    if let Some(obj_defaults) = root
-        .descendants()
-        .find(|n| n.is_element() && n.tag_name().name() == "objectDefaults")
-    {
-        let read_def = |def_name: &str, key_prefix: &str, map: &mut HashMap<String, String>| {
-            let Some(def) = child(obj_defaults, def_name) else {
-                return;
-            };
-            let Some(body_pr) = child(def, "bodyPr") else {
-                return;
-            };
-            // Plain attributes — copy verbatim; consumers parse the strings.
-            for attr_name in [
-                "wrap",
-                "anchor",
-                "anchorCtr",
-                "vert",
-                "rtlCol",
-                "lIns",
-                "rIns",
-                "tIns",
-                "bIns",
-                "numCol",
-                "spcCol",
-                "vertOverflow",
-                "horzOverflow",
-                "spcFirstLastPara",
-                "rot",
-                "upright",
-                "fromWordArt",
-                "forceAA",
-                "compatLnSpc",
-            ] {
-                if let Some(v) = attr(&body_pr, attr_name) {
-                    map.insert(format!("{key_prefix}-bodyPr-{attr_name}"), v);
-                }
-            }
-            // Auto-fit is a child element, not an attribute. Encode as
-            // `{prefix}-autoFit` → "sp" | "norm" | "none".
-            let auto_fit = if child(body_pr, "spAutoFit").is_some() {
-                "sp"
-            } else if child(body_pr, "normAutofit").is_some() {
-                "norm"
-            } else {
-                "none"
-            };
-            // Only record when explicit; "none" is the spec default and
-            // recording it would make every consumer see `Some("none")` even
-            // for themes that didn't say anything.
-            if auto_fit != "none" {
-                map.insert(format!("{key_prefix}-autoFit"), auto_fit.to_owned());
-            }
-        };
-        read_def("txDef", "+txDef", &mut map);
-        read_def("spDef", "+spDef", &mut map);
-    }
+    // `<a:objectDefaults>` (ECMA-376 §20.1.6.7) is intentionally not read:
+    // PowerPoint applies txDef/spDef/lnDef only to objects newly inserted in
+    // its UI, never to shapes already in the file (see parse_text_body).
 
     map
 }
@@ -419,6 +494,37 @@ pub(crate) fn parse_clr_map_ovr(xml: &str) -> Option<HashMap<String, String>> {
     Some(parse_clr_map_node(override_node))
 }
 
+/// Aggregate supplemental fonts in one pass: each script maps to its face, or
+/// to nothing when duplicate entries disagree (the same semantics as
+/// `ThemeFontGroup::typeface_for_script`, without its per-script rescan).
+fn unique_script_faces(fonts: &[ooxml_common::theme::ThemeSupplementalFont]) -> Vec<(&str, &str)> {
+    let mut faces: HashMap<&str, Option<&str>> = HashMap::with_capacity(fonts.len());
+    let mut order = Vec::new();
+    for font in fonts {
+        match faces.get_mut(font.script.as_str()) {
+            Some(existing) => {
+                if existing.is_some_and(|face| face != font.typeface) {
+                    *existing = None;
+                }
+            }
+            None => {
+                faces.insert(&font.script, Some(&font.typeface));
+                order.push(font.script.as_str());
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|script| faces[script].map(|face| (script, face)))
+        .collect()
+}
+
+/// Theme-map key of a major (`+mj`) or minor (`+mn`) supplemental script
+/// font, e.g. `+mn-script-Jpan`.
+pub(crate) fn theme_script_key(set_prefix: &str, script: &str) -> String {
+    format!("{set_prefix}-script-{script}")
+}
+
 /// Resolve a theme typeface reference (e.g. "+mj-lt") to the actual font family name.
 /// If the typeface starts with '+' and has a matching entry in the theme map (added by
 /// parse_theme_colors from the fontScheme), returns the resolved name; otherwise returns
@@ -488,6 +594,49 @@ impl ooxml_common::color::ThemeResolver for PptxSchemeResolver<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supplemental_script_fonts_are_aggregated_once_and_conflicts_name_no_face() {
+        use ooxml_common::theme::ThemeSupplementalFont;
+        let font = |script: &str, typeface: &str| ThemeSupplementalFont {
+            script: script.to_owned(),
+            typeface: typeface.to_owned(),
+        };
+        let mut fonts: Vec<_> = (0..48_000)
+            .map(|i| font(&format!("S{i}"), &format!("F{i}")))
+            .collect();
+        fonts.extend([
+            font("Jpan", "Yu Mincho"),
+            font("Jpan", "Yu Mincho"),
+            font("Hebr", "David"),
+            font("Hebr", "Arial"),
+        ]);
+        // One pass: the former per-entry rescan was quadratic in the entry
+        // count (48,000 entries took seconds).
+        let started = std::time::Instant::now();
+        let faces: HashMap<_, _> = unique_script_faces(&fonts).into_iter().collect();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(faces.get("S47999"), Some(&"F47999"));
+        assert_eq!(faces.get("Jpan"), Some(&"Yu Mincho"));
+        assert_eq!(
+            faces.get("Hebr"),
+            None,
+            "conflicting duplicates name no face"
+        );
+
+        let map = parse_theme_colors(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements><a:fontScheme name="F"><a:majorFont><a:latin typeface="A"/></a:majorFont><a:minorFont><a:latin typeface="B"/><a:font script="Jpan" typeface="Yu Mincho"/><a:font script="Hebr" typeface="David"/><a:font script="Hebr" typeface="Arial"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
+        );
+        assert_eq!(
+            map.get("+mn-script-Jpan").map(String::as_str),
+            Some("Yu Mincho")
+        );
+        assert_eq!(map.get("+mn-script-Hebr"), None);
+    }
+
     use super::*;
     use std::io::{Cursor, Write};
 
@@ -570,21 +719,14 @@ mod tests {
         assert_eq!(map.get("lt1").map(String::as_str), Some("FFFFFF"));
     }
 
-    // ── RB2 neutralization (roxmltree layer): a pathologically deep theme/part
-    //    XML is rejected by the depth pre-check in the PPTX parser BEFORE
-    //    roxmltree's recursive tree builder runs, so `parse_theme_colors` returns
-    //    gracefully instead of trapping. This runs on the DEFAULT (small)
-    //    test-thread stack ON PURPOSE: handing 5 000-deep XML straight to
-    //    roxmltree here would overflow and abort the process. That it returns is
-    //    the guarantee. (The shape-walk DepthGuard is covered separately in
-    //    shape.rs on a generous stack.)
+    // Extreme XML depth is rejected before retaining a DOM or entering the
+    // recursive OOXML walker. Streaming validation fits the default test stack.
     #[test]
     fn deeply_nested_theme_xml_is_rejected_not_trapped() {
         let mut xml = String::from(
             r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#,
         );
-        // 5 000 levels — ~20× MAX_XML_DEPTH and far past roxmltree's ~1 000-deep
-        // small-stack overflow threshold.
+        // Approximately twenty times the production XML depth ceiling.
         for _ in 0..5_000 {
             xml.push_str("<a:x>");
         }

@@ -10,6 +10,8 @@ import {
   openDocxDocument,
 } from './docx.ts';
 import type { NodeCanvasFactory } from './render.ts';
+import { OoxmlError } from '@silurus/ooxml-core';
+import { nonOoxmlInputs } from '@silurus/ooxml-core/testing';
 
 const factory: NodeCanvasFactory = {
   createCanvas: (width, height) =>
@@ -34,6 +36,20 @@ describe('Node bounded DOCX document session', () => {
       expect(parse).not.toHaveBeenCalled();
     } finally {
       parse.mockRestore();
+    }
+  });
+
+  it.each(nonOoxmlInputs('docx'))('rejects %s with OoxmlError not-ooxml', async (_name, input) => {
+    for (const open of [
+      () => materializeDocxDocument(input),
+      () => openDocxDocument(input, { factory }),
+    ]) {
+      const error = await open().then(
+        (document) => { throw new Error(`resolved ${JSON.stringify(document).slice(0, 80)}`); },
+        (rejection: unknown) => rejection,
+      );
+      expect(error).toBeInstanceOf(OoxmlError);
+      expect(error).toMatchObject({ code: 'not-ooxml' });
     }
   });
 
@@ -73,7 +89,11 @@ describe('Node bounded DOCX document session', () => {
       count += 1;
     }
     expect(count).toBe(expectedPages);
-  });
+    // This compares two parser/layout paths and paints every public demo page
+    // through native Skia. Keep the same bounded integration timeout as the
+    // multi-page lifetime test below; the assertions check pagination and
+    // ownership, rather than a machine-dependent five-second performance SLO.
+  }, 15_000);
 
   it('does not route the bounded session through the materializing parse export', async () => {
     const parse = vi.spyOn(docxWasm, 'parse_docx');

@@ -1,3 +1,9 @@
+import {
+  normalizeXlsxWorksheetPolicy,
+  xlsxWorksheetPolicyForWasm,
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  type NormalizedXlsxWorksheetPolicy,
+} from './internal/worksheet-policy.js';
 import init, { XlsxArchive, reinit } from './wasm/xlsx_parser.js';
 import {
   decodeDataUrl,
@@ -35,6 +41,8 @@ const host = new WasmParserHost<XlsxArchive>(init, {
   // wasm-bindgen singleton). `reinit` forces fresh linear memory after a trap.
   reinit,
 });
+// Per-document worksheet policy, captured when a parse adopts a new archive.
+let worksheetPolicy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY;
 const worksheetPull = new WorksheetPullWorker(
   () => host.archive,
   undefined,
@@ -43,6 +51,9 @@ const worksheetPull = new WorksheetPullWorker(
     if (!archive) throw new Error('Workbook not loaded');
     return host.run(() => operation(archive));
   },
+  undefined,
+  undefined,
+  () => worksheetPolicy,
 );
 
 self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<number>>) => {
@@ -65,6 +76,11 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
   const id = req.id;
   if (req.type === 'openSheetSession') worksheetPull.reserveOpen(req);
   try {
+    // Validate the request policy before any reset / instance work. Older
+    // requests without a policy resolve to the defaults.
+    const parsePolicy = req.type === 'parse'
+      ? normalizeXlsxWorksheetPolicy({ xlsxWorksheetLimits: req.worksheetPolicy?.worksheet })
+      : undefined;
     if (req.type === 'openSheetSession') {
       await host.ensureReady();
       if (host.archive) host.run(() => host.archive?.assert_healthy());
@@ -87,7 +103,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       return;
     }
     if (req.type === 'parse') await worksheetPull.reset();
-    await worksheetPull.run(async () => {
+    await (req.type === 'extractImage' ? worksheetPull.runDuringPull : worksheetPull.run).call(worksheetPull, async () => {
     await host.ensureReady();
     if (req.type !== 'parse' && host.archive) {
       const retained = host.archive;
@@ -96,6 +112,8 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
     if (req.type === 'parse') {
       const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(req.resourcePolicy);
       const bytes = new Uint8Array(req.data);
+      worksheetPolicy = parsePolicy ?? DEFAULT_XLSX_WORKSHEET_POLICY;
+      const wasmLimits = xlsxWorksheetPolicyForWasm(worksheetPolicy);
       // Both the construction and `parse()` run under `host.run` so a trap in
       // EITHER poisons + recycles the instance (and frees the archive). Adopting
       // via `setArchive` frees any prior handle first — the re-parse dispose.
@@ -106,7 +124,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest | PullSessionCommand<numbe
       const { workbook: json, usage } = readXlsxArchiveBootstrap(
         () => host.run(() => {
           const archive = new XlsxArchive(bytes, maxEntry, maxTotal, maxEntries);
+          // Adopt first so the host owns cleanup if the setter throws/traps.
           host.setArchive(archive);
+          archive.set_worksheet_limits(...wasmLimits);
           return archive.parse();
         }),
         () => host.run(() => host.archive!.resource_usage()),

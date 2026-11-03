@@ -1,10 +1,11 @@
+import { requireResolvedDrawingMLGeometry } from '@silurus/ooxml-core';
 import { LayoutInvariantError } from './diagnostics.js';
 import {
   createSectionRegionCoordinateSpace,
   logicalPageExtent,
+  sectionWritingMode,
   transformRect,
   uprightPhysicalExtent,
-  writingModeFromTextDirection,
 } from './coordinate-space.js';
 import { columnSeparatorSegments } from './column-separators.js';
 import { orderedPagePaintNodes, pageLayerNodes, PageGraphError } from './page-graph.js';
@@ -29,8 +30,14 @@ import type {
   WritingMode,
 } from './types.js';
 import { unionLayoutRects } from './rect-union.js';
+import { noteOwnedBlocks } from './reserved-note-separators.js';
 
+import { isDeepFrozenPlainDataRoot } from './plain-data.js';
 import { documentLayoutValidationEnabled } from './validation-policy.js';
+// Pagination's generator yields page counts for public progress telemetry.
+// Final validation/freezing also needs suspension points, but commits no new
+// pages; the scheduler ignores this non-finite internal sentinel.
+const FINALIZATION_SUSPENSION = Number.NaN;
 const LAYOUT_DIAGNOSTIC_CODE_MEMBERS = {
   FLOW_OVERLAP: true,
   BOTTOM_MARGIN_INVASION: true,
@@ -59,64 +66,107 @@ const SOURCE_STORIES = new Set<SourceRef['story']>(
   Object.keys(SOURCE_STORY_MEMBERS) as SourceRef['story'][],
 );
 
-function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<object>()): void {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) {
-      throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is not finite`);
-    }
-    return;
-  }
-  if (typeof value !== 'object') {
-    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} contains ${typeof value}`);
-  }
-  if (ancestors.has(value)) {
-    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} contains a cycle`);
-  }
+function plainDataPath(root: string, parts: readonly (string | number)[]): string {
+  let path = root;
+  for (const part of parts) path += typeof part === 'number' ? `[${part}]` : `.${part}`;
+  return path;
+}
 
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) {
-      let indexCount = 0;
-      for (const key of Reflect.ownKeys(value)) {
-        if (key === 'length') continue;
-        if (typeof key !== 'string') {
-          throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} has a symbol key`);
-        }
-        const index = Number(key);
-        if (!Number.isInteger(index) || index < 0 || String(index) !== key || index >= value.length) {
-          throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}.${key} is not an array index`);
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (!descriptor?.enumerable || !('value' in descriptor)) {
-          throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}[${key}] is not plain data`);
-        }
-        assertPlainData(descriptor.value, `${path}[${key}]`, ancestors);
-        indexCount += 1;
-      }
-      if (indexCount !== value.length) {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is sparse`);
+function assertPlainData(value: unknown, path: string, ancestors = new WeakSet<object>(), deferPages = false): void {
+  // Keep one mutable ancestry path for the walk. Rendering a string at each
+  // property used to allocate one full path per node on every finalization.
+  const parts: (string | number)[] = [];
+  // A page is a DAG, not a tree: paint operations, cluster ranges/offsets and
+  // layer roots alias the placements they describe, so a plain walk revisits
+  // each shared node several times (about 3.7 visits per unique object on a
+  // long document), allocating a key list and one descriptor per property on
+  // every visit. Validating a node is a pure function of its subgraph: the
+  // walk never mutates, a node is recorded only after its whole subgraph
+  // passed (so the first violation still throws at its first path), and a
+  // completed node can never be an ancestor. Skipping repeat visits is
+  // therefore exact. The set lives for one call (one page at finalization),
+  // so it never adds document-sized state at the retained-layout peak.
+  const completed = new Set<object>();
+  const walk = (current: unknown, skipPageContents: boolean): void => {
+    if (current === null || typeof current === 'string' || typeof current === 'boolean') return;
+    if (typeof current === 'number') {
+      if (!Number.isFinite(current)) {
+        throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} is not finite`);
       }
       return;
     }
+    if (typeof current !== 'object') {
+      throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} contains ${typeof current}`);
+    }
+    if (completed.has(current)) return;
+    if (ancestors.has(current)) {
+      throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} contains a cycle`);
+    }
 
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is not a plain record`);
-    }
-    for (const key of Reflect.ownKeys(value)) {
-      if (typeof key !== 'string') {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} has a symbol key`);
+    ancestors.add(current);
+    try {
+      if (Array.isArray(current)) {
+        let indexCount = 0;
+        for (const key of Reflect.ownKeys(current)) {
+          if (key === 'length') continue;
+          if (typeof key !== 'string') {
+            throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} has a symbol key`);
+          }
+          const index = Number(key);
+          if (!Number.isInteger(index) || index < 0 || String(index) !== key || index >= current.length) {
+            throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)}.${key} is not an array index`);
+          }
+          // A descriptor is required here and for records below: reading the
+          // property would invoke an accessor, changing validation behavior.
+          const descriptor = Object.getOwnPropertyDescriptor(current, key);
+          if (!descriptor?.enumerable || !('value' in descriptor)) {
+            throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)}[${key}] is not plain data`);
+          }
+          if (!(skipPageContents && path === 'layout' && parts.length === 1 && parts[0] === 'pages')) {
+            const child = descriptor.value;
+            if (child !== null && typeof child !== 'string' && typeof child !== 'boolean'
+              && !(typeof child === 'number' && Number.isFinite(child))) {
+              parts.push(index);
+              walk(child, false);
+              parts.pop();
+            }
+          }
+          indexCount += 1;
+        }
+        if (indexCount !== current.length) {
+          throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} is sparse`);
+        }
+        if (!skipPageContents) completed.add(current);
+        return;
       }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor?.enumerable || !('value' in descriptor)) {
-        throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}.${key} is not plain data`);
+
+      const prototype = Object.getPrototypeOf(current);
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} is not a plain record`);
       }
-      assertPlainData(descriptor.value, `${path}.${key}`, ancestors);
+      for (const key of Reflect.ownKeys(current)) {
+        if (typeof key !== 'string') {
+          throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)} has a symbol key`);
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (!descriptor?.enumerable || !('value' in descriptor)) {
+          throw new LayoutInvariantError('INVALID_GEOMETRY', `${plainDataPath(path, parts)}.${key} is not plain data`);
+        }
+        const child = descriptor.value;
+        if (child !== null && typeof child !== 'string' && typeof child !== 'boolean'
+          && !(typeof child === 'number' && Number.isFinite(child))) {
+          parts.push(key);
+          walk(child, skipPageContents);
+          parts.pop();
+        }
+      }
+      // A record walked with deferred page contents has not validated them.
+      if (!skipPageContents) completed.add(current);
+    } finally {
+      ancestors.delete(current);
     }
-  } finally {
-    ancestors.delete(value);
-  }
+  };
+  walk(value, deferPages);
 }
 
 function requireFinite(value: number, path: string): void {
@@ -156,7 +206,8 @@ function requireMatrix(matrix: unknown, path: string): asserts matrix is Section
 }
 
 function requireWritingMode(value: unknown, path: string): asserts value is WritingMode {
-  if (value !== 'horizontal-tb' && value !== 'vertical-rl' && value !== 'vertical-lr') {
+  if (value !== 'horizontal-tb' && value !== 'vertical-rl' && value !== 'vertical-lr'
+    && value !== 'sideways-lr') {
     throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} is unsupported`);
   }
 }
@@ -179,6 +230,8 @@ function requireDrawingMLShapePlan(
 ): void {
   const { plan } = command;
   assertPlainData(plan, `${path}.plan`);
+  try { requireResolvedDrawingMLGeometry(plan, 1); }
+  catch (error) { throw new LayoutInvariantError('INVALID_GEOMETRY', `${path}.plan: ${error instanceof Error ? error.message : 'invalid retained DrawingML geometry'}`); }
   requireFinite(plan.rect.x, `${path}.plan.rect.x`);
   requireFinite(plan.rect.y, `${path}.plan.rect.y`);
   requireFinite(plan.rect.w, `${path}.plan.rect.w`);
@@ -298,7 +351,7 @@ function requirePageBorder(page: LayoutPage, path: string): void {
   }
   requireMatrix(pageBorder.logicalToPhysical, `${path}.logicalToPhysical`);
   const expectedTransform = createSectionRegionCoordinateSpace(
-    writingModeFromTextDirection(page.section.textDirection),
+    sectionWritingMode(page.section),
     page.geometry,
   ).logicalToPhysical;
   if (!equalMatrix(pageBorder.logicalToPhysical, expectedTransform)) {
@@ -369,13 +422,47 @@ function collectRetainedNodeIds(
     return;
   }
   if (node.kind === 'note') {
-    node.story.blocks.forEach((block) =>
+    noteOwnedBlocks(node).forEach((block) =>
       collectRetainedNodeIds(block, pageIds, documentIds));
     return;
   }
   if (node.kind === 'textbox') {
     node.story.blocks.forEach((block) =>
       collectRetainedNodeIds(block, pageIds, documentIds));
+  }
+}
+
+/** Reserved separator/notice occurrences belong to their note: they lie on its
+ * block interval in its flow domain and replace, never add to, its scalar rule. */
+function requireNoteSeparatorOwnership(node: PaintNode, path: string): void {
+  if (node.kind !== 'note') return;
+  if (node.leading && node.separator.length !== 0) {
+    throw new LayoutInvariantError('INVALID_GEOMETRY', `${path} paints both a scalar and a reserved separator`);
+  }
+  if (node.trailing && node.trailing.role !== 'continuationNotice') {
+    throw new LayoutInvariantError('INVALID_REFERENCE', `${path}.trailing is not a continuation notice`);
+  }
+  for (const [label, occurrence] of [['leading', node.leading], ['trailing', node.trailing]] as const) {
+    if (!occurrence) continue;
+    const occurrencePath = `${path}.${label}`;
+    requireRect(occurrence.flowBounds, `${occurrencePath}.flowBounds`);
+    requireFinite(occurrence.advancePt, `${occurrencePath}.advancePt`);
+    if (!atMostWithinFloatingPrecision(node.flowBounds.yPt, occurrence.flowBounds.yPt)
+      || !atMostWithinFloatingPrecision(
+        occurrence.flowBounds.yPt + occurrence.advancePt,
+        node.flowBounds.yPt + node.flowBounds.heightPt,
+      )) {
+      throw new LayoutInvariantError('FLOW_DOMAIN_INVASION', `${occurrencePath} lies outside its note`);
+    }
+    if (occurrence.paragraph && occurrence.paragraph.flowDomainId !== node.flowDomainId) {
+      throw new LayoutInvariantError('INVALID_REFERENCE', `${occurrencePath} leaves its note flow domain`);
+    }
+    if (occurrence.rule) {
+      for (const point of [occurrence.rule.segment.from, occurrence.rule.segment.to]) {
+        requireFinite(point.xPt, `${occurrencePath}.rule.xPt`);
+        requireFinite(point.yPt, `${occurrencePath}.rule.yPt`);
+      }
+    }
   }
 }
 
@@ -438,6 +525,7 @@ function requireRetainedCollisionGeometry(node: PaintNode, path: string): void {
     return;
   }
   if (node.kind === 'textbox') {
+    node.clipRects?.forEach((rect, index) => requireRect(rect, `${path}.clipRects[${index}]`));
     node.story.blocks.forEach((block, index) =>
       requireRetainedCollisionGeometry(block, `${path}.story.blocks[${index}]`));
   }
@@ -464,6 +552,12 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
     if (command.kind === 'noop') return;
     if (command.kind === 'drawingml-shape') {
       requireDrawingMLShapePlan(command, commandPath);
+      if (command.concentricFill) {
+        const fill = command.concentricFill;
+        if (fill.bounds) requireRect(fill.bounds, `${commandPath}.concentricFill.bounds`);
+        for (const [key,value] of Object.entries(fill.focus)) requireFinite(value, `${commandPath}.concentricFill.focus.${key}`);
+        fill.rings.forEach((ring,i) => { requireFinite(ring.outside, `${commandPath}.concentricFill.rings[${i}]`); });
+      }
       return;
     }
     if (command.kind === 'drawingml-image-fill') {
@@ -471,6 +565,7 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
       if (command.resourceKey.length === 0) {
         throw new LayoutInvariantError('INVALID_GEOMETRY', `${commandPath}.resourceKey is empty`);
       }
+      if (command.maskBounds) requireRect(command.maskBounds, `${commandPath}.maskBounds`);
       if (command.fillRect) {
         for (const edge of ['l', 't', 'r', 'b'] as const) {
           requireFinite(command.fillRect[edge], `${commandPath}.fillRect.${edge}`);
@@ -489,6 +584,7 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
       requireFinite(command.fontWeight, `${commandPath}.fontWeight`);
     }
     if (command.kind === 'watermark-text') {
+      if (command.maskBounds) requireRect(command.maskBounds, `${commandPath}.maskBounds`);
       requireRect(command.sourceBounds, `${commandPath}.sourceBounds`);
       if (command.sourceBounds.widthPt <= 0 || command.sourceBounds.heightPt <= 0) {
         throw new LayoutInvariantError(
@@ -502,6 +598,9 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
       if (command.opacity < 0 || command.opacity > 1 || command.fontSizePt <= 0) {
         throw new LayoutInvariantError('INVALID_GEOMETRY', `${commandPath} has invalid textPath paint metrics`);
       }
+      command.pathSlices?.forEach((slice, i) => {
+        for (const [key, value] of Object.entries(slice)) requireFinite(value, `${commandPath}.pathSlices[${i}].${key}`);
+      });
       command.spans.forEach((span, spanIndex) => {
         requireFinite(span.advancePt, `${commandPath}.spans[${spanIndex}].advancePt`);
         requireFinite(span.fontWeight, `${commandPath}.spans[${spanIndex}].fontWeight`);
@@ -510,8 +609,11 @@ function requireDrawingGeometry(node: DrawingLayout, path: string): void {
   });
 }
 
-function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
-  assertPlainData(layout, 'layout');
+function* assertDocumentLayoutUncheckedSteps(layout: DocumentLayout): Generator<number, void, void> {
+  // Validate the root and the pages array now, then validate each complete page
+  // before yielding. This preserves the plain-data contract while giving the
+  // scheduler a safe suspension point in the formerly monolithic final walk.
+  assertPlainData(layout, 'layout', new WeakSet<object>(), true);
   layout.diagnostics.forEach((diagnostic, index) => {
     const path = `diagnostics[${index}]`;
     if (!LAYOUT_DIAGNOSTIC_CODES.has(diagnostic.code)) {
@@ -535,7 +637,8 @@ function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
     }
   });
   const documentRetainedNodeIds = new Set<string>();
-  layout.pages.forEach((page, pageIndex) => {
+  for (const [pageIndex, page] of layout.pages.entries()) {
+    assertPlainData(page, `layout.pages[${pageIndex}]`);
     if (!Number.isInteger(page.pageIndex) || page.pageIndex !== pageIndex) {
       throw new LayoutInvariantError(
         'INVALID_REFERENCE',
@@ -640,16 +743,16 @@ function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
           );
         }
         pageWritingMode = writingMode;
-        let sectionWritingMode: WritingMode;
+        let sectionMode: WritingMode;
         try {
-          sectionWritingMode = writingModeFromTextDirection(region.section.textDirection);
+          sectionMode = sectionWritingMode(region.section);
         } catch (error) {
           throw new LayoutInvariantError(
             'INVALID_GEOMETRY',
             `${path}.section.textDirection is unsupported: ${(error as Error).message}`,
           );
         }
-        if (writingMode !== sectionWritingMode) {
+        if (writingMode !== sectionMode) {
           throw new LayoutInvariantError(
             'INVALID_GEOMETRY',
             `${path} writing mode contradicts its section text direction`,
@@ -882,6 +985,7 @@ function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
       nodes.set(node.id, node);
       collectRetainedNodeIds(node, retainedNodeIds, documentRetainedNodeIds);
       requireRetainedCollisionGeometry(node, path);
+      requireNoteSeparatorOwnership(node, path);
       requireRect(node.flowBounds, `${path}.flowBounds`);
       requireRect(node.inkBounds, `${path}.inkBounds`);
       if (node.clipBounds) requireRect(node.clipBounds, `${path}.clipBounds`);
@@ -989,12 +1093,17 @@ function assertDocumentLayoutUnchecked(layout: DocumentLayout): void {
         }
       }
     }
-  });
+    yield FINALIZATION_SUSPENSION;
+  }
 }
 
 export function assertDocumentLayout(layout: DocumentLayout): void {
+  for (const _step of assertDocumentLayoutSteps(layout)) { /* drain */ }
+}
+
+function* assertDocumentLayoutSteps(layout: DocumentLayout): Generator<number, void, void> {
   try {
-    assertDocumentLayoutUnchecked(layout);
+    yield* assertDocumentLayoutUncheckedSteps(layout);
   } catch (error) {
     if (error instanceof LayoutInvariantError) throw error;
     if (error instanceof TypeError || error instanceof RangeError) {
@@ -1053,8 +1162,16 @@ function deepFreeze<T>(value: T, seen: WeakSet<object>): DeepReadonly<T> {
     return value as DeepReadonly<T>;
   }
   if (seen.has(value)) return value as DeepReadonly<T>;
+  // A plain-data root sealed by its own complete freeze walk is already deeply
+  // frozen, and that walk rejected non-finite numbers in its whole graph.
+  if (isDeepFrozenPlainDataRoot(value)) return value as DeepReadonly<T>;
   seen.add(value);
-  for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child, seen);
+  // Own enumerable string keys, as Object.values, without its array per node.
+  for (const key in value) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      deepFreeze((value as Record<string, unknown>)[key], seen);
+    }
+  }
   return Object.freeze(value) as DeepReadonly<T>;
 }
 
@@ -1092,11 +1209,28 @@ export function deepFreezeDocumentLayout(layout: DocumentLayout): DeepReadonly<D
 export function assertAndDeepFreezeDocumentLayout(
   layout: DocumentLayout,
 ): DeepReadonly<DocumentLayout> {
+  const steps = assertAndDeepFreezeDocumentLayoutSteps(layout);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+/** The same invariant and freeze operations as the synchronous boundary, with
+ * page-level suspension points for main-thread pagination. */
+export function* assertAndDeepFreezeDocumentLayoutSteps(
+  layout: DocumentLayout,
+): Generator<number, DeepReadonly<DocumentLayout>, void> {
   if (verifiedFrozenDocumentLayouts.has(layout)) {
     return layout as DeepReadonly<DocumentLayout>;
   }
-  assertDocumentLayout(layout);
-  const frozen = freezeDocumentLayout(layout);
+  yield* assertDocumentLayoutSteps(layout);
+  const seen = new WeakSet<object>();
+  for (const page of layout.pages) {
+    deepFreeze(page, seen);
+    yield FINALIZATION_SUSPENSION;
+  }
+  const frozen = deepFreeze(layout, seen);
+  frozenDocumentLayouts.add(frozen);
   verifiedFrozenDocumentLayouts.add(frozen);
   return frozen;
 }

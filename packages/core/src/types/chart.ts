@@ -823,6 +823,13 @@ export interface ChartModel {
   titleRichRuns?: ChartTextRun[] | null;
   /** Direct chart title element exists; an empty title still reserves its band. */
   titlePresent?: boolean;
+  /**
+   * The source chart declares no series at all (every classic plot-area group
+   * is empty, or a binary chart has no Series record). Office draws such a
+   * chart as its empty chart area; the renderer does not show its "(no data)"
+   * placeholder, which it keeps for charts whose series could not be read.
+   */
+  authoredWithoutSeries?: boolean;
   categories: string[];
   /** Host-resolved visibility of the shared category source, aligned by point
    * index. Kept separate from the category strings so authored chart caches
@@ -982,10 +989,12 @@ export interface ChartModel {
    *  gets the reserved band. null = use default layout. */
   legendManualLayout?: LegendManualLayout | null;
   /**
-   * `<c:valAx><c:numFmt@formatCode>` — format code applied to value-axis tick
-   * labels (ECMA-376 §21.2.2.21). null = plain numeric formatting.
+   * Effective value-axis tick format after source linking is resolved.
+   * null = plain numeric formatting.
    */
   valAxisFormatCode?: string | null;
+  /** Authored axis code/linkage, retained apart from the effective tick code. */
+  valAxisNumberFormat?: ChartAxisNumberFormat | null;
   /** `<c:valAx><c:dispUnits>` display-only divisor and optional label. Series
    * values and plot geometry stay in their authored units. */
   valAxisDisplayUnits?: ChartDisplayUnits | null;
@@ -1193,10 +1202,11 @@ export interface ChartModel {
   /** A direct `<c:valAx><c:spPr><a:ln>` paint was authored. */
   valAxisLinePaintAuthored?: boolean | null;
   /**
-   * `<c:catAx><c:numFmt@formatCode>` (or scatter X-axis valAx). When set,
-   * the renderer formats X-axis tick labels with this code (e.g. dates).
+   * Effective category-axis tick format (or scatter X-axis valAx).
    */
   catAxisFormatCode?: string | null;
+  /** Authored axis code/linkage, retained apart from the effective tick code. */
+  catAxisNumberFormat?: ChartAxisNumberFormat | null;
   /**
    * `<c:catAx><c:scaling><c:min/max>` — explicit X-axis range. Used by
    * scatter / bubble charts whose X axis is numeric. null = derive from
@@ -1527,6 +1537,13 @@ export interface ChartModel {
   chartexRegionMap?: ChartexRegionMap | null;
   /** ChartEx histogram controls; raw observations remain in `series[0]`. */
   chartexHistogramBinning?: ChartexHistogramBinning | null;
+  chartexParetoOwnerIndex?: number | null;
+  chartexParetoSortDescending?: boolean | null;
+  chartexParetoFlatEndpoint?: boolean | null;
+  chartexSuppressGeometry?: boolean | null;
+  chartexParetoOutlineOwner?: boolean | null;
+  chartexPrimaryAxisRight?: boolean | null;
+  chartexShowUnpairedPercentageAxis?: boolean | null;
   /**
    * Theme accent palette (`accent1..6`, hex without '#') for chartEx charts
    * that color by branch/series index (boxWhisker series and
@@ -1553,8 +1570,10 @@ export interface ChartModel {
   classicChartStyleRoles?: Partial<Record<ChartStyleRole, ChartExElementStyle>> | null;
   /** Surface-specific numeric style materialized in the value-band domain. */
   classicSurfaceBandStyles?: ChartClassicSurfaceBandStyles | null;
-  /** Raw linked style table retained after renderer-facing effective roles are
-   * composed, so Surface can resolve direct > linked > numeric per band. */
+  /** Linked style table retained after renderer-facing effective roles are
+   * composed. For a classic chart the linked series data roles
+   * (`dataPoint*`, `upBar`, `downBar`, `hiLoLine`) are dropped entirely: Office paints
+   * those atoms from direct formatting over the numeric style alone. */
   linkedChartStyleRoles?: Partial<Record<ChartStyleRole, ChartExElementStyle>> | null;
   /** Numeric dataPoint/dataPoint3D roles for the most common bounded point
    * domain among varyColors groups. Group slots with the same domain inherit
@@ -1941,6 +1960,18 @@ export interface ChartexHistogramBinning {
   intervalClosed?: 'l' | 'r' | null;
   underflow?: number | null;
   overflow?: number | null;
+  /**
+   * Number format for the bin-edge category labels only (value dimension's
+   * resolved or cached format). Never applied to the bin counts.
+   */
+  edgeFormatCode?: string | null;
+}
+
+/** Authored axis format, separate from the effective tick format. */
+export interface ChartAxisNumberFormat {
+  authoredCode: string;
+  /** Omission means true per ECMA-376 §21.2.2.121. */
+  sourceLinked?: boolean | null;
 }
 
 /**
@@ -1963,8 +1994,10 @@ export interface SecondaryValueAxis {
   title: string | null;
   /** `<c:delete val="1"/>` — hide labels/ticks entirely. */
   hidden: boolean;
-  /** `<c:numFmt formatCode>` for tick labels. */
+  /** Effective tick format after source linking is resolved. */
   formatCode?: string | null;
+  /** Authored axis code/linkage, retained apart from the effective tick code. */
+  numberFormat?: ChartAxisNumberFormat | null;
   /** `<c:dispUnits>` for this auxiliary value axis. */
   displayUnits?: ChartDisplayUnits | null;
   /** `<c:txPr>…<a:solidFill>` tick-label color (hex without '#'). */

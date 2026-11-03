@@ -1,14 +1,20 @@
 import { excelSerialToUtcDate, utcDateToExcelSerial } from '@silurus/ooxml-core';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
 import type { Cell, DefinedName } from './types.js';
+// OOXML's fixed address grammar bounds belong to lexical reference parsing,
+// independently of renderer geometry and its shared layout runtime.
+const MAX_WORKSHEET_ROW = 1_048_576;
+const MAX_WORKSHEET_COL = 16_384;
 
 // ────────────────────────────────────────────────────────────────
 // Formula evaluator (conditional-formatting `expression` rules)
 //
 // Handles the narrow subset of Excel formulas used by CF expression rules:
 // numeric/boolean literals, cell references (A1-style, with $ absolute
-// markers), defined-name resolution, comparison/arithmetic operators, and
-// a handful of functions (AND, OR, NOT, IF, ROUNDDOWN, ROUND, ROUNDUP,
-// ISBLANK). Formula strings embed relative references that shift based on
+// markers), defined-name resolution, comparison/arithmetic operators, error
+// values, and the functions listed in `FUNCTION_ARITY`. An expression is
+// parsed completely before it is evaluated against cached cell values.
+// Formula strings embed relative references that shift based on
 // the evaluation cell's offset from an anchor cell:
 //   - CF formulas use the top-left of the rule's `sqref` as anchor
 //   - Workbook-level defined names are anchored at A1 (row 1, col 1)
@@ -22,13 +28,42 @@ interface EvalCtx {
   anchorRow: number;
   anchorCol: number;
   cellIndex: ReadonlyMap<string, Cell>;
-  definedNames: Map<string, DefinedName>;
+  /** In-scope names keyed by spelling; see `lookupDefinedName`. */
+  definedNames: ReadonlyMap<string, DefinedName>;
   /** Recursion guard for nested defined-name resolution. */
   depth: number;
 }
 
-type EvalScalar = number | boolean | string | null;
+/** An ECMA-376 §18.17 error value (`#DIV/0!`, `#N/A`, …), from an error
+ *  literal, a cell's cached error or a function/operator domain failure. It
+ *  is a value, so IFERROR and the IS* functions can inspect it; every other
+ *  consumer coerces through `toNum`/`toBool`/`toStr`, which propagate it. */
+class FormulaErrorValue {
+  constructor(readonly code: string) {}
+}
+
+type EvalScalar = number | boolean | string | null | FormulaErrorValue;
 type EvalValue = EvalScalar | EvalScalar[];
+type PlainScalar = Exclude<EvalScalar, FormulaErrorValue>;
+
+type FailureKind = 'unsupported' | 'invalid' | 'error';
+
+/** Internal CF boundary, not a claim of complete formula support (#1547).
+ * ECMA-376 §18.17.2 requires the whole expression to be consumed. Unsupported
+ * syntax/functions/names and invalid expressions are never numeric placeholders:
+ * NOT, comparison or arithmetic could turn 0 into TRUE and make stopIfTrue
+ * suppress valid lower-priority rules (§18.3.1.10). An expression whose value
+ * is an error value is `error`: a CF formula applies only when it is TRUE.
+ */
+export type FormulaEvaluation =
+  | { kind: 'value'; value: EvalValue }
+  | { kind: FailureKind };
+
+class FormulaFailure extends Error {
+  constructor(readonly kind: FailureKind, readonly code?: string) {
+    super(`CF formula ${kind}`);
+  }
+}
 
 /** Flatten nested scalars and arrays to a flat list of scalars. */
 function flatten(v: EvalValue): EvalScalar[] {
@@ -42,43 +77,120 @@ function toScalar(v: EvalValue): EvalScalar {
   return Array.isArray(v) ? (v[0] ?? 0) : v;
 }
 
-const MAX_DEFINED_NAME_DEPTH = 8;
+/** Scalar value of an operand, propagating an error value (the operators
+ *  and the functions modeled here return the first error operand). */
+function operand(v: EvalValue): PlainScalar {
+  const s = toScalar(v);
+  if (s instanceof FormulaErrorValue) throw new FormulaFailure('error', s.code);
+  return s;
+}
 
-export function evalFormulaToBool(formula: string, ctx: EvalCtx): boolean {
+/** SUM/MIN/MAX/AVERAGE/AND/OR propagate an error anywhere in their
+ *  arguments, including inside a referenced range. */
+function flattenPropagatingErrors(args: EvalValue[]): PlainScalar[] {
+  return args.flatMap(flatten).map(v => operand(v));
+}
+
+const MAX_DEFINED_NAME_DEPTH = 8;
+// Library admission policy, not an Excel grammar limit. Bound recursive
+// descent before an untrusted CF expression can exhaust the JS call stack.
+// The budget covers grouping, unary operators and defined-name expansion,
+// and therefore also the depth of the tree that `evaluate` walks.
+const MAX_FORMULA_PARSE_DEPTH = 128;
+// Library resource policy: retain at most 64 Ki UTF-16 source units from
+// expanded defined-name bodies per CF expression. A depth guard alone does
+// not bound a branching name graph's exponentially duplicated AST. Debit
+// the shared budget before tokenizing each body; reject the entire expression
+// instead of truncating its meaning. This does not cap the outer formula.
+const MAX_EXPANDED_NAME_SOURCE_UNITS = 64 * 1024;
+interface ParseBudget {
+  depth: number;
+  remainingNameSourceUnits: number;
+}
+
+/** The CF match of an already computed evaluation, so a caller that needs
+ *  the evaluation kind (for the #1547 diagnostics) does not evaluate twice.
+ *  Only a value converts; unsupported, invalid and error results are false. */
+export function formulaEvaluationToBool(result: FormulaEvaluation): boolean {
+  if (result.kind !== 'value') return false;
   try {
-    const v = evalFormula(formula, ctx);
-    return toBool(v);
-  } catch {
-    return false;
+    return toBool(result.value);
+  } catch (error) {
+    // A range whose first cell is an error value.
+    if (error instanceof FormulaFailure) return false;
+    throw error;
+  }
+}
+
+export function evaluateFormula(formula: string, ctx: EvalCtx): FormulaEvaluation {
+  try {
+    const value = evalFormula(formula, ctx);
+    if (value instanceof FormulaErrorValue) return { kind: 'error' };
+    return { kind: 'value', value };
+  } catch (error) {
+    if (error instanceof FormulaFailure) return { kind: error.kind };
+    // Do not silently misclassify a programming/resource failure as no match.
+    throw error;
   }
 }
 
 function toBool(v: EvalValue): boolean {
-  const s = toScalar(v);
+  const s = operand(v);
   if (typeof s === 'boolean') return s;
   if (typeof s === 'number') return s !== 0;
   if (typeof s === 'string') return s.length > 0 && s.toUpperCase() !== 'FALSE';
   return false;
 }
 
+/** Number operand for arithmetic, unary operators and number-typed function
+ * arguments (§18.17.7: an incompatible argument type is #VALUE!). Each failure
+ * is an Excel error value, never a placeholder 0: NOT, a comparison or
+ * stopIfTrue could otherwise turn the error into a match. Comparison operands
+ * do not use this conversion; see applyCmp. */
 function toNum(v: EvalValue): number {
-  const s = toScalar(v);
-  if (typeof s === 'number') return s;
+  const s = operand(v);
+  if (typeof s === 'number') {
+    // §18.17.2.6 numbers are real numbers. An IEEE Infinity or NaN can only
+    // come from an overflowed or undefined intermediate result, which §18.17.3
+    // classifies as #NUM!. This also guards cached/range operands and chain
+    // accumulators when numeric coercion is required.
+    if (!Number.isFinite(s)) throw new FormulaFailure('error', '#NUM!');
+    return s;
+  }
   if (typeof s === 'boolean') return s ? 1 : 0;
   if (s == null) return 0;
-  const n = parseFloat(String(s));
-  return isNaN(n) ? 0 : n;
+  // §18.17.3 #VALUE!: text is an incompatible operand unless converted.
+  const n = parseNumericText(s);
+  if (n === null) throw new FormulaFailure('error', '#VALUE!');
+  return n;
+}
+
+/** Library policy, not an Excel rule: §18.17.2.6 leaves text-to-number
+ * conversion implementation-defined. Only the locale-independent §18.17.2.1
+ * numeric-constant spelling converts, with an optional sign and surrounding
+ * U+0020 spaces; underflow reads as 0, as the literal tokenizer does. Other
+ * spellings Excel may convert through locale or number formats (percent,
+ * currency, grouping, dates, times) fail as #VALUE!, as does a numeric
+ * prefix ("1x") or overflow, rather than as a guess. */
+function parseNumericText(s: string): number | null {
+  if (!/^ *[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)? *$/u.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
 }
 
 function toStr(v: EvalValue): string {
-  const s = toScalar(v);
+  const s = operand(v);
   if (s == null) return '';
   if (typeof s === 'boolean') return s ? 'TRUE' : 'FALSE';
   return String(s);
 }
 
+function formulaError(code: string): FormulaErrorValue {
+  return new FormulaErrorValue(code);
+}
+
 interface Tok {
-  kind: 'num' | 'str' | 'op' | 'lparen' | 'rparen' | 'comma' | 'ref' | 'name' | 'bool' | 'colon';
+  kind: 'num' | 'str' | 'op' | 'lparen' | 'rparen' | 'comma' | 'ref' | 'name' | 'bool' | 'colon' | 'error';
   text: string;
   /** For 'ref': pre-parsed reference. */
   ref?: { colAbs: boolean; col: number; rowAbs: boolean; row: number };
@@ -104,15 +216,28 @@ function tokenize(formula: string): Tok[] {
         if (s[j] === '"') break;
         buf += s[j]; j++;
       }
+      if (j === s.length) throw new FormulaFailure('invalid');
       toks.push({ kind: 'str', text: buf });
       i = j + 1;
       continue;
     }
-    if (c >= '0' && c <= '9') {
-      let j = i;
-      while (j < s.length && ((s[j] >= '0' && s[j] <= '9') || s[j] === '.')) j++;
-      toks.push({ kind: 'num', text: s.slice(i, j) });
-      i = j;
+    if (c === '#') {
+      // ECMA-376 §18.17.2 error literals (e.g. `#REF!` left by a deleted
+      // reference). Skipping the `#` would read `REF` as an unknown name
+      // worth 0 and let the rule match.
+      const m = /^#(?:NULL!|DIV\/0!|VALUE!|REF!|NAME\?|NUM!|N\/A|GETTING_DATA)/u.exec(s.slice(i));
+      if (!m) throw new FormulaFailure('unsupported');
+      toks.push({ kind: 'error', text: m[0] });
+      i += m[0].length;
+      continue;
+    }
+    if ((c >= '0' && c <= '9') || (c === '.' && /[0-9]/u.test(s[i + 1] ?? ''))) {
+      // §18.17.2.1 numerical-constant: retain decimal/exponent spellings
+      // while rejecting adjacent numbers rather than accepting a prefix.
+      const m = /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/u.exec(s.slice(i));
+      if (!m || !Number.isFinite(Number(m[0]))) throw new FormulaFailure('invalid');
+      toks.push({ kind: 'num', text: m[0] });
+      i += m[0].length;
       continue;
     }
     if (OP_CHARS.has(c)) {
@@ -128,24 +253,28 @@ function tokenize(formula: string): Tok[] {
     }
     // Reference or identifier: may start with $, letters, or letters+digits.
     // Defined names allow letters, digits, '_', '.'; cell refs are
-    // `$?[A-Z]+\$?[0-9]+` (case-insensitive).
+    // `$?[A-Z]+\$?[0-9]+` (case-insensitive) inside the worksheet grid. A
+    // name cannot be spelled as a cell reference (§18.2.5, §18.17.5.1), so a
+    // spelling inside the grid is a cell and one outside it may be a name.
+    // A cell-like spelling directly before '(' is a function name (LOG10).
     if (c === '$' || isIdentStart(c)) {
       let j = i;
       while (j < s.length && (s[j] === '$' || isIdentPart(s[j]))) j++;
       const text = s.slice(i, j);
       i = j;
-      const ref = tryParseCellRef(text);
+      const ref = s[i] === '(' ? null : tryParseCellRef(text);
       if (ref) {
         toks.push({ kind: 'ref', text, ref });
       } else {
         const up = text.toUpperCase();
-        if (up === 'TRUE' || up === 'FALSE') toks.push({ kind: 'bool', text: up });
+        if ((up === 'TRUE' || up === 'FALSE') && s[i] !== '(') toks.push({ kind: 'bool', text: up });
         else toks.push({ kind: 'name', text });
       }
       continue;
     }
-    // Unknown character — skip.
-    i++;
+    // Sheet-qualified references, arrays and future syntax are outside this
+    // evaluator. Skipping a token would evaluate a different expression.
+    throw new FormulaFailure('unsupported');
   }
   return toks;
 }
@@ -180,57 +309,172 @@ function tryParseCellRef(s: string): { colAbs: boolean; col: number; rowAbs: boo
   for (let k = 0; k < colLetters.length; k++) {
     col = col * 26 + (colLetters.charCodeAt(k) - 64);
   }
+  // The worksheet grid (MAX_WORKSHEET_ROW x MAX_WORKSHEET_COL) bounds cell
+  // references. Outside it the spelling is not a cell (§18.2.5, §18.17.5.1),
+  // so `Limit1` resolves as a defined name instead of reading a blank that
+  // comparisons would treat as 0.
+  if (rowNum < 1 || rowNum > MAX_WORKSHEET_ROW || col > MAX_WORKSHEET_COL) return null;
   return { colAbs, col, rowAbs, row: rowNum };
 }
+
+type CellRef = { colAbs: boolean; col: number; rowAbs: boolean; row: number };
+
+// The whole expression is parsed into a tree before anything is evaluated, so
+// IF evaluates only the selected branch and IFERROR/IS* observe an error
+// value produced anywhere inside their argument (see `callFunc`).
+type FormulaNode =
+  | { t: 'lit'; v: EvalScalar }
+  | { t: 'ref'; ref: CellRef }
+  | { t: 'range'; a: CellRef; b: CellRef }
+  | { t: 'neg' | 'pos'; e: FormulaNode }
+  /** A comparison (not chained: a second comparison operator is unsupported). */
+  | { t: 'bin'; op: string; l: FormulaNode; r: FormulaNode }
+  /** A left-associative `&`, `+`/`-` or `*`/`/` run, kept flat so evaluation
+   *  loops over it instead of recursing once per operator. */
+  | { t: 'chain'; first: FormulaNode; rest: { op: string; r: FormulaNode }[] }
+  | { t: 'call'; name: string; args: FormulaNode[] }
+  /** A workbook defined name; its body anchors relative references at A1. */
+  | { t: 'name'; body: FormulaNode };
 
 interface Parser {
   toks: Tok[];
   pos: number;
+  budget: ParseBudget;
+  names: ReadonlyMap<string, DefinedName>;
+  nameDepth: number;
+}
+
+// §18.17.2.5: defined names are case-insensitive. The caller keys its map by
+// the stored spelling, so resolve through ASCII-folded keys. Folding only
+// ASCII is library policy: formula tokens are ASCII here, and Unicode case
+// equivalence (e.g. KELVIN SIGN vs "k") is not established. A later case
+// variant wins, as an exact duplicate already does in the caller's map and
+// in internal-hyperlink name resolution (the existing shadowing policy).
+//
+// The index is built once per caller-owned map, not per evaluated cell. The
+// map is treated as fixed after construction; a size change rebuilds the
+// index, and a stale key whose definition was removed fails closed.
+interface FoldedNameIndex {
+  size: number;
+  keys: Map<string, string>;
+}
+const foldedNameIndexes = new WeakMap<ReadonlyMap<string, DefinedName>, FoldedNameIndex>();
+
+/** ASCII folding shared by defined names and the bounded text-criteria domain. */
+function asciiFold(name: string): string {
+  return name.replace(/[A-Z]+/gu, (letters) => letters.toLowerCase());
+}
+
+function lookupDefinedName(names: ReadonlyMap<string, DefinedName>, spelling: string): DefinedName | undefined {
+  let index = foldedNameIndexes.get(names);
+  if (!index || index.size !== names.size) {
+    const keys = new Map<string, string>();
+    for (const key of names.keys()) keys.set(asciiFold(key), key);
+    index = { size: names.size, keys };
+    foldedNameIndexes.set(names, index);
+  }
+  const key = index.keys.get(asciiFold(spelling));
+  return key === undefined ? undefined : names.get(key);
 }
 
 function evalFormula(formula: string, ctx: EvalCtx): EvalValue {
-  const toks = tokenize(formula);
-  const p: Parser = { toks, pos: 0 };
-  const v = parseExpr(p, ctx);
-  return v;
+  return evaluate(parseFormula(formula, ctx.definedNames, ctx.depth,
+    { depth: 0, remainingNameSourceUnits: MAX_EXPANDED_NAME_SOURCE_UNITS }), ctx);
+}
+
+function parseFormula(
+  formula: string,
+  names: ReadonlyMap<string, DefinedName>,
+  nameDepth: number,
+  budget: ParseBudget,
+): FormulaNode {
+  // The stored grammar is an expression; accept the conventional display '='
+  // prefix too, without interpreting a second '=' as an empty operand.
+  const source = formula.trim();
+  const toks = tokenize(source.startsWith('=') ? source.slice(1) : source);
+  const p: Parser = { toks, pos: 0, budget, names, nameDepth };
+  const node = parseExpr(p);
+  if (p.pos !== toks.length) throw new FormulaFailure('unsupported');
+  return node;
 }
 
 function peek(p: Parser): Tok | undefined { return p.toks[p.pos]; }
 function consume(p: Parser): Tok | undefined { return p.toks[p.pos++]; }
 
-function parseExpr(p: Parser, ctx: EvalCtx): EvalValue {
-  return parseCmp(p, ctx);
+function parseExpr(p: Parser): FormulaNode {
+  if (p.budget.depth >= MAX_FORMULA_PARSE_DEPTH) throw new FormulaFailure('unsupported');
+  p.budget.depth++;
+  try {
+    return parseCmp(p);
+  } finally {
+    p.budget.depth--;
+  }
 }
 
-function parseCmp(p: Parser, ctx: EvalCtx): EvalValue {
-  let left = parseConcat(p, ctx);
+function parseCmp(p: Parser): FormulaNode {
+  const left = parseConcat(p);
   const t = peek(p);
   if (t && t.kind === 'op' && (t.text === '<' || t.text === '>' || t.text === '<=' || t.text === '>=' || t.text === '=' || t.text === '<>')) {
     consume(p);
-    const right = parseConcat(p, ctx);
-    return applyCmp(t.text, left, right);
+    return { t: 'bin', op: t.text, l: left, r: parseConcat(p) };
   }
   return left;
 }
 
-function parseConcat(p: Parser, ctx: EvalCtx): EvalValue {
-  let left = parseAdd(p, ctx);
+function parseChain(p: Parser, ops: readonly string[], parseOperand: (p: Parser) => FormulaNode): FormulaNode {
+  const first = parseOperand(p);
+  const rest: { op: string; r: FormulaNode }[] = [];
   while (true) {
     const t = peek(p);
-    if (!t || t.kind !== 'op' || t.text !== '&') break;
+    if (!t || t.kind !== 'op' || !ops.includes(t.text)) break;
     consume(p);
-    const right = parseAdd(p, ctx);
-    left = toStr(left) + toStr(right);
+    rest.push({ op: t.text, r: parseOperand(p) });
   }
-  return left;
+  return rest.length ? { t: 'chain', first, rest } : first;
 }
 
-function applyCmp(op: string, a: EvalValue, b: EvalValue): boolean {
-  // Numeric-first comparison; fall back to string compare if either side is
-  // a non-numeric string. Matches Excel's behavior for dates (stored as
-  // serials) and arithmetic operations.
-  const an = typeof a === 'string' && isNaN(parseFloat(a)) ? null : toNum(a);
-  const bn = typeof b === 'string' && isNaN(parseFloat(b)) ? null : toNum(b);
+function parseConcat(p: Parser): FormulaNode { return parseChain(p, ['&'], parseAdd); }
+function parseAdd(p: Parser): FormulaNode { return parseChain(p, ['+', '-'], parseMul); }
+function parseMul(p: Parser): FormulaNode { return parseChain(p, ['*', '/'], parseUnary); }
+
+// §18.17.3: a numeric result outside the representable range is #NUM!.
+// Use only for direct arithmetic and the EXP/POWER results below. A blanket
+// node-level conversion would misclassify legacy rounding helpers whose
+// intermediate can overflow although the mathematical result is finite.
+// Correcting those algorithms and aggregate overflow is separate work.
+function numericResult(value: number): EvalScalar {
+  return Number.isFinite(value) ? value : formulaError('#NUM!');
+}
+
+function applyBinary(op: string, a: EvalValue, b: EvalValue): EvalValue {
+  // Operands are coerced left to right, so the left operand's error wins.
+  switch (op) {
+    case '&': return toStr(a) + toStr(b);
+    case '+': return numericResult(toNum(a) + toNum(b));
+    case '-': return numericResult(toNum(a) - toNum(b));
+    case '*': return numericResult(toNum(a) * toNum(b));
+    case '/': {
+      const n = toNum(a);
+      const d = toNum(b);
+      // ECMA-376 §18.17 error values: #DIV/0! is the result of dividing by
+      // zero (a blank divisor reads as 0), never a numeric placeholder.
+      return d === 0 ? formulaError('#DIV/0!') : numericResult(n / d);
+    }
+    default:  return applyCmp(op, operand(a), operand(b));
+  }
+}
+
+/** Unsettled (#1547): §18.17 does not define how comparison operators convert
+ * or order mixed-type, blank or text operands, and no Excel evidence is
+ * recorded here. Until it is, this keeps the evaluator's earlier rule rather
+ * than adopting either arithmetic's #VALUE! conversion or a guessed Excel
+ * order: when neither operand is text without a numeric prefix, both compare
+ * as numbers; otherwise both compare as case-sensitive strings, a blank as "".
+ * Known unverified consequences include "1"=1, TRUE=1 and "2024 Q1"="2024 Q2"
+ * reading TRUE. */
+function applyCmp(op: string, a: PlainScalar, b: PlainScalar): boolean {
+  const an = typeof a === 'string' && isNaN(parseFloat(a)) ? null : comparisonNumber(a);
+  const bn = typeof b === 'string' && isNaN(parseFloat(b)) ? null : comparisonNumber(b);
   if (an !== null && bn !== null) {
     switch (op) {
       case '<':  return an <  bn;
@@ -253,51 +497,43 @@ function applyCmp(op: string, a: EvalValue, b: EvalValue): boolean {
   return false;
 }
 
-function parseAdd(p: Parser, ctx: EvalCtx): EvalValue {
-  let left = parseMul(p, ctx);
-  while (true) {
+/** The evaluator's earlier lenient number reading, kept only for applyCmp's
+ * unsettled rule: a text prefix ("1x" → 1), 0 for other text, and no error.
+ * Do not use it for arithmetic or function arguments; they use toNum. */
+function comparisonNumber(v: EvalValue): number {
+  const s = operand(v);
+  if (typeof s === 'number') return s;
+  if (typeof s === 'boolean') return s ? 1 : 0;
+  if (s == null) return 0;
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+
+function parseUnary(p: Parser): FormulaNode {
+  if (p.budget.depth >= MAX_FORMULA_PARSE_DEPTH) throw new FormulaFailure('unsupported');
+  p.budget.depth++;
+  try {
     const t = peek(p);
-    if (!t || t.kind !== 'op' || (t.text !== '+' && t.text !== '-')) break;
-    consume(p);
-    const right = parseMul(p, ctx);
-    left = t.text === '+' ? toNum(left) + toNum(right) : toNum(left) - toNum(right);
+    if (t && t.kind === 'op' && t.text === '-') { consume(p); return { t: 'neg', e: parseUnary(p) }; }
+    if (t && t.kind === 'op' && t.text === '+') { consume(p); return { t: 'pos', e: parseUnary(p) }; }
+    return parsePrimary(p);
+  } finally {
+    p.budget.depth--;
   }
-  return left;
 }
 
-function parseMul(p: Parser, ctx: EvalCtx): EvalValue {
-  let left = parseUnary(p, ctx);
-  while (true) {
-    const t = peek(p);
-    if (!t || t.kind !== 'op' || (t.text !== '*' && t.text !== '/')) break;
-    consume(p);
-    const right = parseUnary(p, ctx);
-    if (t.text === '*') left = toNum(left) * toNum(right);
-    else {
-      const rn = toNum(right);
-      left = rn === 0 ? 0 : toNum(left) / rn;
-    }
-  }
-  return left;
-}
-
-function parseUnary(p: Parser, ctx: EvalCtx): EvalValue {
-  const t = peek(p);
-  if (t && t.kind === 'op' && t.text === '-') { consume(p); return -toNum(parseUnary(p, ctx)); }
-  if (t && t.kind === 'op' && t.text === '+') { consume(p); return toNum(parseUnary(p, ctx)); }
-  return parsePrimary(p, ctx);
-}
-
-function parsePrimary(p: Parser, ctx: EvalCtx): EvalValue {
+function parsePrimary(p: Parser): FormulaNode {
   const t = consume(p);
-  if (!t) return 0;
-  if (t.kind === 'num') return parseFloat(t.text);
-  if (t.kind === 'str') return t.text;
-  if (t.kind === 'bool') return t.text === 'TRUE';
+  if (!t) throw new FormulaFailure('invalid');
+  if (t.kind === 'num') return { t: 'lit', v: parseFloat(t.text) };
+  if (t.kind === 'str') return { t: 'lit', v: t.text };
+  if (t.kind === 'bool') return { t: 'lit', v: t.text === 'TRUE' };
+  if (t.kind === 'error') return { t: 'lit', v: formulaError(t.text) };
   if (t.kind === 'lparen') {
-    const v = parseExpr(p, ctx);
+    const v = parseExpr(p);
     const next = consume(p);
-    if (!next || next.kind !== 'rparen') throw new Error('missing )');
+    if (!next || next.kind !== 'rparen') throw new FormulaFailure('invalid');
     return v;
   }
   if (t.kind === 'ref') {
@@ -305,44 +541,115 @@ function parsePrimary(p: Parser, ctx: EvalCtx): EvalValue {
     if (peek(p)?.kind === 'colon') {
       consume(p);
       const right = consume(p);
-      if (right?.kind !== 'ref' || !right.ref) throw new Error('range: expected ref after :');
-      return resolveRange(t.ref!, right.ref, ctx);
+      if (right?.kind !== 'ref' || !right.ref) throw new FormulaFailure('invalid');
+      return { t: 'range', a: t.ref!, b: right.ref };
     }
-    return resolveRef(t.ref!, ctx);
+    return { t: 'ref', ref: t.ref! };
   }
   if (t.kind === 'name') {
     // Function call: NAME(args)
     if (peek(p)?.kind === 'lparen') {
       consume(p);
-      const args: EvalValue[] = [];
+      const args: FormulaNode[] = [];
       if (peek(p)?.kind !== 'rparen') {
-        args.push(parseExpr(p, ctx));
+        args.push(parseExpr(p));
         while (peek(p)?.kind === 'comma') {
           consume(p);
-          args.push(parseExpr(p, ctx));
+          args.push(parseExpr(p));
         }
       }
       const next = consume(p);
-      if (!next || next.kind !== 'rparen') throw new Error('missing )');
-      return callFunc(t.text, args, ctx);
+      if (!next || next.kind !== 'rparen') throw new FormulaFailure('invalid');
+      const name = t.text.toUpperCase();
+      checkArity(name, args.length);
+      return { t: 'call', name, args };
     }
-    // Defined-name reference: substitute and evaluate.
-    const dn = ctx.definedNames.get(t.text);
-    if (dn && ctx.depth < MAX_DEFINED_NAME_DEPTH) {
-      // Strip `SheetName!` prefix if present; keep just the ref body.
-      const body = stripSheetPrefix(dn.formula);
-      // Workbook-level defined names anchor at A1 for relative-ref shifts.
-      const inner: EvalCtx = {
-        ...ctx,
-        anchorRow: 1,
-        anchorCol: 1,
-        depth: ctx.depth + 1,
-      };
-      return evalFormula(body, inner);
-    }
-    return 0;
+    // Library admission is whole-expression, independently of IF's lazy
+    // value evaluation: an unsupported name/body cannot be hidden in the
+    // branch not taken and then incorrectly suppress another CF rule.
+    const dn = lookupDefinedName(p.names, t.text);
+    if (!dn || p.nameDepth >= MAX_DEFINED_NAME_DEPTH) throw new FormulaFailure('unsupported');
+    if (dn.formula.length > p.budget.remainingNameSourceUnits) throw new FormulaFailure('unsupported');
+    p.budget.remainingNameSourceUnits -= dn.formula.length;
+    // Strip `SheetName!` prefix if present; keep just the ref body.
+    return { t: 'name', body: parseFormula(stripSheetPrefix(dn.formula), p.names, p.nameDepth + 1, p.budget) };
   }
-  return 0;
+  throw new FormulaFailure('invalid');
+}
+
+function evaluate(n: FormulaNode, ctx: EvalCtx): EvalValue {
+  try {
+    return evaluateNode(n, ctx);
+  } catch (error) {
+    // Excel errors are values at every expression boundary, including a
+    // compound operator expression. ISNUMBER/COUNT must inspect them just
+    // as they inspect a cached error cell. Only operand coercion propagates
+    // them; library admission and programming failures remain exceptions.
+    if (error instanceof FormulaFailure && error.kind === 'error') {
+      return formulaError(error.code ?? '#VALUE!');
+    }
+    throw error;
+  }
+}
+
+function evaluateNode(n: FormulaNode, ctx: EvalCtx): EvalValue {
+  switch (n.t) {
+    case 'lit': return n.v;
+    case 'ref': return resolveRef(n.ref, ctx);
+    case 'range': return resolveRange(n.a, n.b, ctx);
+    case 'neg': return -toNum(evaluate(n.e, ctx));
+    case 'pos': return toNum(evaluate(n.e, ctx));
+    case 'bin': return applyBinary(n.op, evaluate(n.l, ctx), evaluate(n.r, ctx));
+    case 'chain': {
+      let acc = evaluate(n.first, ctx);
+      for (const { op, r } of n.rest) acc = applyBinary(op, acc, evaluate(r, ctx));
+      return acc;
+    }
+    case 'call': return callFunc(n.name, n.args, ctx);
+    // Workbook-level defined names anchor at A1 for relative-ref shifts.
+    case 'name': return evaluate(n.body, { ...ctx, anchorRow: 1, anchorCol: 1 });
+  }
+}
+
+// Argument counts of the supported functions, from their signatures in
+// ECMA-376 Part 1 §18.17.7 (IFS and CONCAT are later Excel functions with the
+// same documented form). A call outside them is not a valid formula, so it is
+// invalid rather than evaluated with a missing argument read as blank (which
+// made NOT() TRUE). The 255-argument ceiling is library admission policy,
+// not a normative maximum: §18.17.2 encourages support for at least 255.
+// IF requires its logical test and value-if-true slot (§18.17.7.147);
+// empty argument slots remain outside this evaluator's grammar. Names not
+// listed are not implemented and fail as
+// unsupported during whole-expression admission, including an unused IF branch.
+const FUNCTION_ARITY: Readonly<Record<string, readonly [min: number, max: number]>> = {
+  AND: [1, 255], OR: [1, 255], NOT: [1, 1], IF: [2, 3], IFERROR: [2, 2], IFS: [2, 254],
+  TRUE: [0, 0], FALSE: [0, 0],
+  ISBLANK: [1, 1], ISNUMBER: [1, 1], ISTEXT: [1, 1], ISNONTEXT: [1, 1],
+  ISERROR: [1, 1], ISERR: [1, 1], ISNA: [1, 1], ISLOGICAL: [1, 1],
+  ROUNDDOWN: [2, 2], ROUNDUP: [2, 2], ROUND: [2, 2], INT: [1, 1], TRUNC: [1, 2],
+  CEILING: [2, 2], FLOOR: [2, 2], MOD: [2, 2], POWER: [2, 2], SQRT: [1, 1],
+  ABS: [1, 1], SIGN: [1, 1], EXP: [1, 1], LN: [1, 1], LOG10: [1, 1],
+  MIN: [1, 255], MAX: [1, 255], SUM: [1, 255], AVERAGE: [1, 255],
+  COUNT: [1, 255], COUNTA: [1, 255], COUNTBLANK: [1, 1],
+  COUNTIF: [2, 2], SUMIF: [2, 3], AVERAGEIF: [2, 3],
+  LEN: [1, 1], LEFT: [1, 2], RIGHT: [1, 2], MID: [3, 3], UPPER: [1, 1], LOWER: [1, 1],
+  TRIM: [1, 1], EXACT: [2, 2], FIND: [2, 3], SEARCH: [2, 3],
+  CONCATENATE: [1, 255],
+  // Later Excel CONCAT syntax admits at most 253 text arguments:
+  // https://support.microsoft.com/en-us/excel/functions/concat-function
+  CONCAT: [1, 253], T: [1, 1], N: [1, 1], VALUE: [1, 1],
+  ROW: [0, 1], COLUMN: [0, 1],
+  TODAY: [0, 0], NOW: [0, 0], DATE: [3, 3], YEAR: [1, 1], MONTH: [1, 1], DAY: [1, 1],
+  WEEKDAY: [1, 2],
+};
+
+function checkArity(name: string, count: number): void {
+  const arity = ownValue(FUNCTION_ARITY, name);
+  if (!arity) throw new FormulaFailure('unsupported');
+  // IFS takes condition/value pairs.
+  if (count < arity[0] || count > arity[1] || (name === 'IFS' && count % 2 !== 0)) {
+    throw new FormulaFailure('invalid');
+  }
 }
 
 function stripSheetPrefix(formula: string): string {
@@ -353,37 +660,84 @@ function stripSheetPrefix(formula: string): string {
   return m ? m[1] : formula;
 }
 
-function resolveRef(
-  ref: { colAbs: boolean; col: number; rowAbs: boolean; row: number },
-  ctx: EvalCtx,
-): EvalScalar {
-  const col = ref.colAbs ? ref.col : ref.col + (ctx.col - ctx.anchorCol);
-  const row = ref.rowAbs ? ref.row : ref.row + (ctx.row - ctx.anchorRow);
-  const cell = ctx.cellIndex.get(`${row}:${col}`);
-  return cellValueToEval(cell);
+/** Sheet coordinates of a reference evaluated at `ctx`'s cell. */
+function refCoord(ref: CellRef, ctx: EvalCtx): { row: number; col: number } {
+  return {
+    col: ref.colAbs ? ref.col : ref.col + (ctx.col - ctx.anchorCol),
+    row: ref.rowAbs ? ref.row : ref.row + (ctx.row - ctx.anchorRow),
+  };
 }
 
-function resolveRange(
-  a: { colAbs: boolean; col: number; rowAbs: boolean; row: number },
-  b: { colAbs: boolean; col: number; rowAbs: boolean; row: number },
-  ctx: EvalCtx,
-): EvalScalar[] {
-  const ac = a.colAbs ? a.col : a.col + (ctx.col - ctx.anchorCol);
-  const ar = a.rowAbs ? a.row : a.row + (ctx.row - ctx.anchorRow);
-  const bc = b.colAbs ? b.col : b.col + (ctx.col - ctx.anchorCol);
-  const br = b.rowAbs ? b.row : b.row + (ctx.row - ctx.anchorRow);
-  const c1 = Math.min(ac, bc), c2 = Math.max(ac, bc);
-  const r1 = Math.min(ar, br), r2 = Math.max(ar, br);
+function resolveRef(ref: CellRef, ctx: EvalCtx): EvalScalar {
+  const { row, col } = refCoord(ref, ctx);
+  return cellValueToEval(ctx.cellIndex.get(`${row}:${col}`));
+}
+
+// Library resource policy, not an Excel limit: bound the per-cell work of a
+// pathological range. A larger range is unsupported rather than truncated,
+// because a partial range silently changes COUNTIF/SUM/... results.
+const MAX_RANGE_CELLS = 4096;
+
+interface CellRect { r1: number; c1: number; r2: number; c2: number }
+
+function rangeRect(a: CellRef, b: CellRef, ctx: EvalCtx): CellRect {
+  const pa = refCoord(a, ctx);
+  const pb = refCoord(b, ctx);
+  return {
+    r1: Math.min(pa.row, pb.row), c1: Math.min(pa.col, pb.col),
+    r2: Math.max(pa.row, pb.row), c2: Math.max(pa.col, pb.col),
+  };
+}
+
+/** Cached values of `rect` in row-major order. */
+function readRect({ r1, c1, r2, c2 }: CellRect, ctx: EvalCtx): EvalScalar[] {
+  if ((r2 - r1 + 1) * (c2 - c1 + 1) > MAX_RANGE_CELLS) throw new FormulaFailure('unsupported');
   const out: EvalScalar[] = [];
-  // Cap range size to avoid pathological formulas like A:A (≈1M cells).
-  // 4096 cells is plenty for CF use cases.
-  const maxCells = 4096;
-  for (let r = r1; r <= r2 && out.length < maxCells; r++) {
-    for (let c = c1; c <= c2 && out.length < maxCells; c++) {
+  for (let r = r1; r <= r2; r++) {
+    for (let c = c1; c <= c2; c++) {
       out.push(cellValueToEval(ctx.cellIndex.get(`${r}:${c}`)));
     }
   }
   return out;
+}
+
+function resolveRange(a: CellRef, b: CellRef, ctx: EvalCtx): EvalScalar[] {
+  return readRect(rangeRect(a, b, ctx), ctx);
+}
+
+/** The cell rectangle a reference node denotes at `ctx`, or null for any
+ *  other expression. A defined name's body anchors at A1, as in `evaluate`. */
+function referenceRect(n: FormulaNode, ctx: EvalCtx): CellRect | null {
+  switch (n.t) {
+    case 'ref': { const { row, col } = refCoord(n.ref, ctx); return { r1: row, c1: col, r2: row, c2: col }; }
+    case 'range': return rangeRect(n.a, n.b, ctx);
+    case 'name': return referenceRect(n.body, { ...ctx, anchorRow: 1, anchorCol: 1 });
+    default: return null;
+  }
+}
+
+/** SUMIF sum_range / AVERAGEIF average_range. Microsoft's SUMIF and
+ * AVERAGEIF documentation: the supplied range need not match `range` in size
+ * or shape; the cells used start at its top-left cell and take `range`'s
+ * dimensions (A1:B4 with C1:C2 reads C1:D4). Only that rectangle is read.
+ * https://support.microsoft.com/en-us/excel/functions/sumif-function
+ * https://support.microsoft.com/en-us/excel/functions/averageif-function
+ * Only direct references (including reference-valued defined names) retain
+ * rectangle provenance here. Computed expressions keep their existing
+ * evaluate/flatten pairing; this preserves IF/IFS/IFERROR selection and lazy
+ * branch behavior without re-evaluating a condition to infer a rectangle.
+ * Library policy, without Excel evidence: a resized rectangle outside the
+ * worksheet grid is unsupported. */
+function resizedTargetValues(rangeNode: FormulaNode, targetNode: FormulaNode, ctx: EvalCtx): EvalScalar[] | null {
+  const range = referenceRect(rangeNode, ctx);
+  const target = referenceRect(targetNode, ctx);
+  if (!range || !target) return null;
+  const r2 = target.r1 + (range.r2 - range.r1);
+  const c2 = target.c1 + (range.c2 - range.c1);
+  if (target.r1 < 1 || target.c1 < 1 || r2 > MAX_WORKSHEET_ROW || c2 > MAX_WORKSHEET_COL) {
+    throw new FormulaFailure('unsupported');
+  }
+  return readRect({ r1: target.r1, c1: target.c1, r2, c2 }, ctx);
 }
 
 function cellValueToEval(cell: Cell | undefined): EvalScalar {
@@ -398,37 +752,78 @@ function cellValueToEval(cell: Cell | undefined): EvalScalar {
     case 'number': return cell.value.number;
     case 'bool':   return cell.value.bool;
     case 'text':   return cell.value.text;
-    case 'error':  return null;
+    // A cached error is an error value, not a blank: `=$A2=0` must not match
+    // an `#N/A` cell, and ISNA/ISERR must see its code.
+    case 'error':  return formulaError(cell.value.error);
     case 'empty':
     default:       return null;
   }
 }
 
-function callFunc(nameRaw: string, args: EvalValue[], ctx: EvalCtx): EvalValue {
-  const name = nameRaw.toUpperCase();
+function callFunc(name: string, argNodes: FormulaNode[], ctx: EvalCtx): EvalValue {
+  const arg = (i: number) => evaluate(argNodes[i], ctx);
+  // Functions that must not evaluate every argument first.
   switch (name) {
-    // ── Logic ───────────────────────────────────────────────────────────────
-    case 'AND':        return args.flatMap(flatten).every(a => toBool(a));
-    case 'OR':         return args.flatMap(flatten).some(a => toBool(a));
-    case 'NOT':        return !toBool(args[0]);
-    case 'IF':         return toBool(args[0]) ? (args[1] ?? true) : (args[2] ?? false);
-    case 'IFERROR':    return args[0] == null ? (args[1] ?? 0) : args[0];
-    case 'IFS': {
-      for (let i = 0; i + 1 < args.length; i += 2) {
+    // IF returns the selected branch only (§18.17.7.147): an error in a branch
+    // not taken, e.g. the division in IF(B1=0,FALSE,A1/B1>1), does not
+    // become the result. An error in a condition does.
+    case 'IF':
+      if (toBool(arg(0))) return arg(1);
+      return argNodes.length > 2 ? arg(2) : false;
+    // IFERROR and ISERROR/ISERR/ISNA test for an error value; a blank is not
+    // one. ISERR excludes #N/A and ISNA accepts only #N/A.
+    case 'IFERROR': {
+      const v = toScalar(arg(0));
+      // §18.17.7.148: an empty-cell argument is treated as empty text,
+      // rather than remaining an empty-cell value for ISBLANK to observe.
+      return (v instanceof FormulaErrorValue ? arg(1) : v) ?? '';
+    }
+    case 'ISERROR':    return toScalar(arg(0)) instanceof FormulaErrorValue;
+    case 'ISERR':      { const v = toScalar(arg(0)); return v instanceof FormulaErrorValue && v.code !== '#N/A'; }
+    case 'ISNA':       { const v = toScalar(arg(0)); return v instanceof FormulaErrorValue && v.code === '#N/A'; }
+    // ROW()/COLUMN() are the evaluated cell; with a reference argument they
+    // are that reference's row/column. Other argument forms are not modeled.
+    case 'ROW':
+    case 'COLUMN': {
+      const node = argNodes[0];
+      const at = node === undefined ? ctx : node.t === 'ref' ? refCoord(node.ref, ctx) : null;
+      if (!at) throw new FormulaFailure('unsupported');
+      return name === 'ROW' ? at.row : at.col;
+    }
+    // Direct target references are resized; computed targets retain evaluation.
+    case 'SUMIF':
+    case 'AVERAGEIF': {
+      const source = flatten(arg(0));
+      const criteria = arg(1);
+      const target = argNodes.length > 2
+        ? resizedTargetValues(argNodes[0], argNodes[2], ctx) ?? flatten(arg(2))
+        : null;
+      return name === 'SUMIF' ? sumIf(source, criteria, target) : averageIf(source, criteria, target);
+    }
+  }
+  const args = argNodes.map(n => evaluate(n, ctx));
+  switch (name) {
+    // Preserve this evaluator's eager IFS argument/error behavior. IF's
+    // specified lazy rule does not establish the later IFS function's
+    // evaluation strategy; changing it needs separate Excel evidence.
+    case 'IFS':
+      flattenPropagatingErrors(args);
+      for (let i = 0; i < args.length; i += 2) {
         if (toBool(args[i])) return args[i + 1];
       }
-      return null;
-    }
+      return formulaError('#N/A');
+    // ── Logic ───────────────────────────────────────────────────────────────
+    case 'AND':        return flattenPropagatingErrors(args).every(a => toBool(a));
+    case 'OR':         return flattenPropagatingErrors(args).some(a => toBool(a));
+    case 'NOT':        return !toBool(args[0]);
     case 'TRUE':       return true;
     case 'FALSE':      return false;
     // ── Type checks ─────────────────────────────────────────────────────────
-    case 'ISBLANK':    { const s = toScalar(args[0]); return s == null || s === ''; }
+    // ISBLANK tests for an empty cell: an empty-text value is not one.
+    case 'ISBLANK':    return toScalar(args[0]) === null;
     case 'ISNUMBER':   return typeof toScalar(args[0]) === 'number';
     case 'ISTEXT':     return typeof toScalar(args[0]) === 'string';
     case 'ISNONTEXT':  return typeof toScalar(args[0]) !== 'string';
-    case 'ISERROR':
-    case 'ISERR':
-    case 'ISNA':       return toScalar(args[0]) == null;
     case 'ISLOGICAL':  return typeof toScalar(args[0]) === 'boolean';
     // ── Rounding / math ─────────────────────────────────────────────────────
     case 'ROUNDDOWN': {
@@ -441,58 +836,87 @@ function callFunc(nameRaw: string, args: EvalValue[], ctx: EvalCtx): EvalValue {
       const p = Math.pow(10, d);
       return (n >= 0 ? Math.ceil(n * p) : Math.floor(n * p)) / p;
     }
-    case 'ROUND': {
-      const n = toNum(args[0]); const d = toNum(args[1]);
-      const p = Math.pow(10, d);
-      return Math.round(n * p) / p;
-    }
+    case 'ROUND':      return roundHalfAwayFromZero(toNum(args[0]), toNum(args[1]));
     case 'INT':        return Math.floor(toNum(args[0]));
     case 'TRUNC':      { const n = toNum(args[0]); const d = toNum(args[1] ?? 0); const p = Math.pow(10, d); return (n >= 0 ? Math.floor(n * p) : Math.ceil(n * p)) / p; }
-    case 'CEILING':    { const n = toNum(args[0]); const sig = toNum(args[1] ?? 1); return sig === 0 ? 0 : Math.ceil(n / sig) * sig; }
-    case 'FLOOR':      { const n = toNum(args[0]); const sig = toNum(args[1] ?? 1); return sig === 0 ? 0 : Math.floor(n / sig) * sig; }
-    case 'MOD':        { const a = toNum(args[0]); const b = toNum(args[1]); return b === 0 ? null : a - Math.floor(a / b) * b; }
-    case 'POWER':      return Math.pow(toNum(args[0]), toNum(args[1]));
-    case 'SQRT':       { const n = toNum(args[0]); return n < 0 ? null : Math.sqrt(n); }
+    case 'CEILING':    { const n = toNum(args[0]); const sig = toNum(args[1]); return sig === 0 ? 0 : Math.ceil(n / sig) * sig; }
+    case 'FLOOR': {
+      const n = toNum(args[0]); const sig = toNum(args[1]);
+      // Documented Excel FLOOR returns #NUM! for a positive number with
+      // negative significance:
+      // https://support.microsoft.com/en-us/excel/functions/floor-function
+      // ECMA-376 §18.17.7.125 specifies mismatched-sign errors generally;
+      // retain the existing modern-Excel negative-number/positive-significance
+      // result and zero handling outside this bounded domain correction.
+      if (n > 0 && sig < 0) return formulaError('#NUM!');
+      return sig === 0 ? 0 : Math.floor(n / sig) * sig;
+    }
+    // Domain failures are §18.17 error values (#DIV/0!, #NUM!), not blanks
+    // that a comparison would read as 0.
+    case 'MOD':        { const a = toNum(args[0]); const b = toNum(args[1]); return b === 0 ? formulaError('#DIV/0!') : a - Math.floor(a / b) * b; }
+    case 'POWER': {
+      const base = toNum(args[0]); const exponent = toNum(args[1]);
+      // §18.17.7.255: zero to a nonpositive power is #DIV/0!; negative
+      // bases with fractional exponents and unrepresentable results are #NUM!.
+      // The section explicitly includes exponent zero in the #DIV/0! domain.
+      if (base === 0 && exponent <= 0) return formulaError('#DIV/0!');
+      return numericResult(Math.pow(base, exponent));
+    }
+    case 'SQRT':       { const n = toNum(args[0]); return n < 0 ? formulaError('#NUM!') : Math.sqrt(n); }
     case 'ABS':        return Math.abs(toNum(args[0]));
     case 'SIGN':       { const n = toNum(args[0]); return n > 0 ? 1 : n < 0 ? -1 : 0; }
-    case 'EXP':        return Math.exp(toNum(args[0]));
-    case 'LN':         { const n = toNum(args[0]); return n <= 0 ? null : Math.log(n); }
-    case 'LOG10':      { const n = toNum(args[0]); return n <= 0 ? null : Math.log10(n); }
+    case 'EXP':        return numericResult(Math.exp(toNum(args[0]))); // §18.17.7.113: overflow is #NUM!.
+    case 'LN':         { const n = toNum(args[0]); return n <= 0 ? formulaError('#NUM!') : Math.log(n); }
+    case 'LOG10':      { const n = toNum(args[0]); return n <= 0 ? formulaError('#NUM!') : Math.log10(n); }
     // ── Aggregates ──────────────────────────────────────────────────────────
-    case 'MIN':        { const ns = args.flatMap(flatten).filter(v => typeof v === 'number') as number[]; return ns.length ? Math.min(...ns) : 0; }
-    case 'MAX':        { const ns = args.flatMap(flatten).filter(v => typeof v === 'number') as number[]; return ns.length ? Math.max(...ns) : 0; }
-    case 'SUM':        return args.flatMap(flatten).reduce<number>((s, v) => s + (typeof v === 'number' ? v : 0), 0);
-    case 'AVERAGE':    { const ns = args.flatMap(flatten).filter(v => typeof v === 'number') as number[]; return ns.length ? ns.reduce((s, v) => s + v, 0) / ns.length : null; }
+    case 'MIN':        { const ns = flattenPropagatingErrors(args).filter(v => typeof v === 'number') as number[]; return ns.length ? Math.min(...ns) : 0; }
+    case 'MAX':        { const ns = flattenPropagatingErrors(args).filter(v => typeof v === 'number') as number[]; return ns.length ? Math.max(...ns) : 0; }
+    case 'SUM':        return flattenPropagatingErrors(args).reduce<number>((s, v) => s + (typeof v === 'number' ? v : 0), 0);
+    case 'AVERAGE':    { const ns = flattenPropagatingErrors(args).filter(v => typeof v === 'number') as number[]; return ns.length ? ns.reduce((s, v) => s + v, 0) / ns.length : formulaError('#DIV/0!'); }
     case 'COUNT':      return args.flatMap(flatten).filter(v => typeof v === 'number').length;
-    case 'COUNTA':     return args.flatMap(flatten).filter(v => v != null && v !== '').length;
+    // Microsoft COUNTA documentation counts empty text, including cached "";
+    // an absent/empty cell is null, which remains excluded.
+    case 'COUNTA':     return args.flatMap(flatten).filter(v => v != null).length;
     case 'COUNTBLANK': return args.flatMap(flatten).filter(v => v == null || v === '').length;
     case 'COUNTIF':    return countIf(flatten(args[0]), args[1]);
-    case 'SUMIF':      return sumIf(flatten(args[0]), args[1], args[2] !== undefined ? flatten(args[2]) : null);
-    case 'AVERAGEIF':  {
-      const src = flatten(args[0]);
-      const sum = sumIf(src, args[1], args[2] !== undefined ? flatten(args[2]) : null);
-      const count = countIf(src, args[1]);
-      return count === 0 ? null : toNum(sum) / count;
-    }
     // ── Text ────────────────────────────────────────────────────────────────
     case 'LEN':        return toStr(args[0]).length;
-    case 'LEFT':       return toStr(args[0]).slice(0, Math.max(0, toNum(args[1] ?? 1)));
-    case 'RIGHT':      { const s = toStr(args[0]); const n = Math.max(0, toNum(args[1] ?? 1)); return n >= s.length ? s : s.slice(s.length - n); }
-    case 'MID':        { const s = toStr(args[0]); const start = Math.max(1, toNum(args[1])) - 1; const len = Math.max(0, toNum(args[2])); return s.slice(start, start + len); }
+    // ECMA-376 §18.17.7.191/275: negative LEFT/RIGHT counts are #VALUE!,
+    // not empty text that a CF comparison could turn into a stopIfTrue match.
+    // Positive fractional slicing is unchanged; no new integer-coercion rule.
+    case 'LEFT':       { const s = toStr(args[0]); const n = toNum(args[1] ?? 1); return n < 0 ? formulaError('#VALUE!') : s.slice(0, n); }
+    case 'RIGHT':      { const s = toStr(args[0]); const n = toNum(args[1] ?? 1); return n < 0 ? formulaError('#VALUE!') : n >= s.length ? s : s.slice(s.length - n); }
+    // §18.17.7.210: MID requires a position >= 1 and a nonnegative count.
+    case 'MID':        { const s = toStr(args[0]); const start = toNum(args[1]); const len = toNum(args[2]); return start < 1 || len < 0 ? formulaError('#VALUE!') : s.slice(start - 1, start - 1 + len); }
     case 'UPPER':      return toStr(args[0]).toUpperCase();
     case 'LOWER':      return toStr(args[0]).toLowerCase();
-    case 'TRIM':       return toStr(args[0]).replace(/\s+/g, ' ').trim();
+    // Excel TRIM removes only ASCII spaces (Microsoft TRIM documentation).
+    // NBSP and controls are text, not separators to collapse or strip.
+    case 'TRIM': {
+      const s = toStr(args[0]).replace(/ +/g, ' ');
+      return s.slice(s.startsWith(' ') ? 1 : 0, s.endsWith(' ') ? s.length - 1 : s.length);
+    }
     case 'EXACT':      return toStr(args[0]) === toStr(args[1]);
-    case 'FIND':       { const needle = toStr(args[0]); const hay = toStr(args[1]); const start = Math.max(1, toNum(args[2] ?? 1)) - 1; const idx = hay.indexOf(needle, start); return idx < 0 ? null : idx + 1; }
-    case 'SEARCH':     { const needle = toStr(args[0]).toLowerCase(); const hay = toStr(args[1]).toLowerCase(); const start = Math.max(1, toNum(args[2] ?? 1)) - 1; const idx = hay.indexOf(needle, start); return idx < 0 ? null : idx + 1; }
+    // A text not found is #VALUE! (so ISNUMBER(SEARCH(...)) stays FALSE).
+    // §18.17.7.119: a FIND position below 1 is #VALUE!, not position 1.
+    case 'FIND':       { const needle = toStr(args[0]); const hay = toStr(args[1]); const start = toNum(args[2] ?? 1); if (start < 1) return formulaError('#VALUE!'); const idx = hay.indexOf(needle, start - 1); return idx < 0 ? formulaError('#VALUE!') : idx + 1; }
+    case 'SEARCH': {
+      const needle = toStr(args[0]).toLowerCase(); const text = toStr(args[1]); const hay = text.toLowerCase();
+      const start = toNum(args[2] ?? 1);
+      // §18.17.7.285: start >= 1 and outside positions are #VALUE!, even
+      // for an empty needle. Bound the upper correction to integer positions
+      // in nonempty text: fractional truncation/validation order and the
+      // empty-text endpoint remain unverified and retain existing behavior.
+      // Check original text length: lowercase mapping can expand its length.
+      if (start < 1 || (text.length > 0 && Number.isInteger(start) && start > text.length)) return formulaError('#VALUE!');
+      const idx = hay.indexOf(needle, start - 1);
+      return idx < 0 ? formulaError('#VALUE!') : idx + 1;
+    }
     case 'CONCATENATE':
-    case 'CONCAT':     return args.flatMap(flatten).map(v => v == null ? '' : typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : String(v)).join('');
-    case 'T':          { const s = toScalar(args[0]); return typeof s === 'string' ? s : ''; }
-    case 'N':          { const s = toScalar(args[0]); return typeof s === 'number' ? s : typeof s === 'boolean' ? (s ? 1 : 0) : 0; }
+    case 'CONCAT':     return args.flatMap(flatten).map(v => toStr(v)).join('');
+    case 'T':          { const s = operand(args[0]); return typeof s === 'string' ? s : ''; }
+    case 'N':          { const s = operand(args[0]); return typeof s === 'number' ? s : typeof s === 'boolean' ? (s ? 1 : 0) : 0; }
     case 'VALUE':      return toNum(args[0]);
-    // ── Reference ───────────────────────────────────────────────────────────
-    case 'ROW':        return ctx.row;    // no-arg form only (current cell row)
-    case 'COLUMN':     return ctx.col;    // no-arg form only (current cell col)
     // ── Date / time ─────────────────────────────────────────────────────────
     case 'TODAY':      return todaySerial();
     case 'NOW':        return nowSerial();
@@ -510,8 +934,39 @@ function callFunc(nameRaw: string, args: EvalValue[], ctx: EvalCtx): EvalValue {
       return jsDow + 1;
     }
     default:
-      return 0;
+      throw new FormulaFailure('unsupported');
   }
+}
+
+/** §18.17.7.278 ROUND. Normative: digits 0–4 round down and 5–9 round up by
+ * magnitude, so ties round away from zero (ROUND(-1.475,2) = -1.48).
+ * Library policy: the digits are x's shortest round-trip decimal spelling.
+ * Round that spelling directly, converting back to a double only once:
+ * binary products can lose a written tie, while exponent-shifting through
+ * intermediate doubles can change x even when no decimal digit is discarded.
+ * Unsupported: fractional number-digits has no rule established here.
+ * Callers pass finite operands; a result outside the finite-double range is
+ * the §18.17.3 #NUM! error. */
+function roundHalfAwayFromZero(x: number, digits: number): number {
+  if (!Number.isInteger(digits)) throw new FormulaFailure('unsupported');
+  if (x === 0) return 0;
+  // Finite doubles' shortest spellings fit in decimal exponents -324..308
+  // with at most 17 significant digits. This resource bound covers every
+  // place that can change them and keeps exponents in integer spelling.
+  const d = Math.max(-400, Math.min(400, digits));
+  const [mantissa, exponent = '0'] = String(Math.abs(x)).split('e');
+  const point = mantissa.indexOf('.');
+  const decimalDigits = mantissa.replace('.', '');
+  const integerPlaces = (point === -1 ? mantissa.length : point) + Number(exponent);
+  const retainedPlaces = integerPlaces + d;
+  // No discarded digit: preserve the original double exactly.
+  if (retainedPlaces >= decimalDigits.length) return x;
+  if (retainedPlaces < 0) return 0;
+  const retained = retainedPlaces === 0 ? 0n : BigInt(decimalDigits.slice(0, retainedPlaces));
+  const rounded = retained + (decimalDigits[retainedPlaces]! >= '5' ? 1n : 0n);
+  const value = Number(`${rounded}e${-d}`);
+  if (!Number.isFinite(value)) throw new FormulaFailure('error', '#NUM!');
+  return value === 0 ? 0 : Math.sign(x) * value;
 }
 
 function countIf(source: EvalScalar[], criteria: EvalValue): number {
@@ -534,10 +989,37 @@ function sumIf(source: EvalScalar[], criteria: EvalValue, sumRange: EvalScalar[]
   return sum;
 }
 
+// Microsoft AVERAGEIF documentation: an empty average_range cell is excluded,
+// so a matched blank (null) is not in the denominator while a matched 0 is,
+// and no remaining matched cell is #DIV/0!.
+// https://support.microsoft.com/en-us/excel/functions/averageif-function
+// A direct-reference average_range is resized to `source`'s dimensions;
+// computed expressions retain prior index pairing (see `resizedTargetValues`).
+// Unresolved, kept as before without Excel evidence: an index past a shorter
+// computed target is counted instead of treated as a blank. A matched text,
+// boolean or error target adds nothing to the SUMIF-style numerator but counts.
+function averageIf(source: EvalScalar[], criteria: EvalValue, averageRange: EvalScalar[] | null): EvalScalar {
+  const pred = makeCriteriaPredicate(criteria);
+  const target = averageRange ?? source;
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < source.length; i++) {
+    if (pred(source[i])) {
+      const t = target[i];
+      if (t === null) continue;
+      if (typeof t === 'number') sum += t;
+      count++;
+    }
+  }
+  return count === 0 ? formulaError('#DIV/0!') : sum / count;
+}
+
 /** Build a predicate matching Excel's COUNTIF/SUMIF criteria syntax:
  *  a bare value (exact match) or a string like ">5", "<>foo", "=100". */
 function makeCriteriaPredicate(criteria: EvalValue): (v: EvalScalar) => boolean {
   const raw = toScalar(criteria);
+  // An error-valued criterion is not modeled.
+  if (raw instanceof FormulaErrorValue) throw new FormulaFailure('unsupported');
   if (typeof raw !== 'string') {
     const rn = typeof raw === 'number' ? raw : null;
     return (v) => {
@@ -550,6 +1032,7 @@ function makeCriteriaPredicate(criteria: EvalValue): (v: EvalScalar) => boolean 
   const rhsStr = m ? m[2] : raw;
   const rhsNum = rhsStr.trim() === '' ? NaN : parseFloat(rhsStr);
   const rhsIsNum = !isNaN(rhsNum) && /^-?\d+(\.\d+)?$/.test(rhsStr.trim());
+  const foldedText = asciiFold(rhsStr);
   return (v) => {
     if (rhsIsNum && typeof v === 'number') {
       switch (op) {
@@ -561,7 +1044,16 @@ function makeCriteriaPredicate(criteria: EvalValue): (v: EvalScalar) => boolean 
         default:   return v === rhsNum;
       }
     }
-    const sv = v == null ? '' : typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : String(v);
+    // Microsoft COUNTIF documents case-insensitive text criteria. Correct its
+    // ASCII equality domain. SUMIF/AVERAGEIF inherit this shared predicate as
+    // library policy; their wiring tests are not separate Excel authority.
+    // Non-ASCII case folding and relational collation remain unresolved.
+    if (typeof v === 'string' && (op === '=' || op === '<>')) {
+      const equal = asciiFold(v) === foldedText;
+      return op === '=' ? equal : !equal;
+    }
+    const sv = v == null ? '' : typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE')
+      : v instanceof FormulaErrorValue ? v.code : String(v);
     switch (op) {
       case '<>': return sv !== rhsStr;
       case '<':  return sv <  rhsStr;
@@ -580,20 +1072,20 @@ function makeCriteriaPredicate(criteria: EvalValue): (v: EvalScalar) => boolean 
 // which had no leap-bug correction (serials < 60 read the wrong calendar day)
 // and no 1904 support.
 //
-// The formula engine always operates in the 1900 date system: its serials are
-// consumed by the number-format layer, whose volatile-recompute path formats
-// TODAY()/NOW() against the 1900 epoch regardless of `<workbookPr date1904>`
-// (see number-format.ts). So every core call below passes date1904=false.
-// Threading the workbook's date system into the formula engine is a separate
-// track; this change is purely about retiring the duplicate serial math.
+// This evaluator exists only for conditional-formatting formulas (see
+// conditional-format.ts); cell values are never recalculated and are rendered
+// from their cached `<v>` (number-format.ts). It always operates in the 1900
+// date system, so TODAY()/NOW() inside a CF formula yield 1900-system serials
+// and every core call below passes date1904=false. Threading the workbook's
+// date system into CF evaluation is part of completing that evaluator (#1547).
 
-export function todaySerial(): number {
+function todaySerial(): number {
   const d = new Date();
   const utcMid = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
   return utcDateToExcelSerial(utcMid, false);
 }
 
-export function nowSerial(): number {
+function nowSerial(): number {
   return utcDateToExcelSerial(new Date(Date.now()), false);
 }
 

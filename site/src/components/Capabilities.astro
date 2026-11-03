@@ -3,7 +3,7 @@ const cols = [
   {
     name: 'DOCX', ext: '.docx', color: 'var(--docx)',
     items: [
-      'Paginated layout with headers, footers & sections',
+      'Paginated layout with headers, footers, sections & continued notes',
       'Complex tables with borders, fills & merged cells',
       'Adaptive large-image display, optional TIFF decoding and DrawingML shapes with image fills',
       'CJK typography: ruby, vertical writing & line grids',
@@ -46,8 +46,11 @@ const cols = [
     </div>
   ))}
 </div>
+<p class="caps-legacy">Optional, experimental: read a supported subset of .doc, .xls and .ppt with the <a href="/legacy-office">legacy Office add-on</a>. Unsupported content rejects.</p>
 
 <style>
+  .caps-legacy { margin: 20px 0 0; color: var(--text-dim); font-size: 13px; }
+  .caps-legacy a { text-decoration: underline; text-underline-offset: 3px; }
   .caps-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 0; margin-top: 48px; border-top: 1px solid var(--border-bright); }
   .caps-col {
     grid-column: span 4;

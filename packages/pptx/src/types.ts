@@ -19,7 +19,7 @@ export type {
 // All positions and sizes are in EMUs (English Metric Units).
 // 914400 EMU = 1 inch, 12700 EMU = 1 pt
 
-import type { Bullet as CoreBullet, Fill, Stroke, TextBody as CoreTextBody, Paragraph as CoreParagraph, Shadow, Glow, SoftEdge, Reflection, PathCmd, ChartModel, Duotone } from '@silurus/ooxml-core';
+import type { Bullet as CoreBullet, Fill, Stroke, TextBody as CoreTextBody, Paragraph as CoreParagraph, Shadow, Glow, SoftEdge, Reflection, PathCmd, ChartModel, Duotone, BlipEffect } from '@silurus/ooxml-core';
 
 /**
  * Picture bullet — ECMA-376 §21.1.2.4.2 `<a:buBlip><a:blip r:embed>`. The
@@ -73,6 +73,11 @@ export type Bullet = CoreBullet | BlipBullet;
  * variant narrow `bullet` with {@link asBullet} / a `type === 'blip'` check.
  */
 export interface Paragraph extends CoreParagraph {
+  /** Inline MCE alternatives for complete selected run ranges [start, end).
+   * Part 3 §§9.3–9.4 selects a whole branch. Library recovery substitutes its
+   * authored plain-text preview once if any equation in that range fails.
+   * Nested alternatives are ordered inner first, including equal ranges. */
+  mathFallbacks?: { start: number; end: number; text: string }[];
   /**
    * `<a:pPr eaLnBrk>` (ECMA-376 §21.1.2.2.7, xsd:boolean, default true). When
    * true, East Asian text may break at character boundaries (kinsoku rules);
@@ -81,6 +86,13 @@ export interface Paragraph extends CoreParagraph {
    * emits an effective boolean.
    */
   eaLnBrk: boolean;
+  /**
+   * Effective `<a:pPr fontAlgn>` (ECMA-376 §21.1.2.2.7) after the paragraph →
+   * list-style → layout/master cascade. Only `t`, `ctr` and `b` are emitted:
+   * PowerPoint lays out an omitted value, `auto` and `base` identically, so an
+   * absent field means baseline alignment.
+   */
+  fontAlgn?: 't' | 'ctr' | 'b';
   /**
    * `<a:pPr defTabSz>` (ECMA-376 §21.1.2.2.7) — the default tab-stop interval in
    * EMU. When a `\t` has no reachable explicit `a:tabLst` stop, it advances to
@@ -114,6 +126,26 @@ export interface TextBody extends CoreTextBody {
    * omitted from JSON when false. Only meaningful when `numCol > 1`.
    */
   rtlCol?: boolean;
+  /**
+   * `<a:bodyPr spcFirstLastPara>` (ECMA-376 §21.1.2.1.1) — when true the first
+   * paragraph's space before and the last paragraph's space after are applied.
+   * Defaults to false (both suppressed); omitted from JSON when false.
+   */
+  spcFirstLastPara?: boolean;
+  /**
+   * `<a:bodyPr anchorCtr>` (ECMA-376 §21.1.2.1.1) — centre the text block
+   * within the bounding box perpendicular to the anchor. Defaults to false;
+   * omitted from JSON when false. Only stacked vertical text
+   * (`wordArtVert` / `wordArtVertRtl`) applies it so far.
+   */
+  anchorCtr?: boolean;
+  /**
+   * Effective `<a:bodyPr compatLnSpc>` (ECMA-376 §21.1.2.1.1) after the
+   * slide → layout → master placeholder cascade; omitted when no level
+   * authors it. Only `false` changes layout: PowerPoint renders an omitted
+   * value and `true` identically.
+   */
+  compatLnSpc?: boolean;
   /**
    * `<a:bodyPr><a:prstTxWarp>` (ECMA-376 §20.1.9.19) — WordArt text warp. When
    * present the renderer maps each glyph through the named envelope
@@ -152,6 +184,9 @@ export interface Presentation {
 }
 
 export interface Slide {
+  /** Effective part-local defaults after layout/slide theme overrides. */
+  theme?: { defaultTextColor: string | null; majorFont: string | null;
+    minorFont: string | null; hlinkColor: string | null };
   index: number;
   /** 1-based slide number (index + 1); used to render slidenum fields */
   slideNumber: number;
@@ -301,7 +336,17 @@ export interface MediaElement {
   mimeType: string;
 }
 
+/** Parsed MCE alternative and complete selected-branch range for equation recovery.
+ * Counts are relative to the shape or table anchor in the flattened element stream. */
+export interface EquationBranchFallback {
+  elements: SlideElement[];
+  before: number;
+  after: number;
+}
+
 export interface ShapeElement {
+  /** Equation Choice preview retained for runtime conversion failures (MCE §9.3). */
+  mathFallback?: EquationBranchFallback;
   type: 'shape';
   x: number;
   y: number;
@@ -323,6 +368,13 @@ export interface ShapeElement {
   /** Custom geometry sub-paths (set only when geometry === "custGeom").
    *  Outer array: one entry per <a:path>; inner: path commands with coords in [0,1]. */
   custGeom: PathCmd[][] | null;
+  /**
+   * Per-path paint of `custGeom` (ECMA-376 §20.1.9.15 `a:path@fill` /
+   * `@stroke`), one entry per path. Absent when every path is filled
+   * normally and stroked. `fill` is `none`, `lighten`, `lightenLess`,
+   * `darken` or `darkenLess`; `null` means `norm`.
+   */
+  custGeomPaint?: { fill: string | null; stroke: boolean }[];
   /** First adjustment value from prstGeom avLst (e.g. trapezoid inset). Range 0–100000. */
   adj: number | null;
   /** Second adjustment value from prstGeom avLst (e.g. arrow head width). Range 0–100000. */
@@ -483,6 +535,12 @@ export interface Sp3d {
 }
 
 export interface TableElement {
+  /** Whole MCE branch recovery, including equations in table cells (Part 3 §9.3). */
+  mathFallback?: EquationBranchFallback;
+  /** Optional `a:tblBg` fill across the entire table beneath cell fills.
+   * Resolved from the active theme matrix; omitted means no background paint.
+   * Existing model producers may omit it. */
+  background?: Fill;
   type: 'table';
   /** `<p:nvGraphicFramePr><p:cNvPr @id>` for the table frame. */
   id?: string;
@@ -508,6 +566,8 @@ export interface TableRow {
 
 export interface TableCell {
   textBody: TextBody | null;
+  /** ECMA-376 §21.1.3.17: cell-owned horizontal overflow; omitted means clip. */
+  horzOverflow?: 'clip' | 'overflow';
   fill: Fill | null;
   /** Default run text colour inherited from the table style (`<a:tcTxStyle>`); hex, no `#`. */
   textColor?: string;
@@ -605,6 +665,12 @@ export interface PictureElement {
    */
   stroke: Stroke | null;
   /**
+   * `<p:spPr>` fill (a `p:pic`'s spPr is CT_ShapeProperties, §19.3.1.37),
+   * painted inside the picture silhouette BEHIND the blip so it shows through
+   * transparent pixels. Omitted when the spPr has no fill element.
+   */
+  fill?: Fill;
+  /**
    * `<p:spPr><a:prstGeom prst="…">` preset name (e.g. `"roundRect"`,
    * `"ellipse"`). ECMA-376 §20.1.9.18: a picture's preset geometry is its clip
    * silhouette and the path its border / contour hug. Undefined / omitted = a
@@ -626,7 +692,7 @@ export interface PictureElement {
    * default to 0), so the renderer reads them without a fallback.
    */
   srcRect?: { l: number; t: number; r: number; b: number };
-  /** a:blip > a:alphaModFix@amt as 0..1. Undefined = fully opaque. */
+  /** Legacy model-source opacity. Parsed alphaModFix is baked once by blipEffects. */
   alpha?: number;
   /**
    * ECMA-376 §20.1.8.23 `<a:duotone>` recolour, resolved to its two endpoint
@@ -635,6 +701,12 @@ export interface PictureElement {
    * luminance ramp, and caches the recoloured bitmap under a colour-suffixed key.
    */
   duotone?: Duotone;
+  /**
+   * Ordered CT_Blip effects (§20.1.8.13), including alpha modulation and
+   * independent duotone endpoints. Unsupported entries reject the chain.
+   * Absent for plain pictures and the legacy single-duotone fast path.
+   */
+  blipEffects?: BlipEffect[];
   /**
    * `<p:spPr><a:custGeom>` clipping path. Same `PathCmd` model as
    * `ShapeElement.custGeom` (one entry per `<a:path>`; coords normalized

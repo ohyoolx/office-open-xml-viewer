@@ -1,3 +1,9 @@
+import {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+  type NormalizedXlsxWorksheetPolicy,
+} from './internal/worksheet-policy.js';
+import { bindCellFontLanguage, snapshotJapaneseCellFonts } from './internal/cell-font-language.js';
 import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import { xlsxCjkFallback } from './google-fonts.js';
 import InlineWorker from './worker.ts?worker&inline';
@@ -5,13 +11,19 @@ import wasmAssetUrl from './wasm/xlsx_parser_bg.wasm?url';
 import {
   preloadGoogleFonts,
   unloadGoogleFonts,
+  loadOfficeFontFallbacks,
+  unloadOfficeFontFallbacks,
+  type LoadedOfficeFontFallbacks,
+  type OfficeFontFallbackRequest,
   WorkerBridge,
   defaultDpr,
+  isHTMLCanvas,
   dropDecodedBitmapCache,
   dropSvgImageCache,
   resolveOoxmlContainer,
   toArrayBuffer,
   type LoadOptions as CoreLoadOptions,
+  type ModelSource,
   type MathRenderer,
   type ChartThreeDRenderer,
   type ChartRegionMapRenderer,
@@ -39,7 +51,8 @@ import { BoundedRawPartCache } from '@silurus/ooxml-core/internal/bounded-raw-pa
 import type { ParsedWorkbook, Worksheet, ViewportRange, RenderViewportOptions, XlsxRenderViewportOptions, WorkerRequest, WorkerResponse, Cell, SheetVisibility, XlsxComment } from './types.js';
 import { selectSheetVisibility } from './sheet-visibility.js';
 import { renderWorksheetViewport } from './render-orchestrator.js';
-import { XLSX_GOOGLE_FONTS, xlsxFontPreloadNames } from './google-fonts.js';
+import { XLSX_GOOGLE_FONTS, xlsxFontPreloadNames, xlsxOfficeFontRequests, xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
+import { officeRequestKey } from './shape-office-line.js';
 import { formatCellValue } from './number-format.js';
 import {
   addWorksheetUsage,
@@ -71,8 +84,7 @@ import {
   isXlsxWorksheetPullResponse,
   XlsxWorksheetPullClient,
 } from './worksheet-pull-client.js';
-import { GridGeometry } from './internal/grid-geometry.js';
-import { applyAutoRowHeights, inheritSheetRenderCache, getGridGeometryForWorksheet } from './renderer.js';
+import { applyAutoRowHeights, bindXlsxOfficeFontRoutes, bindXlsxWorksheetOfficeFontRoutes, inheritSheetRenderCache, getGridGeometryForWorksheet } from './renderer.js';
 import {
   assertDelimitedTextSourceBytes,
   resolveDelimitedTextOptions,
@@ -80,6 +92,9 @@ import {
   type XlsxSheetLoadOptions,
 } from './delimited-text.js';
 import { readDelimitedTextResponse } from './delimited-text-source.js';
+import { WorksheetPreview } from './internal/worksheet-preview.js';
+import { setWorksheetPreviewBounds } from './internal/worksheet-content-bounds.js';
+import { bindWorksheetPolicy } from './worksheet-policy-context.js';
 import type {
   DelimitedTextParseRequest,
   DelimitedTextParseResponse,
@@ -103,8 +118,8 @@ export const loadXlsxSheetSource = Symbol('load-xlsx-sheet-source');
 
 interface RetainedFontSet {
   refs: number;
-  faces: FontFace[] | null;
-  readonly loading: Promise<FontFace[]>;
+  loaded: { google: FontFace[]; office: LoadedOfficeFontFallbacks } | null;
+  readonly loading: Promise<{ google: FontFace[]; office: LoadedOfficeFontFallbacks }>;
 }
 
 /** Options for {@link XlsxWorkbook.load}. Extends the shared load-options type
@@ -121,6 +136,14 @@ export interface LoadOptions extends CoreLoadOptions {
    * documented fallback in worker mode.
    */
   mode?: 'main' | 'worker';
+  /**
+   * Opt-in model source for workbook input that is not an OOXML package (a
+   * `ModelSource<'xlsx'>`). When its `claim()` accepts the raw bytes, it
+   * opens them in the parser realm through its own module; otherwise the
+   * ordinary OOXML path runs unchanged. A source for another format is a
+   * `TypeError`. Omitting this option imports and runs nothing extra.
+   */
+  legacyXls?: ModelSource<'xlsx'>;
 }
 
 type WorkbookBridge = WorkerBridge<
@@ -132,12 +155,19 @@ export class XlsxWorkbook {
   private metrics: OoxmlResourceMetricsSession | null = null;
   private bridge: WorkbookBridge | null = null;
   private delimitedTextBacked = false;
+  private readonly japaneseCellFonts = snapshotJapaneseCellFonts();
   private parsedWorkbook: ParsedWorkbook | null = null;
   private sheetCache = new Map<number, Worksheet>();
+  /** Cache insertion order is the workbook session's LRU order. A lease pins a
+   * model while an operation or a viewer is using its content graph. */
+  private sheetCacheUsage = new Map<number, WorksheetCacheUsage>();
+  private sheetLeases = new Map<number, number>();
+  private evictingSheets = new Map<number, { done: Promise<void>; complete: () => void }>();
   /** One materialization per sheet at a time. This becomes the ownership seam
    * for the bounded worksheet cursor: concurrent callers share one cursor and
    * one eventual mutable compatibility object instead of doubling peak work. */
   private sheetLoads = new Map<number, Promise<Worksheet>>();
+  private sheetPreviews = new Map<number, WorksheetPreview>();
   /** Cache of fetched image *bytes* (as Blobs) keyed by zip path, populated by
    *  {@link XlsxWorkbook.getImage}. Twin of pptx/docx's per-instance
    *  raw-part owner; decoded sources are owned separately by core. */
@@ -154,7 +184,8 @@ export class XlsxWorkbook {
    *  across viewport renders. */
   private readonly _fetchImage = (path: string, mime: string): Promise<Blob> =>
     this.getImageWithinArchiveOperation(path, mime);
-  private resourcePolicy: NormalizedOoxmlResourcePolicy | null = null;
+  /** Normalized per-session worksheet admission policy. */
+  private worksheetPolicy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY;
   /** Opt-in OMML equation engine, injected once at {@link load}. Every
    *  `renderViewport` call reuses it — equations in shapes render when present,
    *  and are skipped when omitted. */
@@ -173,6 +204,8 @@ export class XlsxWorkbook {
   /** Web-font registrations are per FontFaceSet. Same-origin child windows have
    * their own set even when they share this workbook instance. */
   private googleFontNames: string[] = [];
+  private googleSubstitutes = false;
+  private officeFontRequests: OfficeFontFallbackRequest[] = [];
   private readonly retainedFontSets = new Map<FontFaceSet, RetainedFontSet>();
   private fontsDestroyed = false;
   private _mode: 'main' | 'worker' = 'main';
@@ -258,6 +291,8 @@ export class XlsxWorkbook {
     opts: LoadOptions,
     sourceOptions: Exclude<XlsxSheetLoadOptions, Readonly<{ format?: 'xlsx' }>>,
   ): Promise<XlsxWorkbook> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
+    opts = { ...opts, xlsxWorksheetLimits: worksheetPolicy.worksheet };
     opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const delimited = resolveDelimitedTextOptions(sourceOptions);
     const resourceOptions = normalizeLoadResourceOptions(opts);
@@ -267,6 +302,7 @@ export class XlsxWorkbook {
       format: 'xlsx',
       mode,
       policy: resourceOptions.policy,
+      formatLimits: { xlsxWorksheetLimits: { ...worksheetPolicy.worksheet } },
       onMetrics: resourceOptions.onResourceMetrics,
       emitToConsole: resourceOptions.debug,
     });
@@ -301,7 +337,6 @@ export class XlsxWorkbook {
         await loaded._loadDelimitedText(
           callerBuffer === buffer ? buffer.slice(0) : buffer,
           opts,
-          resourceOptions.policy,
           delimited,
         );
         if (mode === 'main') {
@@ -325,8 +360,14 @@ export class XlsxWorkbook {
     }
   }
 
-  /** Parse an XLSX from a URL or ArrayBuffer. */
+  /** Parse an XLSX from a URL or ArrayBuffer. Cell-font theme selection uses a
+   * snapshot of the viewer language; re-open to apply a language change. */
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<XlsxWorkbook> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
+    opts = { ...opts, xlsxWorksheetLimits: worksheetPolicy.worksheet };
+    if (__OOXML_MODEL_SOURCES__ && opts.legacyXls !== undefined) {
+      return (await import('./internal/workbook-model-source.js')).loadXlsxModelSource(source, opts, XlsxWorkbook);
+    }
     opts = { ...opts, cjkFallback: resolveCjkFallback(opts.cjkFallback) };
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const mode = opts.mode ?? 'main';
@@ -335,6 +376,7 @@ export class XlsxWorkbook {
       format: 'xlsx',
       mode,
       policy: resourceOptions.policy,
+      formatLimits: { xlsxWorksheetLimits: { ...worksheetPolicy.worksheet } },
       onMetrics: resourceOptions.onResourceMetrics,
       emitToConsole: resourceOptions.debug,
     });
@@ -404,15 +446,20 @@ export class XlsxWorkbook {
     onUsage?: (usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot) => void,
     preserveCallerBuffer = false,
   ): Promise<void> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
     const bridge = this.requireBridge();
+    this.worksheetPolicy = worksheetPolicy;
     this.resourceFailure = null;
     this.retainedSheetUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0 };
     this.sheetCache.clear();
+    this.sheetCacheUsage.clear();
+    this.sheetLeases.clear();
+    this.completePendingEvictions();
     await this.worksheetPullClient?.cancelAll('closed');
     this.worksheetPullClient = null;
     this.generation = (this.generation ?? 0) + 1;
-    this.resourcePolicy = resourcePolicy;
     this.workerTimeoutMs = opts.workerTimeoutMs;
+    this.googleSubstitutes = opts.useGoogleFonts === true;
     this.cjkFallback = resolveCjkFallback(opts.cjkFallback);
     this.math = this._mode === 'worker' ? undefined : opts.math;
     this.threeD = this._mode === 'worker' ? undefined : opts.threeD;
@@ -462,15 +509,18 @@ export class XlsxWorkbook {
               id,
               data: workerData,
               resourcePolicy,
+              worksheetPolicy,
               useGoogleFonts: !!opts.useGoogleFonts,
               cjkFallback: this.cjkFallback,
               renderers: rendererDescriptors,
+              japaneseCellFonts: this.japaneseCellFonts,
             } satisfies RenderWorkerRequest)
           : ({
               type: 'parse',
               id,
               data: workerData,
               resourcePolicy,
+              worksheetPolicy,
             } satisfies WorkerRequest),
       [workerData],
       { timeoutMs: opts.workerTimeoutMs },
@@ -503,28 +553,30 @@ export class XlsxWorkbook {
     if (workbookError) {
       console.warn(`[ooxml] xlsx opened with a degraded part: ${workbookError}`);
     }
+    this.officeFontRequests = xlsxOfficeFontRequests(parsedWorkbook);
     if (opts.useGoogleFonts) {
       // The composite viewer computes hit/scroll/overlay geometry on the main
       // realm even when paint runs in a worker. Register the same fallback
       // faces in both realms before any worksheet geometry snapshot is made so
       // ECMA-376 MDW is identical across paint and interaction.
       this.googleFontNames = [...xlsxFontPreloadNames(parsedWorkbook, this.cjkFallback)];
-      if (typeof document !== 'undefined' && document.fonts) {
-        await this.retainFontsInSet(document.fonts);
-      }
+    }
+    if (typeof document !== 'undefined' && document.fonts) {
+      await this.retainFontsInSet(document.fonts);
     }
   }
 
   private async _loadDelimitedText(
     data: ArrayBuffer,
     opts: LoadOptions,
-    resourcePolicy: NormalizedOoxmlResourcePolicy,
     options: ResolvedDelimitedTextOptions,
   ): Promise<void> {
+    const worksheetPolicy = normalizeXlsxWorksheetPolicy(opts);
     const bridge = this.requireBridge();
+    this.worksheetPolicy = worksheetPolicy;
     this.delimitedTextBacked = true;
-    this.resourcePolicy = resourcePolicy;
     this.workerTimeoutMs = opts.workerTimeoutMs;
+    this.googleSubstitutes = opts.useGoogleFonts === true;
     this.cjkFallback = resolveCjkFallback(opts.cjkFallback);
     this.generation++;
     this.math = this._mode === 'worker' ? undefined : opts.math;
@@ -538,9 +590,11 @@ export class XlsxWorkbook {
     const response = await bridge.request(
       (id) => ({
         type: 'parseDelimitedText',
+        japaneseCellFonts: this.japaneseCellFonts,
         id,
         data,
         options,
+        worksheetPolicy,
         useGoogleFonts: !!opts.useGoogleFonts,
         cjkFallback: this.cjkFallback,
         renderers: rendererDescriptors,
@@ -551,39 +605,52 @@ export class XlsxWorkbook {
     const worksheet = JSON.parse(
       new TextDecoder().decode(response.worksheetJson),
     ) as Worksheet;
+    bindWorksheetPolicy(worksheet, worksheetPolicy);
+    bindCellFontLanguage(worksheet, this.japaneseCellFonts);
     const sheets = response.workbook.workbook.sheets;
     if (sheets.length !== 1 || sheets[0]?.name !== worksheet.name) {
       throw new Error('Delimited text worker returned inconsistent worksheet metadata');
     }
-    const measured = measureWorksheet(worksheet);
-    assertWorksheetModelUsage(measured, 'load-delimited-text', undefined);
-    assertWorksheetJsonBytes(measured.jsonBytes, 'load-delimited-text', undefined);
-    assertWorksheetCacheUsage(measured, 'load-delimited-text', undefined);
+    const measured = measureWorksheet(worksheet, worksheetPolicy);
+    assertWorksheetModelUsage(measured, 'load-delimited-text', undefined, undefined, worksheetPolicy);
+    assertWorksheetJsonBytes(measured.jsonBytes, 'load-delimited-text', undefined, undefined, worksheetPolicy);
+    assertWorksheetCacheUsage(measured, 'load-delimited-text', undefined, undefined, worksheetPolicy);
     this.parsedWorkbook = response.workbook;
     this.cjkFallback = xlsxCjkFallback(response.workbook, this.cjkFallback);
     this.sheetCache.set(0, worksheet);
+    this.sheetCacheUsage.set(0, measured);
     this.retainedSheetUsage = measured;
 
+    this.officeFontRequests = xlsxOfficeFontRequests(response.workbook);
     if (opts.useGoogleFonts) {
       this.googleFontNames = [...xlsxFontPreloadNames(response.workbook, this.cjkFallback)];
-      if (typeof document !== 'undefined' && document.fonts) {
-        await this.retainFontsInSet(document.fonts);
-      }
+    }
+    if (typeof document !== 'undefined' && document.fonts) {
+      await this.retainFontsInSet(document.fonts);
+      await this.retainWorksheetOfficeFonts(worksheet);
+      const office = this.retainedFontSets.get(document.fonts)?.loaded?.office;
+      bindXlsxWorksheetOfficeFontRoutes(worksheet, office?.routes, this.googleSubstitutes);
     }
   }
 
   private async retainFontsInSet(fontSet: FontFaceSet): Promise<() => void> {
-    if (this.googleFontNames.length === 0 || this.fontsDestroyed) return () => undefined;
+    if (this.fontsDestroyed) return () => undefined;
     let retained = this.retainedFontSets.get(fontSet);
     if (retained) {
       retained.refs++;
     } else {
-      const loading = preloadGoogleFonts(this.googleFontNames, XLSX_GOOGLE_FONTS, fontSet);
-      retained = { refs: 1, faces: null, loading };
+      const loading = Promise.all([
+        preloadGoogleFonts(this.googleFontNames, XLSX_GOOGLE_FONTS, fontSet),
+        loadOfficeFontFallbacks(this.officeFontRequests, fontSet),
+      ]).then(([google, office]) => ({ google, office }));
+      retained = { refs: 1, loaded: null, loading };
       this.retainedFontSets.set(fontSet, retained);
-      loading.then((faces) => {
-        retained!.faces = faces;
-        if (this.fontsDestroyed) unloadGoogleFonts(faces);
+      loading.then((loaded) => {
+        retained!.loaded = loaded;
+        if (this.fontsDestroyed) {
+          unloadGoogleFonts(loaded.google);
+          unloadOfficeFontFallbacks(loaded.office.faces);
+        }
       });
     }
     await retained.loading;
@@ -596,9 +663,43 @@ export class XlsxWorkbook {
       current.refs--;
       if (current.refs > 0) return;
       this.retainedFontSets.delete(fontSet);
-      if (current.faces) unloadGoogleFonts(current.faces);
-      else current.loading.then(unloadGoogleFonts);
+      if (current.loaded) {
+        unloadGoogleFonts(current.loaded.google);
+        unloadOfficeFontFallbacks(current.loaded.office.faces);
+      } else void current.loading.then((loaded) => {
+        unloadGoogleFonts(loaded.google);
+        unloadOfficeFontFallbacks(loaded.office.faces);
+      });
     };
+  }
+
+  private async retainWorksheetOfficeFonts(worksheet: Worksheet): Promise<void> {
+    const additional = xlsxWorksheetOfficeFontRequests(worksheet).filter((request) =>
+      !this.officeFontRequests.some((known) => officeRequestKey(known) === officeRequestKey(request)));
+    if (additional.length === 0) return;
+    this.officeFontRequests.push(...additional);
+    // Even an initially empty font registry is retained at bootstrap and by
+    // each viewer. Worksheet-local shape tuples can then extend every live
+    // document's registry without inventing a new lifetime or missing popups.
+    await Promise.all([...this.retainedFontSets].map(async ([set, retained]) => {
+      const current = await retained.loading;
+      const office = await loadOfficeFontFallbacks(additional, set);
+      // A popup can release its FontFaceSet while this extra sheet tuple is
+      // loading. The retained record then leaves the map; attaching the late
+      // face to that orphan would leak its registry reference forever.
+      if (this.fontsDestroyed || this.retainedFontSets.get(set) !== retained || retained.refs <= 0) {
+        unloadOfficeFontFallbacks(office.faces);
+      } else {
+        current.office.faces.push(...office.faces);
+        const completed = new Set(current.office.checked);
+        for (const key of office.checked) {
+          if (completed.has(key)) continue;
+          completed.add(key);
+          current.office.checked.push(key);
+        }
+        Object.assign(current.office.routes, office.routes);
+      }
+    }));
   }
 
   /** @internal Retain required faces in the document that owns a viewer canvas. */
@@ -610,6 +711,10 @@ export class XlsxWorkbook {
    * measurement observes the same faces that the subsequent paint uses. */
   [prepareXlsxViewerRowHeights](worksheet: Worksheet, ctx: CanvasRenderingContext2D): void {
     if (!this.parsedWorkbook) return;
+    const set = isHTMLCanvas(ctx.canvas)
+      ? ctx.canvas.ownerDocument.fonts : null;
+    const routes = set ? this.retainedFontSets.get(set)?.loaded?.office.routes : undefined;
+    bindXlsxOfficeFontRoutes(ctx, worksheet, routes, this.googleSubstitutes);
     getGridGeometryForWorksheet(worksheet);
     applyAutoRowHeights(ctx, worksheet, this.parsedWorkbook.styles, this.cjkFallback);
   }
@@ -650,25 +755,128 @@ export class XlsxWorkbook {
   }
 
   async getWorksheet(sheetIndex: number): Promise<Worksheet> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.getWorksheet(sheetIndex);
+    }
+    const release = this.pinWorksheet(sheetIndex);
+    try {
+      return await this.getOrLoadWorksheet(sheetIndex);
+    } finally {
+      release();
+    }
+  }
+
+  private async getOrLoadWorksheet(sheetIndex: number): Promise<Worksheet> {
     this.assertResourceHealthy();
     const cached = this.sheetCache.get(sheetIndex);
-    if (cached) return cached;
+    if (cached) {
+      this.touchWorksheet(sheetIndex, cached);
+      return cached;
+    }
     const active = this.sheetLoads.get(sheetIndex);
     if (active) return active;
-    const load = this.loadWorksheet(sheetIndex);
+    const progress = new WorksheetPreview([]);
+    (this.sheetPreviews ??= new Map()).set(sheetIndex, progress);
+    const load = this.loadWorksheet(sheetIndex, progress);
+    void load.catch((error: unknown) => progress.fail(error));
     this.sheetLoads.set(sheetIndex, load);
     try {
       return await load;
     } finally {
       if (this.sheetLoads.get(sheetIndex) === load) this.sheetLoads.delete(sheetIndex);
+      if (this.sheetPreviews?.get(sheetIndex) === progress) this.sheetPreviews.delete(sheetIndex);
+    }
+  }
+
+  private touchWorksheet(sheetIndex: number, worksheet: Worksheet): void {
+    this.sheetCache.delete(sheetIndex);
+    this.sheetCache.set(sheetIndex, worksheet);
+  }
+
+  private pinWorksheet(sheetIndex: number): () => void {
+    this.sheetLeases.set(sheetIndex, (this.sheetLeases.get(sheetIndex) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = this.sheetLeases.get(sheetIndex) ?? 0;
+      if (count <= 1) this.sheetLeases.delete(sheetIndex);
+      else this.sheetLeases.set(sheetIndex, count - 1);
+    };
+  }
+
+  private completePendingEvictions(): void {
+    for (const pending of this.evictingSheets.values()) pending.complete();
+    this.evictingSheets.clear();
+  }
+
+  /** The lease begins before an asynchronous pull so another admission cannot
+   * discard a sheet just as the waiting caller receives it. */
+  private async acquireWorksheetLease(sheetIndex: number): Promise<{
+    worksheet: Worksheet;
+    release: () => void;
+  }> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.acquireWorksheetLease(sheetIndex);
+    }
+    const release = this.pinWorksheet(sheetIndex);
+    try {
+      return { worksheet: await this.getWorksheet(sheetIndex), release };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
+  /** Viewer lease may resolve at the first exact row-local viewport. Public
+   * worksheet and find callers continue to wait for terminal cache admission.
+   * Row pulling is independent of painting: a render may itself need a later
+   * row, so waiting for the paint here would create a mutual wait. */
+  private async acquireWorksheetPreviewLease(sheetIndex: number): Promise<{
+    worksheet: Worksheet;
+    release: () => void;
+    partial: boolean;
+    completion: Promise<Worksheet>;
+    waitForRows: (row: number) => Promise<void>;
+  }> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.acquireWorksheetPreviewLease(sheetIndex);
+    }
+    const releasePin = this.pinWorksheet(sheetIndex);
+    const release = () => { releasePin(); };
+    try {
+      const completion = this.getOrLoadWorksheet(sheetIndex);
+      // Preview readiness can reject before this lease exposes completion (for
+      // example, on destroy). Observe both promises immediately; callers still
+      // receive failures through ready or the original completion promise.
+      void completion.catch(() => undefined);
+      const progress = this.sheetPreviews?.get(sheetIndex);
+      const worksheet = progress ? await progress.ready : await completion;
+      return {
+        worksheet, release, partial: !!progress?.worksheet && !progress.complete, completion,
+        waitForRows: (row) => progress ? progress.waitFor(row) : Promise.resolve(),
+      };
+    } catch (error) {
+      release();
+      throw error;
     }
   }
 
   /** Detached comments for one worksheet, in authored order. Worksheet models
    * are materialized lazily, so this accessor is asynchronous. */
   async getComments(sheetIndex: number): Promise<readonly Readonly<XlsxComment>[]> {
-    const worksheet = await this.getWorksheet(sheetIndex);
-    return structuredClone(worksheet.comments ?? []);
+    const lease = await this.acquireWorksheetLease(sheetIndex);
+    try {
+      return structuredClone(lease.worksheet.comments ?? []);
+    } finally {
+      lease.release();
+    }
   }
 
   /** Return a fresh content-free metrics snapshot, including lazy worksheet and
@@ -691,7 +899,7 @@ export class XlsxWorkbook {
     });
   }
 
-  private async loadWorksheet(sheetIndex: number): Promise<Worksheet> {
+  private async loadWorksheet(sheetIndex: number, progress: WorksheetPreview): Promise<Worksheet> {
     // The worker retained its transferred archive at parse time; loaded state
     // is represented by the workbook bootstrap, not a duplicate source buffer.
     if (!this.parsedWorkbook) {
@@ -700,34 +908,55 @@ export class XlsxWorkbook {
     const sheetMeta = this.parsedWorkbook.workbook.sheets[sheetIndex];
     if (!sheetMeta) throw new Error(`Sheet index ${sheetIndex} out of range`);
 
-    return this.runArchiveOperation(() => this.loadWorksheetStream(sheetIndex, sheetMeta.name));
+    return this.runArchiveOperation(() => this.loadWorksheetStream(sheetIndex, sheetMeta.name, progress));
   }
 
-  private async loadWorksheetStream(sheetIndex: number, sheetName: string): Promise<Worksheet> {
+  private async loadWorksheetStream(sheetIndex: number, sheetName: string, progress: WorksheetPreview): Promise<Worksheet> {
+    const policy = this.worksheetPolicy;
     const client = this.ensureWorksheetPullClient();
-    const rows: Worksheet['rows'] = [];
+    const rows = progress.rows;
     let modelUsage: WorksheetModelUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0 };
     let terminal: Worksheet | undefined;
     let nextCacheUsage: WorksheetCacheUsage | undefined;
+    let terminalUsage: WorksheetCacheUsage | undefined;
+    let terminalAcknowledged = false;
     // The compatibility adapter knows the workbook sheet index/name but not
     // the resolved OPC relationship target. Omit `part` rather than fabricate
     // a package address; Rust-originated violations carry the real xl/... path.
     const part = undefined;
     try {
       for await (const unit of client.stream(sheetIndex, sheetName)) {
+        if (unit.kind === 'preview') {
+          if (unit.worksheet) {
+            bindWorksheetPolicy(unit.worksheet, policy);
+            bindCellFontLanguage(unit.worksheet, this.japaneseCellFonts);
+          }
+          progress.preview(unit.worksheet, unit.reason, unit.maxRow, unit.maxCol);
+          if (unit.worksheet) {
+            setWorksheetPreviewBounds(unit.worksheet, { maxRow: unit.maxRow, maxCol: unit.maxCol });
+            await this.retainWorksheetOfficeFonts(unit.worksheet);
+            const mainOffice = typeof document !== 'undefined'
+              ? this.retainedFontSets.get(document.fonts)?.loaded?.office : undefined;
+            bindXlsxWorksheetOfficeFontRoutes(unit.worksheet, mainOffice?.routes, this.googleSubstitutes);
+          }
+          continue;
+        }
         if (unit.kind === 'rows') {
-          const nextUsage = addWorksheetUsage(modelUsage, measureRows(unit.rows));
+          const nextUsage = addWorksheetUsage(modelUsage, measureRows(unit.rows, policy), policy);
           assertWorksheetModelUsage(
             nextUsage,
             'get-worksheet',
             part,
             unit.usage,
+            policy,
           );
-          rows.push(...unit.rows);
+          progress.append(unit.rows);
           modelUsage = nextUsage;
           continue;
         }
         const worksheet = unit.worksheet;
+        bindWorksheetPolicy(worksheet, policy);
+        bindCellFontLanguage(worksheet, this.japaneseCellFonts);
         worksheet.rows = worksheet.parseError ? [] : rows;
         // Terminal metadata contains no rows, but measure the final public model
         // to cover exact monolithic JSON before its cache admission.
@@ -736,42 +965,120 @@ export class XlsxWorkbook {
           worksheet.parseError
             ? { rows: 0, cells: 0, ownedUtf8Bytes: 0 }
             : modelUsage,
+          policy,
         );
         assertWorksheetModelUsage(
           measured,
           'get-worksheet',
           part,
           unit.usage,
+          policy,
         );
         assertWorksheetJsonBytes(
           measured.jsonBytes,
           'get-worksheet',
           part,
           unit.usage,
+          policy,
         );
-        const retainedUsage = this.retainedSheetUsage ?? {
-          rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0,
-        };
-        const nextCache = addWorksheetCacheUsage(retainedUsage, measured);
-        assertWorksheetCacheUsage(
-          nextCache,
-          'get-worksheet',
-          part,
-          unit.usage,
-        );
+        // Resource governance is a library policy, not an OOXML rule. Plan the
+        // complete eviction before changing either realm. The worker receives
+        // the same victims before terminal ACK, so it cannot retain a stale
+        // model or reject a sheet that fits after eviction.
+        let remaining = this.retainedSheetUsage;
+        let nextCache = addWorksheetCacheUsage(remaining, measured, {}, policy);
+        const victims: number[] = [];
+        for (const [candidate] of this.sheetCache) {
+          try {
+            assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage, policy);
+            break;
+          } catch (error) {
+            if (!(error instanceof OoxmlResourceLimitError)) throw error;
+          }
+          if ((this.sheetLeases.get(candidate) ?? 0) > 0) continue;
+          const previous = this.sheetCacheUsage.get(candidate);
+          if (!previous) continue;
+          // Subtract from the unsaturated retained total, then add the incoming
+          // sheet again. addWorksheetCacheUsage caps an over-budget candidate
+          // at limit + 1, so subtracting from that candidate loses exact usage.
+          remaining = addWorksheetCacheUsage(remaining, {
+            rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0,
+          }, previous, policy);
+          nextCache = addWorksheetCacheUsage(remaining, measured, {}, policy);
+          victims.push(candidate);
+        }
+        assertWorksheetCacheUsage(nextCache, 'get-worksheet', part, unit.usage, policy);
+        let pendingEviction: { done: Promise<void>; complete: () => void } | undefined;
+        if (victims.length && this._mode === 'worker') {
+          let complete!: () => void;
+          const done = new Promise<void>((resolve) => { complete = resolve; });
+          pendingEviction = { done, complete };
+          for (const candidate of victims) this.evictingSheets.set(candidate, pendingEviction);
+        }
+        try {
+          if (pendingEviction) {
+            await this.requireBridge().request(
+              (id) => ({ type: 'evictWorksheets', id, sheetIndices: victims }) satisfies RenderWorkerRequest,
+            );
+            if (!this.parsedWorkbook) throw new Error('Workbook not loaded');
+          }
+          for (const candidate of victims) {
+            if ((this.sheetLeases.get(candidate) ?? 0) > 0) {
+              throw new Error(`Cannot evict leased worksheet ${candidate}`);
+            }
+          }
+          for (const candidate of victims) {
+            this.sheetCache.delete(candidate);
+            this.sheetCacheUsage.delete(candidate);
+          }
+          // The terminal can still be canceled or fail its ACK. Eviction has
+          // already happened in both realms, so its accounting commits now.
+          this.retainedSheetUsage = remaining;
+        } catch (error) {
+          if (pendingEviction) {
+            // A lost reply or divergent lease cannot prove the worker state.
+            // Close both caches rather than let either realm serve a stale copy.
+            this.destroy();
+          }
+          throw error;
+        } finally {
+          if (pendingEviction) {
+            for (const candidate of victims) {
+              if (this.evictingSheets.get(candidate) === pendingEviction) {
+                this.evictingSheets.delete(candidate);
+              }
+            }
+            pendingEviction.complete();
+          }
+        }
         terminal = worksheet;
+        terminalUsage = measured;
         nextCacheUsage = nextCache;
       }
-      if (!terminal || !nextCacheUsage) {
+      terminalAcknowledged = true;
+      if (!terminal || !nextCacheUsage || !terminalUsage) {
         throw new Error(`XLSX worksheet ${sheetIndex} did not produce a terminal model`);
       }
       // The coordinator has ACKed the accepted terminal before it completes.
       // Only now commit Browser-retained cache ownership/accounting.
       this.retainedSheetUsage = nextCacheUsage;
       this.sheetCache.set(sheetIndex, terminal);
+      this.sheetCacheUsage.set(sheetIndex, terminalUsage);
+      // Both realms now retain the same model even if an optional font load
+      // rejects; a later operation can still acquire the cached worksheet.
+      await this.retainWorksheetOfficeFonts(terminal);
+      const mainOffice = typeof document !== 'undefined'
+        ? this.retainedFontSets.get(document.fonts)?.loaded?.office : undefined;
+      bindXlsxWorksheetOfficeFontRoutes(terminal, mainOffice?.routes, this.googleSubstitutes);
+      progress.finish(terminal);
       return terminal;
     } catch (error) {
-      if (error instanceof OoxmlResourceLimitError) this.resourceFailure ??= error;
+      // Terminal ACK may have committed on the worker even when its reply was
+      // lost. The main cache has not admitted that model; terminate the worker
+      // and discard all local models before another operation can read it.
+      if (this._mode === 'worker' && terminal && !terminalAcknowledged) this.destroy();
+      this.latchFatalResourceFailure(error);
+      progress.fail(error);
       throw error;
     }
   }
@@ -801,7 +1108,7 @@ export class XlsxWorkbook {
       try {
         return await operation();
       } catch (error) {
-        if (error instanceof OoxmlResourceLimitError) this.resourceFailure ??= error;
+        this.latchFatalResourceFailure(error);
         throw error;
       }
     };
@@ -826,8 +1133,11 @@ export class XlsxWorkbook {
     this.requireArchiveBridge();
     const queued = this.queuedImageLoads?.get(imagePath);
     if (queued) return queued;
-    const p = this.runArchiveOperation(() =>
-      this.getImageWithinArchiveOperation(imagePath, mimeType));
+    const provisional = [...(this.sheetPreviews?.values() ?? [])]
+      .some((preview) => preview.worksheet && !preview.complete);
+    const p = provisional
+      ? this.getImageWithinArchiveOperation(imagePath, mimeType)
+      : this.runArchiveOperation(() => this.getImageWithinArchiveOperation(imagePath, mimeType));
     this.queuedImageLoads ??= new Map();
     this.queuedImageLoads.set(imagePath, p);
     void p.finally(() => {
@@ -919,20 +1229,25 @@ export class XlsxWorkbook {
       targetIndex = found;
     }
 
-    const ws = await this.getWorksheet(targetIndex);
-    const styles = this.parsedWorkbook.styles;
-    // Index the target sheet's cells by "row:col" for O(1) lookup during the
-    // row-major walk in resolveListValues.
-    const byRC = new Map<string, Cell>();
-    for (const r of ws.rows) {
-      for (const c of r.cells) byRC.set(`${c.row}:${c.col}`, c);
-    }
+    const lease = await this.acquireWorksheetLease(targetIndex);
+    try {
+      const ws = lease.worksheet;
+      const styles = this.parsedWorkbook.styles;
+      // Index the target sheet's cells by "row:col" for O(1) lookup during the
+      // row-major walk in resolveListValues.
+      const byRC = new Map<string, Cell>();
+      for (const r of ws.rows) {
+        for (const c of r.cells) byRC.set(`${c.row}:${c.col}`, c);
+      }
 
-    return resolveListValues(parsed, (row, col) => {
-      const cell = byRC.get(`${row}:${col}`);
-      if (!cell) return null;
-      return formatCellValue(cell, styles, null, ws.date1904);
-    });
+      return resolveListValues(parsed, (row, col) => {
+        const cell = byRC.get(`${row}:${col}`);
+        if (!cell) return null;
+        return formatCellValue(cell, styles, null, ws.date1904);
+      });
+    } finally {
+      lease.release();
+    }
   }
 
   /**
@@ -964,6 +1279,9 @@ export class XlsxWorkbook {
     opts: RenderViewportOptions = {},
   ): Promise<void> {
     this.assertResourceHealthy();
+    // This invocation owns its viewport identity across resource awaits and
+    // caller callbacks; a later edit to the caller's object is another frame.
+    viewport = { row: viewport.row, col: viewport.col, rows: viewport.rows, cols: viewport.cols };
     if (this._mode === 'worker') {
       throw new Error(
         "renderViewport(canvas) is unavailable in mode: 'worker'; use renderViewportToBitmap() and paint it via an ImageBitmapRenderingContext",
@@ -973,12 +1291,44 @@ export class XlsxWorkbook {
     const styles = this.parsedWorkbook.styles;
     const extracted = extractViewerRenderContext(opts as WireRenderViewportOptions);
     const { sizeOverrides, ...renderOpts } = extracted.opts;
+    const targetFontSet = isHTMLCanvas(target)
+      ? target.ownerDocument.fonts
+      : (typeof document !== 'undefined' ? document.fonts : null);
+    const preview = this.sheetPreviews?.get(sheetIndex);
+    if (preview?.worksheet && extracted.worksheet) {
+      await preview.waitFor(Math.max(
+        viewport.row + viewport.rows - 1,
+        renderOpts.freezeRows ?? 0,
+      ));
+      this.assertResourceHealthy();
+      const ws = extracted.worksheet;
+      // Visible images may be fetched during the provisional paint. Their
+      // requests use the pull owner's image path while the cursor holds the
+      // package operation, so the render itself must not queue behind that
+      // operation.
+      await renderWorksheetViewport(
+        {
+          ws, styles, cjkFallback: this.cjkFallback, math: this.math,
+          threeD: this.threeD, regionMap: this.regionMap,
+          chartEx: this.chartEx, tiff: this.tiff,
+        }, target, viewport,
+        {
+          ...renderOpts,
+          authoritativeMdw: extracted.layoutMetrics?.maximumDigitWidth,
+          officeFontRoutes: targetFontSet
+            ? this.retainedFontSets.get(targetFontSet)?.loaded?.office.routes
+            : undefined,
+          googleSubstitutes: this.googleSubstitutes,
+          fetchImage: this._fetchImage,
+        },
+      );
+      return;
+    }
     return this.withWorksheetArchiveOperation(sheetIndex, (source) => {
       const ws = extracted.worksheet ?? createSizeOverriddenWorksheet(source, sizeOverrides);
       if (ws !== source) inheritSheetRenderCache(source, ws);
-      if (extracted.layoutMetrics) {
-        GridGeometry.forWorksheet(ws, extracted.layoutMetrics.maximumDigitWidth);
-      }
+      // The render bind may invalidate a geometry snapshot made in another
+      // font realm. Pin the viewer's MDW inside the renderer after binding.
       return renderWorksheetViewport(
         {
           ws,
@@ -994,7 +1344,15 @@ export class XlsxWorkbook {
         viewport,
         // The stable closure uses the archive operation already reserved by
         // withWorksheetArchiveOperation, avoiding a nested FIFO acquisition.
-        { ...renderOpts, fetchImage: this._fetchImage },
+        {
+          ...renderOpts,
+          authoritativeMdw: extracted.layoutMetrics?.maximumDigitWidth,
+          officeFontRoutes: targetFontSet
+            ? this.retainedFontSets.get(targetFontSet)?.loaded?.office.routes
+            : undefined,
+          googleSubstitutes: this.googleSubstitutes,
+          fetchImage: this._fetchImage,
+        },
       );
     });
   }
@@ -1021,14 +1379,23 @@ export class XlsxWorkbook {
     opts: WireRenderViewportOptions & { width: number; height: number },
   ): Promise<ImageBitmap> {
     this.assertResourceHealthy();
+    // This invocation owns its viewport identity across resource awaits and
+    // caller callbacks; a later edit to the caller's object is another frame.
+    viewport = { row: viewport.row, col: viewport.col, rows: viewport.rows, cols: viewport.cols };
     const extracted = extractViewerRenderContext(opts);
     const wireOpts = { ...extracted.opts, dpr: opts.dpr ?? defaultDpr() };
     if (this._mode === 'worker') {
       if (!Number.isInteger(sheetIndex) || sheetIndex < 0 || sheetIndex >= this.sheetCount) {
         throw new Error(`Sheet index ${sheetIndex} out of range (count: ${this.sheetCount})`);
       }
-      const res = await this.withWorksheetArchiveOperation(sheetIndex, () =>
-        this.requireBridge().request(
+      // WHATWG HTML: an OffscreenCanvas constructed here snapshots this
+      // document's language and direction, while one constructed in the Worker
+      // has unknown language. Transferring it before any getContext() carries
+      // those inherited values, matching the main-mode surface below. Each
+      // send constructs its own surface because transfer detaches it.
+      const request = () => {
+        const canvas = new OffscreenCanvas(1, 1);
+        return this.requireBridge().request(
           (id) => ({
             type: 'renderViewport',
             id,
@@ -1037,8 +1404,23 @@ export class XlsxWorkbook {
             opts: wireOpts,
             layoutMetrics: extracted.layoutMetrics,
             viewProjection: extracted.projection,
+            canvas,
           }) satisfies RenderWorkerRequest,
+          [canvas],
+        );
+      };
+      const preview = this.sheetPreviews?.get(sheetIndex);
+      let res;
+      if (preview?.worksheet && extracted.worksheet) {
+        await preview.waitFor(Math.max(
+          viewport.row + viewport.rows - 1,
+          wireOpts.freezeRows ?? 0,
         ));
+        this.assertResourceHealthy();
+        res = await request();
+      } else {
+        res = await this.withWorksheetArchiveOperation(sheetIndex, request);
+      }
       return (res as Extract<RenderWorkerResponse, { type: 'viewportRendered' }>).bitmap;
     }
     const off = new OffscreenCanvas(1, 1);
@@ -1048,18 +1430,42 @@ export class XlsxWorkbook {
 
   /** @internal Drop projections owned by a destroyed viewer. */
   [releaseXlsxViewerProjection](projectionId: number): void {
-    if (this._mode !== 'worker') return;
-    this.requireBridge().post(
+    if (this._mode !== 'worker' || !this.bridge) return;
+    this.bridge.post(
       { type: 'releaseViewProjection', projectionId } satisfies RenderWorkerRequest,
     );
+  }
+
+  /** The viewer may keep displaying a model after its cache entry is evicted.
+   * Restore its active lease without materializing or changing that model. */
+  private async retainWorksheetReference(sheetIndex: number): Promise<() => void> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) {
+      await pending.done;
+      return this.retainWorksheetReference(sheetIndex);
+    }
+    return this.parsedWorkbook ? this.pinWorksheet(sheetIndex) : () => undefined;
   }
 
   private withWorksheetArchiveOperation<T>(
     sheetIndex: number,
     operation: (worksheet: Worksheet) => Promise<T>,
   ): Promise<T> {
+    const pending = this.evictingSheets.get(sheetIndex);
+    if (pending) return pending.done.then(() => this.withWorksheetArchiveOperation(sheetIndex, operation));
+    const release = this.pinWorksheet(sheetIndex);
+    return this.withPinnedWorksheetArchiveOperation(sheetIndex, operation).finally(release);
+  }
+
+  private withPinnedWorksheetArchiveOperation<T>(
+    sheetIndex: number,
+    operation: (worksheet: Worksheet) => Promise<T>,
+  ): Promise<T> {
     const cached = this.sheetCache.get(sheetIndex);
-    if (cached) return this.runArchiveOperation(() => operation(cached));
+    if (cached) {
+      this.touchWorksheet(sheetIndex, cached);
+      return this.runArchiveOperation(() => operation(cached));
+    }
     const active = this.sheetLoads.get(sheetIndex);
     if (active) {
       return this.runArchiveOperation(async () => operation(await active));
@@ -1081,9 +1487,11 @@ export class XlsxWorkbook {
     // leave this coordination promise as an unhandled rejection.
     void load.catch(() => undefined);
     this.sheetLoads.set(sheetIndex, load);
+    const progress = new WorksheetPreview([]);
+    (this.sheetPreviews ??= new Map()).set(sheetIndex, progress);
     const combined = this.runArchiveOperation(async () => {
       try {
-        const worksheet = await this.loadWorksheetStream(sheetIndex, sheetMeta.name);
+        const worksheet = await this.loadWorksheetStream(sheetIndex, sheetMeta.name, progress);
         resolveLoad(worksheet);
         return await operation(worksheet);
       } catch (error) {
@@ -1091,6 +1499,7 @@ export class XlsxWorkbook {
         throw error;
       } finally {
         if (this.sheetLoads.get(sheetIndex) === load) this.sheetLoads.delete(sheetIndex);
+        if (this.sheetPreviews?.get(sheetIndex) === progress) this.sheetPreviews.delete(sheetIndex);
       }
     });
     return combined;
@@ -1104,15 +1513,28 @@ export class XlsxWorkbook {
     this.bridge = null;
     this.parsedWorkbook = null;
     this.sheetCache.clear();
+    this.sheetCacheUsage.clear();
+    this.sheetLeases.clear();
+    this.completePendingEvictions();
+    this.retainedSheetUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0 };
     this.sheetLoads.clear();
+    for (const progress of this.sheetPreviews?.values() ?? []) {
+      progress.fail(new Error('XLSX workbook has been destroyed'));
+    }
+    this.sheetPreviews?.clear();
     this.fontsDestroyed = true;
     for (const retained of this.retainedFontSets.values()) {
-      if (retained.faces) unloadGoogleFonts(retained.faces);
+      if (retained.loaded) {
+        unloadGoogleFonts(retained.loaded.google);
+        unloadOfficeFontFallbacks(retained.loaded.office.faces);
+      }
       // An in-flight registration observes fontsDestroyed in its own completion
       // callback and releases exactly once when the faces become available.
     }
     this.retainedFontSets.clear();
     this.googleFontNames = [];
+    this.googleSubstitutes = false;
+    this.officeFontRequests = [];
     // Frame-local lookup maps never escape the renderer; drop the owning core
     // caches to release decoded surfaces and SVG references.
     dropDecodedBitmapCache(this._fetchImage);
@@ -1123,6 +1545,15 @@ export class XlsxWorkbook {
 
   private assertResourceHealthy(): void {
     if (this.resourceFailure) throw this.resourceFailure;
+  }
+
+  private latchFatalResourceFailure(error: unknown): void {
+    // Aggregate cache capacity can change when a lease ends. Preserve the
+    // document-level poison boundary for hard model/package limits only.
+    if (
+      error instanceof OoxmlResourceLimitError &&
+      error.details.violation.resource !== 'worksheet-cache'
+    ) this.resourceFailure ??= error;
   }
 
   private requireBridge(): WorkbookBridge {
@@ -1139,3 +1570,39 @@ export class XlsxWorkbook {
     return this.bridge;
   }
 }
+
+/** @internal Viewer-owned operations retain a model until their content reads
+ * finish. This adapter stays out of the package entry's public API. */
+export function acquireXlsxWorksheet(workbook: XlsxWorkbook, sheetIndex: number): Promise<{
+  worksheet: Worksheet;
+  release: () => void;
+}> {
+  return workbook['acquireWorksheetLease'](sheetIndex);
+}
+
+/** @internal Fast viewer acquisition. Structural test doubles retain the
+ * established full-model contract. */
+export function acquireXlsxWorksheetPreview(workbook: XlsxWorkbook, sheetIndex: number): Promise<{
+  worksheet: Worksheet;
+  release: () => void;
+  partial: boolean;
+  completion: Promise<Worksheet>;
+  waitForRows?: (row: number) => Promise<void>;
+}> {
+  const acquire = workbook['acquireWorksheetPreviewLease'];
+  if (typeof acquire === 'function') return acquire.call(workbook, sheetIndex);
+  return acquireXlsxWorksheet(workbook, sheetIndex).then((lease) => ({
+    ...lease, partial: false, completion: Promise.resolve(lease.worksheet),
+  }));
+}
+
+/** @internal Restore the active viewer lease for a displayed worksheet even
+ * when its workbook cache entry has already been evicted. */
+export function retainXlsxWorksheetReference(workbook: XlsxWorkbook, sheetIndex: number): Promise<() => void> {
+  const retain = workbook['retainWorksheetReference'];
+  // Structural viewer test doubles may not implement this cache-only hook.
+  return typeof retain === 'function'
+    ? retain.call(workbook, sheetIndex)
+    : Promise.resolve(() => undefined);
+}
+declare const __OOXML_MODEL_SOURCES__: boolean;

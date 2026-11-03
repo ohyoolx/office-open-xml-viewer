@@ -21,7 +21,8 @@ export interface ParagraphBorderSegment {
 }
 
 /** Vertical extent reserved below text for a visible bottom paragraph border.
- * ECMA-376 §17.3.1.7 places the centered stroke after `w:space`. */
+ * ECMA-376 §17.3.1.7 places the centered stroke after `w:space`.
+ * `word-paragraph-border-flow-reservation` */
 export function bottomBorderExtentPt(
   borders: ParagraphBorders | null | undefined,
   merge?: ParagraphBorderMerge,
@@ -30,6 +31,20 @@ export function bottomBorderExtentPt(
   const bottom = borders.bottom;
   if (!bottom || bottom.style === 'none') return 0;
   return (bottom.space ?? 0) + (bottom.width ?? 0) / 2;
+}
+
+/** Reserve the painted outer edge of a visible top paragraph border above its
+ * text. ECMA-376 §17.3.1.42 defines w:space as the distance from text to the
+ * top stroke; §17.3.4 gives the centered stroke its own width. A grouped
+ * paragraph whose top edge is suppressed contributes no top reservation. */
+export function topBorderExtentPt(
+  borders: ParagraphBorders | null | undefined,
+  edge: ParagraphBorderEdges['top'],
+): number {
+  if (!borders || edge === 'none') return 0;
+  const top = borders[edge];
+  if (!top || top.style === 'none' || top.style === 'nil') return 0;
+  return (top.space ?? 0) + (top.width ?? 0) / 2;
 }
 
 function effectiveEdge(edge: ParaBorderEdge | null): ParaBorderEdge | null {

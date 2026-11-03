@@ -1,3 +1,10 @@
+import { graphemeClusterOffsets } from '@silurus/ooxml-core';
+import {
+  bidiLevelChanges,
+  CONDENSED_CONTEXT_GRAPHEMES,
+  hasCursiveJoining,
+  textSpacingAdvance,
+} from './character-spacing.js';
 // ECMA-376 §17.6.20 vertical writing (`<w:textDirection w:val="tbRl">`) — the
 // glyph-level primitives for rendering a page that has been laid out in the
 // SWAPPED logical coordinate space and rotated +90° into physical space by the
@@ -15,7 +22,7 @@
 //   • vo=Tu (transform, fallback upright): 、。，．！？ and small kana. When
 //     this DOM canvas/font proves that `vert` changes the code point, the original
 //     character is drawn with its featured A/D placement. Otherwise the existing
-//     FE10–FE12 / centred-upright / corner-nudge machinery remains the fallback.
+//     FE10–FE12 / upright base-glyph machinery remains the fallback.
 //   • vo=Tr (transform, fallback rotate): the fullwidth brackets （「」〈〉【】… and
 //     the white lenticular brackets 〖〗 have a U+FE1x/FE3x vertical presentation
 //     form (core `verticalBracketFormSubstitute`) present in the substitute fonts;
@@ -48,13 +55,14 @@
 // resolved against the physical page then projected into the logical flow
 // (PDF-verified centroid); inline/anchored/float image uprighting; and the
 // vertical text-layer transform. Still approximated / deferred (flagged inline):
-// the U+FF0E Tu upper-right corner fallback is a font-dependent heuristic;
+// an unreachable U+FF0E vertical alternate retains the upright base glyph;
 // paragraph-relative vertical anchors are a follow-up. `btLr` shares the +90°
 // page FRAME but bypasses this module's
 // upright/substitute glyph handling entirely (issue #988 re-adjudication: every
 // glyph rides the page rotation — see BodyAcquisitionState.verticalAllRotated).
 
 import { wordPreservesVerticalTuCorner } from './layout/script-compatibility.js';
+import type { WritingMode } from './layout/types.js';
 import {
   verticalOrientation,
   verticalFormSubstitute,
@@ -63,6 +71,8 @@ import {
   measureVerticalVertGlyph,
   verticalVertGlyphReachable,
   withVertFeature,
+  emBoxCenterAboveBaseline,
+  inkCenterAboveMiddlePx,
 } from '@silurus/ooxml-core';
 
 // Browser acceptance tests load this source module through Vite's `/src` bridge;
@@ -110,41 +120,6 @@ export function isUprightVerticalGlyph(cp: number): boolean {
   return verticalDrawMode(cp) === 'upright';
 }
 
-/** The Tu punctuation whose upper-right cell position is approximated by a
- *  draw-time nudge WHEN the font has no U+FExx vertical form to substitute (see
- *  {@link verticalGlyphOffset}). The comma/full stop that DO have a vertical form
- *  ({@link verticalFormSubstitute}: 、。，) are substituted instead and the font
- *  positions them, so they are NOT nudged. The fullwidth full stop ． (FF0E) has
- *  no vertical form in Unicode, so it stays on the nudge fallback. */
-const VERTICAL_PUNCT_UPPER_RIGHT = new Set<number>([
-  0xff0e, // ． fullwidth full stop (no U+FExx vertical form → nudge fallback)
-]);
-
-/**
- * Per-glyph draw offset (in em fractions of the font size) applied in the
- * glyph's own UPRIGHT local frame — i.e. after the −90° counter-rotation, in
- * physical (dx = rightward, dy = downward) terms. Returns `{ dx, dy }` em
- * fractions; the caller multiplies by the font px size.
- *
- * This is the FALLBACK for a Tu code point whose upper-right cell position would
- * otherwise be supplied by a substituted vertical presentation form
- * ({@link verticalFormSubstitute}) but for which Unicode has none (only ． FF0E
- * today). The nudge moves the glyph toward the upper-right corner of the cell.
- * Everything with a vertical form is substituted and returns `{0,0}` here.
- */
-export function verticalGlyphOffset(cp: number): { dx: number; dy: number } {
-  if (VERTICAL_PUNCT_UPPER_RIGHT.has(cp)) {
-    // HEURISTIC (approximation, font-dependent): move ． toward the upper-right
-    // corner of the cell by ~0.4em each way. NOT a spec constant — JIS X 4051
-    // §4.x gives the punctuation cell geometry (the glyph occupies a quarter-em
-    // corner box), not a 0.4em nudge. The correct fix would be a Unicode vertical
-    // form for ． (none exists), so this narrow fallback remains. Tracked in issue
-    // #771 (vertical-text).
-    return { dx: 0.4, dy: -0.4 };
-  }
-  return { dx: 0, dy: 0 };
-}
-
 /**
  * Split a run's text into maximal runs of same-draw-mode code points (UAX#50 vo,
  * via {@link verticalDrawMode}), so the vertical draw path can counter-rotate
@@ -184,69 +159,6 @@ export function splitVerticalOrientationRuns(
 type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 type VertCapability = (cp: number) => boolean;
 const NO_VERT_CAPABILITY: VertCapability = () => false;
-
-/**
- * Cross-axis (column-thickness) offset, in px, from the alphabetic baseline to
- * the font's EM-BOX CENTRE — i.e. `(fontBoundingBoxAscent − fontBoundingBoxDescent)/2`.
- *
- * This is a FONT metric (glyph-independent): `fontBoundingBox*` describe the
- * font's design box, not one glyph's ink. In vertical text the column's cross
- * axis is where every cell centres, and the UPRIGHT cells (drawn with a `middle`
- * textBaseline) already sit their em box on the caller's `baseline`. A SIDEWAYS
- * (Latin/digit) glyph, however, is drawn on its ALPHABETIC baseline, so its ink
- * (which sits ~this many px above the baseline) would land off the column centre
- * by exactly this amount. Shifting the sideways draw down the cross axis by this
- * offset re-centres its em box on the same line the upright cells use — so mixed
- * columns like "電話 03-1234-5678" share one centreline (ECMA-376 §17.6.20).
- *
- * Falls back to `0.38 × fontPx` (the near-universal CJK/Latin em-box centre ratio)
- * only if the Canvas does not report `fontBoundingBox*` (older engines); on those
- * engines the previous baseline-anchored placement is no worse than today.
- */
-function emBoxCenterAboveBaselinePx(ctx: Ctx2D, sample: string, fontPx: number): number {
-  const prevBaseline = ctx.textBaseline;
-  ctx.textBaseline = 'alphabetic';
-  const m = ctx.measureText(sample);
-  ctx.textBaseline = prevBaseline;
-  const asc = m.fontBoundingBoxAscent;
-  const desc = m.fontBoundingBoxDescent;
-  if (typeof asc === 'number' && typeof desc === 'number' && (asc !== 0 || desc !== 0)) {
-    return (asc - desc) / 2;
-  }
-  return 0.38 * fontPx;
-}
-
-/**
- * Along-column offset, in px, from a glyph's own cell centre to its INK centre
- * when the glyph is drawn UPRIGHT — i.e. `(actualBoundingBoxAscent −
- * actualBoundingBoxDescent)/2` measured with a `middle` textBaseline.
- *
- * For an upright-drawn glyph the page transform maps the glyph's VERTICAL extent
- * onto the along-column axis, so a glyph whose ink is not vertically centred in
- * its em box (most visibly a substituted vertical bracket form ︵ ︶ ﹁ ﹂,
- * whose ink hugs one end of the cell) lands off the cell centre by this amount.
- * The renderer shifts the draw by `+this` so the ink re-centres — a per-GLYPH
- * measured metric (`actualBoundingBox*` is the tight ink box), NOT a constant.
- * For an ordinary ideograph/kana this is ≈0, so upright CJK cells are unaffected.
- *
- * Returns 0 when the Canvas does not report `actualBoundingBox*` (older engines):
- * the glyph then draws at the cell centre exactly as before this metric existed.
- */
-function inkCenterAboveMiddlePx(ctx: Ctx2D, drawStr: string): number {
-  const prevAlign = ctx.textAlign;
-  const prevBaseline = ctx.textBaseline;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  const m = ctx.measureText(drawStr);
-  ctx.textAlign = prevAlign;
-  ctx.textBaseline = prevBaseline;
-  const asc = m.actualBoundingBoxAscent;
-  const desc = m.actualBoundingBoxDescent;
-  if (typeof asc === 'number' && typeof desc === 'number') {
-    return (asc - desc) / 2;
-  }
-  return 0;
-}
 
 /**
  * True for a vo=Tr code point that takes the GEOMETRIC ROTATE fallback in
@@ -329,6 +241,12 @@ export interface PlannedVerticalGlyphCell {
   readonly drawOffsetPt: Readonly<{ xPt: number; yPt: number }>;
   readonly verticalFeature: boolean;
   readonly blockAxisInkBounds?: Readonly<{ startPt: number; endPt: number }>;
+  /** WORD_CONDENSED_SPACING_ADVANCE_FLOOR took this cell's advance (or, for
+   * an unsplit cursive piece, one of its graphemes' advances) to zero. */
+  readonly floored?: true;
+  /** Drawn advance of a floored sideways cluster painted on its own (its
+   * isolated shaped width), for direction-aware placement of its ink. */
+  readonly naturalAdvancePt?: number;
 }
 
 function plannedVerticalBlockAxisInkBounds(
@@ -337,7 +255,7 @@ function plannedVerticalBlockAxisInkBounds(
   orientation: PlannedVerticalGlyphCell['orientation'],
   drawOffsetPt: Readonly<{ xPt: number; yPt: number }>,
   charScale: number,
-  writingMode: 'horizontal-tb' | 'vertical-rl' | 'vertical-lr',
+  writingMode: WritingMode,
   verticalFeature: boolean,
 ): PlannedVerticalGlyphCell['blockAxisInkBounds'] {
   const previousAlign = ctx.textAlign;
@@ -384,6 +302,24 @@ function plannedVerticalBlockAxisInkBounds(
   });
 }
 
+// UAX #50 §3.1 / Vertical_Orientation=Tu permits an upright base glyph when the
+// vertical alternate is unavailable. OpenType `vert` selects a distinct glyph;
+// `vrt2` additionally supplies rotation and must not be stacked with `vert`.
+// ECMA-376 §§17.6.20, 17.18.93 specify flow, not a punctuation translation.
+//
+// Windows Word 16.0 build 16.0.20430: seven reference-catalog CJK families at
+// 8/12/20/32pt, section tbRl and ideographic VML textboxes, with horizontal
+// counterexamples, select different glyph IDs for ．、。，. The U+FF0E alternate
+// can change outline dimensions as well as position. Neither horizontal Canvas
+// ink bounds nor the catalog's font-wide metrics identify that alternate or its
+// vertical origin. No Unicode vertical presentation character exists for FF0E.
+// Therefore the reachable-feature path below keeps the font's design, while
+// the unreachable path uses ordinary upright placement, including its measured
+// along-column ink centering. It deliberately does not synthesize a corner
+// glyph by translating the horizontal one. This fallback has residuals in all
+// seven tested families; worker/offscreen hosts can differ from the DOM path.
+// The FE10–FE12 fallbacks for 、。， retain their existing designed placement.
+
 /** The single cell router shared by layout measurement and paint. */
 function routedVerticalGlyphCell(
   ctx: Ctx2D,
@@ -421,32 +357,134 @@ export function planVerticalRunWithCapability(
   charScale = 1,
   growTrRotateInk = false,
   vertCapability: VertCapability = NO_VERT_CAPABILITY,
-  writingMode: 'horizontal-tb' | 'vertical-rl' | 'vertical-lr' = 'vertical-rl',
+  writingMode: WritingMode = 'vertical-rl',
+  characterGridDeltaPt = 0,
+  characterAdjustmentPt?: (start: number, end: number) => number,
 ): readonly PlannedVerticalGlyphCell[] {
   const cells: PlannedVerticalGlyphCell[] = [];
-  const emBoxCenterPt = emBoxCenterAboveBaselinePx(ctx, text, fontPt);
+  const emBoxCenterPt = emBoxCenterAboveBaseline(ctx, text, fontPt);
   let ax = 0;
   let sourceOffset = 0;
+  const charSpacingPt = letterSpacingPt - characterGridDeltaPt;
+  // WORD_CONDENSED_SPACING_ADVANCE_FLOOR, only when acquisition opts in by
+  // supplying `characterAdjustmentPt` (punctuation compression and width
+  // balance of a source range, floored with the cell): no character advance
+  // below zero, and the reported advances include the adjustment. Without it
+  // the plan is the ordinary unfloored one. Unfloored cells keep their centring.
+  const mayFloor = characterAdjustmentPt !== undefined
+    && (letterSpacingPt < 0 || characterGridDeltaPt < 0);
+  const unitAdvance = (unit: string, start: number, scaledNaturalPt: number): Readonly<{
+    advancePt: number;
+    cellPt: number;
+    floored: boolean;
+  }> => {
+    const spacedPt = scaledNaturalPt
+      + textSpacingAdvance(unit, characterGridDeltaPt, charSpacingPt, letterSpacingPt);
+    if (!mayFloor) return { advancePt: spacedPt, cellPt: spacedPt, floored: false };
+    const rawPt = spacedPt + characterAdjustmentPt!(start, start + unit.length);
+    if (rawPt < 0) return { advancePt: 0, cellPt: 0, floored: true };
+    return { advancePt: rawPt, cellPt: spacedPt, floored: false };
+  };
   for (const piece of splitVerticalOrientationRuns(text)) {
     if (piece.mode === 'sideways') {
-      const glyphCount = [...piece.text].length;
-      const advancePt = ctx.measureText(piece.text).width * charScale
-        + letterSpacingPt * glyphCount;
       const drawOffsetPt = { xPt: 0, yPt: emBoxCenterPt };
-      const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
-        ctx, piece.text, 'sideways', drawOffsetPt, charScale, writingMode, false,
-      );
-      cells.push({
-        range: { start: sourceOffset, end: sourceOffset + piece.text.length },
-        text: piece.text,
-        orientation: 'sideways',
-        originPt: ax,
-        advancePt,
-        drawOffsetPt,
-        verticalFeature: false,
-        ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
-      });
-      ax += advancePt;
+      const offsets = [...new Set([0, ...graphemeClusterOffsets(piece.text), piece.text.length])]
+        .sort((a, b) => a - b);
+      // Contextual grapheme advances (bounded preceding context, as line
+      // fitting measures them): an over-condensed cluster stops the pen at its
+      // floor, which a shared Canvas letterSpacing cannot express, so the
+      // piece then paints each cluster from its own origin. Cursive text stays
+      // one contextual cell (Canvas does not track inside cursive scripts)
+      // advancing by its graphemes' floored sum.
+      const units = mayFloor
+        ? offsets.slice(0, -1).map((start, index) => {
+            const end = offsets[index + 1]!;
+            const context = offsets[Math.max(0, index - CONDENSED_CONTEXT_GRAPHEMES)]!;
+            return {
+              text: piece.text.slice(start, end),
+              start: sourceOffset + start,
+              naturalPt: ctx.measureText(piece.text.slice(context, end)).width
+                - (context < start ? ctx.measureText(piece.text.slice(context, start)).width : 0),
+            };
+          })
+        : [];
+      const unitPlaces = units.map((unit) => unitAdvance(unit.text, unit.start, unit.naturalPt * charScale));
+      // Floored: non-cursive graphemes paint from their own origins; each run
+      // of cursive graphemes stays one contextual cell (Canvas does not track
+      // inside cursive scripts) advancing by its graphemes' floored sum.
+      // A cursive group keeps its classification and source range; its text
+      // is sliced once when the cell is emitted, so grouping stays linear.
+      const pieceCells: Array<{
+        start: number;
+        end: number;
+        advancePt: number;
+        floored: boolean;
+        cursive: boolean;
+      }> =
+        unitPlaces.some((placed) => placed.floored)
+          ? []
+          : (() => {
+              const placed = unitAdvance(piece.text, sourceOffset, ctx.measureText(piece.text).width * charScale);
+              return [{
+                start: sourceOffset,
+                end: sourceOffset + piece.text.length,
+                advancePt: placed.advancePt,
+                floored: placed.floored,
+                cursive: false,
+              }];
+            })();
+      const split = pieceCells.length === 0;
+      if (split) {
+        // Split cells are placed in bidi order at paint, so a cursive group
+        // stays level-uniform.
+        const levelChanges = bidiLevelChanges(piece.text);
+        units.forEach((unit, index) => {
+          const placed = unitPlaces[index]!;
+          const previous = pieceCells.at(-1);
+          const cursive = hasCursiveJoining(unit.text);
+          if (cursive && previous?.cursive && !levelChanges(unit.start - sourceOffset)) {
+            previous.end = unit.start + unit.text.length;
+            previous.advancePt += placed.advancePt;
+            previous.floored ||= placed.floored;
+          } else {
+            pieceCells.push({
+              start: unit.start,
+              end: unit.start + unit.text.length,
+              advancePt: placed.advancePt,
+              floored: placed.floored,
+              cursive,
+            });
+          }
+        });
+      }
+      for (const pieceCell of pieceCells) {
+        const cell = {
+          ...pieceCell,
+          text: piece.text.slice(pieceCell.start - sourceOffset, pieceCell.end - sourceOffset),
+        };
+        // A split non-cursive floored cell paints one isolated cluster whose
+        // ink runs past its zero allocation; directional placement anchors
+        // that drawn advance.
+        const naturalAdvancePt = split && cell.floored && !cell.cursive
+          ? ctx.measureText(cell.text).width * charScale
+          : undefined;
+        const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
+          ctx, cell.text, 'sideways', drawOffsetPt, charScale, writingMode, false,
+        );
+        cells.push({
+          range: { start: cell.start, end: cell.start + cell.text.length },
+          text: cell.text,
+          orientation: 'sideways',
+          originPt: ax,
+          advancePt: cell.advancePt,
+          drawOffsetPt,
+          verticalFeature: false,
+          ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...(cell.floored ? { floored: true as const } : {}),
+          ...(naturalAdvancePt !== undefined ? { naturalAdvancePt } : {}),
+        });
+        ax += cell.advancePt;
+      }
       sourceOffset += piece.text.length;
       continue;
     }
@@ -458,7 +496,9 @@ export function planVerticalRunWithCapability(
         && bracketCp === null
         && verticalTrUprightFallback(cp);
       const routed = routedVerticalGlyphCell(ctx, ch, cp, vertCapability, growTrRotateInk);
-      const advancePt = routed.naturalPx * charScale + letterSpacingPt;
+      const placed = unitAdvance(ch, sourceOffset, routed.naturalPx * charScale);
+      const advancePt = placed.advancePt;
+      const flooredCell = placed.floored ? { floored: true as const } : {};
       const range = { start: sourceOffset, end: sourceOffset + ch.length };
       if (routed.vert !== null) {
         const drawOffsetPt = { xPt: 0, yPt: 0 };
@@ -474,19 +514,19 @@ export function planVerticalRunWithCapability(
           drawOffsetPt,
           verticalFeature: true,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...flooredCell,
         });
       } else if (mode === 'upright' || bracketCp !== null || uprightFallback) {
         const puncCp = bracketCp !== null ? null : verticalFormSubstitute(cp);
         const drawCp = bracketCp ?? puncCp;
         const drawText = drawCp === null ? ch : String.fromCodePoint(drawCp);
-        const offset = drawCp === null ? verticalGlyphOffset(cp) : { dx: 0, dy: 0 };
         const preserveCorner = wordPreservesVerticalTuCorner(puncCp);
-        const alongEm = offset.dy === 0 && !preserveCorner
+        const alongEm = !preserveCorner
           ? inkCenterAboveMiddlePx(ctx, drawText) / fontPt
           : 0;
         const drawOffsetPt = {
-          xPt: offset.dx * fontPt,
-          yPt: (alongEm + offset.dy) * fontPt,
+          xPt: 0,
+          yPt: alongEm * fontPt,
         };
         const blockAxisInkBounds = plannedVerticalBlockAxisInkBounds(
           ctx, drawText, 'upright', drawOffsetPt, charScale, writingMode, false,
@@ -495,11 +535,12 @@ export function planVerticalRunWithCapability(
           range,
           text: drawText,
           orientation: 'upright',
-          originPt: ax + advancePt / 2,
+          originPt: ax + placed.cellPt / 2,
           advancePt,
           drawOffsetPt,
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...flooredCell,
         });
       } else {
         const drawOffsetPt = { xPt: 0, yPt: 0 };
@@ -510,11 +551,12 @@ export function planVerticalRunWithCapability(
           range,
           text: ch,
           orientation: 'rotate',
-          originPt: ax + advancePt / 2 + charScale * routed.rotateInkShiftPx,
+          originPt: ax + placed.cellPt / 2 + charScale * routed.rotateInkShiftPx,
           advancePt,
           drawOffsetPt,
           verticalFeature: false,
           ...(blockAxisInkBounds ? { blockAxisInkBounds } : {}),
+          ...flooredCell,
         });
       }
       ax += advancePt;
@@ -632,7 +674,7 @@ export function drawVerticalRunWithCapability(
   // font's em-box centre — the line the UPRIGHT cells centre on. Measured once
   // per run (font-level, glyph-independent). Used to re-centre SIDEWAYS glyphs,
   // which are otherwise drawn on their baseline and so land off the centreline.
-  const emBoxCenterPx = emBoxCenterAboveBaselinePx(ctx, text, fontPx);
+  const emBoxCenterPx = emBoxCenterAboveBaseline(ctx, text, fontPx);
   // In this rotate-layout architecture the direction-independent layout kernel
   // applies ECMA-376 §17.3.2.43 `w:w` to the line axis (`segAdvanceWidth`) even
   // for tbRl; wrapping, selection, and run boxes already depend on that advance,
@@ -651,8 +693,7 @@ export function drawVerticalRunWithCapability(
       // frame). Letter spacing is applied inside the shaped piece, while the
       // trailing pitch remains part of the explicit cell advance as before.
       const naturalPx = ctx.measureText(piece.text).width;
-      const glyphCount = [...piece.text].length;
-      const pieceAdvance = naturalPx * charScale + letterSpacingPx * glyphCount;
+      const pieceAdvance = naturalPx * charScale + textSpacingAdvance(piece.text, 0, letterSpacingPx, letterSpacingPx);
       const prevLetterSpacing = ctx.letterSpacing;
       ctx.textAlign = prevAlign;
       ctx.textBaseline = 'alphabetic';
@@ -704,7 +745,7 @@ export function drawVerticalRunWithCapability(
     const vertCell = routedCell.vert;
     const cellNaturalPx = routedCell.naturalPx;
     const rotateInkShiftPx = routedCell.rotateInkShiftPx;
-    const adv = cellNaturalPx * charScale + letterSpacingPx;
+    const adv = cellNaturalPx * charScale + textSpacingAdvance(ch, 0, letterSpacingPx, letterSpacingPx);
     if (vertCell !== null) {
       // Preserve the feature glyph's asymmetric A/D placement by keeping its
       // origin at the nominal half-advance measured under the same composed
@@ -735,16 +776,13 @@ export function drawVerticalRunWithCapability(
       const drawCp = bracketCp !== null ? bracketCp : puncCp;
       const drawStr = drawCp !== null ? String.fromCodePoint(drawCp) : ch;
       const cx = x + ax + adv / 2;
-      // Corner nudge fallback only for a Tu punct with NO vertical form (． FF0E);
-      // every substituted glyph is positioned by its own vertical metric below.
-      const off = drawCp !== null ? { dx: 0, dy: 0 } : verticalGlyphOffset(cp);
       // ALONG-COLUMN centring: an upright glyph's VERTICAL ink extent maps to the
       // column axis, so shift by its measured ink centre so the ink lands on the
       // cell centre. Per-GLYPH metric (the drawn glyph's tight ink box): for an
       // ideograph/kana it is ≈0 (cells unchanged); for a substituted vertical
-      // bracket (ink hugging one cell end) it is the needed correction. Replaces
-      // the old `+0.12em` font-tuned heuristic. Skipped when the ． corner nudge is
-      // active (`off.dy`), which is a self-contained upper-right cell placement.
+      // bracket (ink hugging one cell end) it is the needed correction. An
+      // unreachable Tu base glyph (including ．) uses this ordinary upright
+      // fallback; its horizontal ink cannot identify a vertical alternate.
       //
       // Under `word-vertical-tu-corner-placement`, this is NOT applied to a
       // substituted Tu punctuation form (comma/full stop 、。， → FE10–FE12):
@@ -757,7 +795,7 @@ export function drawVerticalRunWithCapability(
       // full cell apart and the font centres the em box, not the ink (#792).
       const isPunctSubstitute = wordPreservesVerticalTuCorner(puncCp);
       const alongEm =
-        off.dy === 0 && !isPunctSubstitute
+        !isPunctSubstitute
           ? inkCenterAboveMiddlePx(ctx, drawStr) / fontPx
           : 0;
       ctx.save();
@@ -765,12 +803,11 @@ export function drawVerticalRunWithCapability(
       ctx.rotate(-Math.PI / 2);
       if (scaled) ctx.scale(1, charScale);
       // In the upright local frame: `center`/`middle` puts the em box on the cell
-      // centre; local +x = cross axis, local +y = along-column. `off.dx` nudges
-      // ． toward the cell's upper-right corner (cross axis); `alongEm + off.dy`
-      // centres the ink along the column.
+      // centre; local +x = cross axis, local +y = along-column. Only the
+      // measured along-column correction is applied to ordinary upright glyphs.
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(drawStr, off.dx * fontPx, (alongEm + off.dy) * fontPx);
+      ctx.fillText(drawStr, 0, alongEm * fontPx);
       ctx.restore();
     } else if (mode === 'rotate') {
       // vo=Tr with NO substituted vertical form and NOT the upright-fallback

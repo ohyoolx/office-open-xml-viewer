@@ -28,7 +28,7 @@ vi.mock('@silurus/ooxml-core', async (importOriginal) => ({
   renderChart: coreMocks.renderChart,
 }));
 
-import { renderSlide } from './renderer.js';
+import { renderSlide, renderSlideWithEmbeddedFonts } from './renderer.js';
 
 function pngBlob(width = 12_090, height = 9_063): Blob {
   const bytes = new Uint8Array(26);
@@ -109,7 +109,7 @@ describe('PPTX chart picture-marker preload', () => {
       { l: 0.5, t: 0, r: 0.4999999999999999, b: 0 },
     ],
   ] as const)(
-    'excludes %s chart frames before aggregate source gating and preload',
+    'handles %s chart frames without silently dropping invalid image geometry',
     async (_case, hiddenWidth, hiddenHeight, overflowCrop) => {
       coreMocks.decode.mockClear();
       coreMocks.decodeSvg.mockClear();
@@ -125,7 +125,7 @@ describe('PPTX chart picture-marker preload', () => {
         chartType: 'line', categories: ['A'],
         series: [{ name: 'Visible', values: [1], markerFillPaint: visibleFill }],
       } as ChartModel;
-      const sourceCount = overflowCrop ? 257 : 256;
+      const sourceCount = 256;
       const hiddenChart = {
         chartType: 'line',
         categories: Array.from({ length: sourceCount }, (_, index) => String(index)),
@@ -165,10 +165,16 @@ describe('PPTX chart picture-marker preload', () => {
       } as Slide;
       const fetchImage = vi.fn(async () => pngBlob());
 
-      await renderSlide(canvas(), slide, 9_144_000, 6_858_000, {
+      const rendering = renderSlide(canvas(), slide, 9_144_000, 6_858_000, {
         width: 960, dpr: 1, fetchImage,
       });
 
+      if (overflowCrop || !Number.isFinite(hiddenWidth) || !Number.isFinite(hiddenHeight) || hiddenWidth < 0 || hiddenHeight < 0) {
+        await expect(rendering).rejects.toHaveProperty('code');
+        expect(coreMocks.decode).not.toHaveBeenCalled();
+        return;
+      }
+      await rendering;
       expect(coreMocks.decode).toHaveBeenCalledTimes(1);
       expect(coreMocks.decode.mock.calls[0]?.slice(0, 4)).toEqual([
         'ppt/media/visible-chart-fill.png', 'image/png', undefined, fetchImage,
@@ -400,8 +406,61 @@ describe('PPTX chart picture-marker preload', () => {
     await renderSlide(canvas(), slide, 9_144_000, 6_858_000, {
       width: 960, dpr: 1, fetchImage,
     });
+    // An SVG-only fill with a pixel transform is rasterized through the
+    // shared effect decoder (host SVG bridge), never omitted.
     expect(coreMocks.decodeSvg).not.toHaveBeenCalled();
-    expect(coreMocks.decode).not.toHaveBeenCalled();
-    expect(coreMocks.resolved()).toBeNull();
+    expect(coreMocks.decode).toHaveBeenCalledTimes(1);
+    expect(coreMocks.decode.mock.calls[0]?.slice(0, 3)).toEqual([
+      'ppt/media/chart-marker.svg', 'image/svg+xml', { clr1: '000000', clr2: 'FFFFFF' },
+    ]);
+  });
+
+  it('keeps an SVG-twin fill display-targeted when its raster twin is planned for another fill (#1950)', async () => {
+    coreMocks.decode.mockClear();
+    coreMocks.decodeSvg.mockClear();
+    coreMocks.renderChart.mockClear();
+    const vectorFill = {
+      fillType: 'image', stretch: true, imagePath: 'ppt/media/chart-marker.png',
+      svgImagePath: 'ppt/media/chart-marker.svg', mimeType: 'image/png',
+    };
+    coreMocks.setLookupFill(vectorFill);
+    // A second series stretches the same raster part without an SVG twin, so
+    // the raster plan owns an entry for that part at its native 12x10 grid.
+    const chart = {
+      chartType: 'line', categories: ['A'],
+      series: [
+        { name: 'Vector', values: [1], markerSymbol: 'picture', markerFillPaint: vectorFill },
+        {
+          name: 'Raster', values: [2], markerSymbol: 'picture', markerFillPaint: {
+            fillType: 'image', stretch: true, imagePath: 'ppt/media/chart-marker.png', mimeType: 'image/png',
+          },
+        },
+      ],
+    } as ChartModel;
+    const slide = {
+      index: 0, slideNumber: 1, background: null,
+      elements: [{
+        type: 'chart', x: 0, y: 0, width: 4_000_000, height: 3_000_000,
+        rotation: 0, flipH: false, flipV: false, chart,
+      }],
+    } as Slide;
+    const fetchImage = vi.fn(async () => pngBlob(12, 10));
+    const svgDecoder = vi.fn();
+
+    // The worker render path passes its host SVG bridge through this entry.
+    await renderSlideWithEmbeddedFonts(canvas(), slide, 9_144_000, 6_858_000, {
+      width: 960, dpr: 1, fetchImage, svgDecoder,
+      // Strict planning keeps the fitting 12x10 PNG at its native grid, so the
+      // leaked entry would carry a 120-pixel retained ceiling.
+      imageResources: { strategy: 'strict' },
+    });
+
+    // The SVG is rasterized for its own display coverage; the raster plan's
+    // grid and retained ceiling describe the PNG, not the SVG.
+    expect(coreMocks.decodeSvg).toHaveBeenCalledWith(
+      'ppt/media/chart-marker.svg',
+      fetchImage,
+      { targetWidthPx: 420, targetHeightPx: 315, workerDecoder: svgDecoder },
+    );
   });
 });

@@ -2,7 +2,7 @@ import { recolorSvg, type MathSvg } from './mathjax.js';
 import { createAuxCanvas, type AuxContext } from '../canvas/aux-canvas.js';
 import { clampCanvasSize } from '../canvas/clamp.js';
 
-export const MATH_RASTER_PX_PER_EM = 256;
+const MATH_RASTER_PX_PER_EM = 256;
 const MATH_RASTER_CACHE_PX_PER_EM = 64;
 
 export interface RasterizedMathSvg {
@@ -41,6 +41,18 @@ function attribute(source: string, name: string): string | undefined {
 function numericAttribute(source: string, name: string, fallback = 0): number {
   const value = Number.parseFloat(attribute(source, name) ?? '');
   return Number.isFinite(value) ? value : fallback;
+}
+
+function decodeXmlText(value: string): string {
+  return value.replace(/&(#(?:x[\da-fA-F]+|\d+)|amp|lt|gt|quot|apos);/g, (entity, code: string) => {
+    if (code[0] === '#') {
+      const point = code[1] === 'x'
+        ? Number.parseInt(code.slice(2), 16)
+        : Number.parseInt(code.slice(1), 10);
+      return point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    }
+    return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[code as 'amp' | 'lt' | 'gt' | 'quot' | 'apos'];
+  });
 }
 
 function presentationAttributes(source: string): Map<string, string> {
@@ -150,7 +162,9 @@ function paintPath(context: AuxContext, path: Path2D, state: PaintState): void {
 
 /** Draw the deliberately small SVG vocabulary emitted by the bundled MathJax
  * SVG output. This avoids `createImageBitmap(svgBlob)`, which Chromium workers
- * do not decode, and keeps Window/Worker pixels on the same Canvas path. */
+ * do not decode, and keeps Window/Worker pixels on the same Canvas path.
+ * Unsupported STIX2 ranges use MathJax's system-font <text> fallback, which
+ * must be painted here as well or the glyph silently disappears in workers. */
 export function drawMathJaxSvg(
   context: AuxContext,
   svg: string,
@@ -169,14 +183,21 @@ export function drawMathJaxSvg(
     throw new TypeError('MathJax SVG viewBox must have positive dimensions');
   }
 
+  // The raster spans the baseline-relative band from `svgExtents` (ascent above
+  // to descent below the baseline), which always includes the baseline. A lone
+  // raised operator such as ∙ or ⋅ has a viewBox wholly above the baseline, so
+  // map that band — not the bare viewBox — or the glyph stretches vertically.
+  const bandTop = Math.min(minY, 0);
+  const bandHeight = Math.max(minY + viewHeight, 0) - bandTop;
+
   context.save();
   context.setTransform(
     widthPx / viewWidth,
     0,
     0,
-    heightPx / viewHeight,
+    heightPx / bandHeight,
     (-minX * widthPx) / viewWidth,
-    (-minY * heightPx) / viewHeight,
+    (-bandTop * heightPx) / bandHeight,
   );
   context.fillStyle = '#000000';
   context.strokeStyle = '#000000';
@@ -201,6 +222,27 @@ export function drawMathJaxSvg(
       context.save();
       state = applyPresentation(context, attributes, state);
       applyTransform(context, attribute(attributes, 'transform'));
+      continue;
+    }
+    if (name === 'text') {
+      const end = svg.indexOf('</text>', tags.lastIndex);
+      if (end < 0) throw new TypeError('MathJax SVG text must have a closing tag');
+      context.save();
+      const textState = applyPresentation(context, attributes, state);
+      applyTransform(context, attribute(attributes, 'transform'));
+      const style = attribute(attributes, 'font-style') === 'italic' ? 'italic ' : '';
+      const weight = attribute(attributes, 'font-weight') === 'bold' ? 'bold ' : '';
+      const size = numericAttribute(attributes, 'font-size', 1000);
+      const family = attribute(attributes, 'font-family') ?? 'serif';
+      context.font = `${style}${weight}${size}px ${family}`;
+      context.textBaseline = 'alphabetic';
+      const content = decodeXmlText(svg.slice(tags.lastIndex, end));
+      const x = numericAttribute(attributes, 'x');
+      const y = numericAttribute(attributes, 'y');
+      if (textState.fill) context.fillText(content, x, y);
+      if (textState.stroke && context.lineWidth > 0) context.strokeText(content, x, y);
+      context.restore();
+      tags.lastIndex = end + '</text>'.length;
       continue;
     }
     if (name !== 'path' && name !== 'rect' && name !== 'line') continue;
@@ -294,4 +336,27 @@ export function tintMathRaster(
   context.fillStyle = color;
   context.fillRect(0, 0, raster.widthPx, raster.heightPx);
   return canvas;
+}
+
+/**
+ * {@link tintMathRaster} cached per colour. Equations follow the run text
+ * colour, which can vary per draw (white on dark, theme accents, …), so the
+ * black raster is recoloured at draw time and each colour's copy is kept on
+ * the equation's own render record.
+ */
+export function cachedTintedMathRaster(
+  render: {
+    readonly raster: RasterizedMathSvg;
+    readonly tinted: {
+      get(color: string): CanvasImageSource | null | undefined;
+      set(color: string, image: CanvasImageSource): unknown;
+    };
+  },
+  color: string,
+): CanvasImageSource {
+  const cached = render.tinted.get(color);
+  if (cached) return cached;
+  const tinted = tintMathRaster(render.raster, color);
+  render.tinted.set(color, tinted);
+  return tinted;
 }

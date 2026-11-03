@@ -1,3 +1,4 @@
+import { resolveDrawingMLGeometry, type DrawingMLShapePaintPlan as GeometryFixtureInput } from '@silurus/ooxml-core';
 import { describe, expect, it } from 'vitest';
 import type { DocumentLayout, DrawingLayout } from './types.js';
 import { assertDocumentLayout } from './invariants.js';
@@ -64,7 +65,7 @@ function layoutWith(command: DrawingLayout['commands'][number]): DocumentLayout 
 
 const validShape = {
   kind: 'drawingml-shape' as const,
-  plan: {
+  plan: retainedGeometryFixture({
     rect: { x: 72, y: 72, w: 100, h: 50 },
     geometry: {
       kind: 'preset' as const,
@@ -74,7 +75,7 @@ const validShape = {
     fill: { fillType: 'solid' as const, color: 'FFFFFF' },
     stroke: { color: '000000', width: 1 },
     transform: { rotationDeg: 0, flipH: false, flipV: false },
-  },
+  }),
 };
 
 describe('drawing-command invariants', () => {
@@ -113,3 +114,7 @@ describe('drawing-command invariants', () => {
     expect(() => assertDocumentLayout(layoutWith(degenerate))).toThrow(/INVALID_GEOMETRY/);
   });
 });
+
+function retainedGeometryFixture<T extends GeometryFixtureInput>(plan: T) {
+  return { ...plan, resolvedGeometry: resolveDrawingMLGeometry(plan, 1) };
+}

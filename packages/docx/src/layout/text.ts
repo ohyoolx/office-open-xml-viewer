@@ -1,9 +1,14 @@
+import { wordTextBoxVerticalMode } from './compatibility.js';
+import { wordArabicTextKerned } from './line-compatibility.js';
 import type { LayoutDiagnostic } from './types.js';
 import {
   classifyFontGeneric,
+  fontSubstituteScriptCoversText,
+  fontSubstituteScriptScope,
   graphemeClusterOffsets,
   normalizeFontMetricFamily,
   type CjkLang,
+  type FontSubstituteScript,
   type ResolvedFontMetric,
 } from '@silurus/ooxml-core';
 import type {
@@ -18,7 +23,6 @@ import type {
   DocParagraph,
   DocRun,
   DocxTextRun,
-  FieldRun,
   ShapeTextRun,
   TabStop,
 } from '../types.js';
@@ -31,6 +35,7 @@ import type {
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
 import type { TextBoxAcquisitionInput } from './textbox-input.js';
 import type { AnchorAcquisitionInput } from './anchor-input.js';
+import type { InternalParagraphTypographyWire } from './typography-input.js';
 
 /** The subset of a measured text segment needed to resolve its effective size. */
 export interface EffectiveFontSegment {
@@ -106,8 +111,7 @@ export function shapeRunToDocRun(
   run: ShapeTextRun,
   textVert?: string | null,
 ): ShapeTextDocRun {
-  const textBoxVertical = textVert === 'vert' || textVert === 'vert270'
-    || textVert === 'eaVert' || textVert === 'mongolianVert';
+  const textBoxVertical = wordTextBoxVerticalMode(textVert) !== undefined;
   return {
     type: 'text',
     text: run.text,
@@ -132,6 +136,9 @@ export function shapeRunToDocRun(
 /** Plain parser-boundary snapshot used by retained line acquisition. Private
  * parser extensions are copied into named immutable fields exactly once. */
 type ParagraphTextFacts = Readonly<{
+  /** Authored discretionary opportunity with its own conditional glyph style.
+   * Its source run is otherwise empty, independent of dictionary hyphenation. */
+  optionalHyphen?: boolean;
   /** Parser-projected CT_R boundary constraint around an authored
    * `<w:noBreakHyphen/>`. These names are layout facts, not parser wire keys. */
   noBreakBefore?: boolean;
@@ -153,6 +160,12 @@ type ParagraphTextFacts = Readonly<{
     theme: TextFontSlots;
     themePresent: TextFontSlotPresence;
   }>;
+  /** Private reserved-separator character (ECMA-376 §17.18.33 story): the
+   * U+0003/U+0004 control or the story paragraph's content mark. It carries
+   * that character's own effective properties and has no text; line acquisition
+   * resolves its selected face as a zero-advance, inkless metric participant.
+   * Its rule ink is retained separately, never as a glyph. */
+  noteSeparatorCharacter?: 'rule-control' | 'paragraph-mark';
 }>;
 
 export type ParagraphTextBearingRun =
@@ -162,6 +175,7 @@ export type ParagraphTextBearingRun =
 
 export type ParagraphMathRun = Readonly<{
   type: 'math';
+  revision?: DeepReadonly<DocRun['revision']>;
   display: boolean;
   fontSize: number;
   jc?: string;
@@ -170,7 +184,7 @@ export type ParagraphMathRun = Readonly<{
   fallbackText: string;
 }>;
 
-export type ParagraphShapeRun = DeepReadonly<Extract<DocRun, { type: 'shape' }>> & Readonly<{
+export type ParagraphShapeRun = DeepReadonly<Extract<DocRun, { type: 'shape' }> & import('./types.js').VmlShapeAcquisitionFacts> & Readonly<{
   vmlTextPathInput?: VmlTextPathAcquisitionInput;
   textBoxInput?: TextBoxAcquisitionInput;
   anchorAcquisitionInput?: AnchorAcquisitionInput;
@@ -225,6 +239,7 @@ export interface ComplexFieldBoundaryInput {
 }
 
 export type ParagraphAcquisitionInput = DeepReadonly<Omit<DocParagraph, 'runs'>> & Readonly<{
+  typographyInput?: Readonly<InternalParagraphTypographyWire>;
   runs: readonly ParagraphAcquisitionRun[];
   complexFieldBoundaries?: readonly ComplexFieldBoundaryInput[];
   numberingMarkerShapeInput?: NumberingMarkerShapeInput;
@@ -279,11 +294,146 @@ export interface TextShapeRequest {
   /** Resolved §17.3.2.19 w:kern state at this run size. Absence preserves the
    * measurement adapter's inherited kerning policy, matching the paint path. */
   readonly kerning?: boolean;
+  /** Builder-owned proof that one registered grapheme has no per-slot
+   * allocation policy. The shaper still revalidates resource and cmap facts. */
+  readonly joinRegisteredGrapheme?: boolean;
+  /** Builder-owned uniform allocation of one Latin word piece with a single
+   * ordinary WORD slot seam (two maximal body spans, plus an optional pure
+   * trailing U+0020 span owned by the builder piece). §17.3.2.26 slots still
+   * select faces per scalar; matching registered faces may share
+   * native GPOS/GSUB context. This is library shaping policy, not an Office
+   * metric rule. The service re-proves exact face/route and snapshot cmap. */
+  readonly joinRegisteredLatinSlots?: boolean;
+  /** Exact text of a builder-adopted Latin physical piece. Only actual slices
+   * preserve this internal provenance; generated/expanded probes clear it. */
+  readonly registeredLatinPieceText?: string;
   /** Resolve script slots and faces without touching the measurement adapter. */
   readonly measure?: boolean;
-  /** Aggregate-only acquisition may omit per-grapheme contextual advances.
-   * Script spans and aggregate metrics remain authoritative. */
-  readonly clusterGeometry?: boolean;
+  /** False acquires only aggregate metrics; 'spaces' acquires contextual
+   * scalar U+0020 advances for fit arithmetic. Full clusters are acquired after
+   * wrapping, avoiding repeated prefix shaping of overlong words. */
+  readonly clusterGeometry?: boolean | 'spaces';
+  /** The same run's surrounding text, with this request's offset in it. A
+   * script-scoped substitute's scope is decided over the whole contiguous
+   * context, so a word of Arabic digits after proven Arabic text continues it,
+   * while digits alone never enable the substitute. */
+  readonly substituteContext?: Readonly<{ text: string; offset: number }>;
+}
+
+/** The measured class has a strong Latin base with attached marks. rFonts
+ * ascii is a semantic slot, not proof of ASCII or bidi direction: it also
+ * contains unmarked Hebrew/Arabic, which must retain their existing path. */
+export function registeredLatinMarkGraphemeCandidate(text: string): boolean {
+  return /^[A-Za-z]\p{M}+$/u.test(text) && graphemeClusterOffsets(text).length === 0;
+}
+
+/** Exclude non-Latin scripts even when §17.3.2.26 selects their ascii slot.
+ * Soft hyphens and nonordinary separators keep their existing break path. */
+const REGISTERED_LATIN_SLOT_CHARSET =
+  /^(?:[\p{Script=Latin}\u0020-\u0040\u005B-\u0060\u007B-\u007E\u00A0-\u00AC\u00AE-\u00BF\u00D7\u00F7\u0300-\u036F])+$/u;
+export function registeredLatinSlotRunCandidate(text: string): boolean {
+  return /\p{Script=Latin}/u.test(text) && REGISTERED_LATIN_SLOT_CHARSET.test(text);
+}
+
+/** Structural word-seam admission over already resolved maximal slots.
+ * splitTextForLayout owns a word's trailing U+0020 sequence in the same piece;
+ * that pure separator span does not add a WORD slot seam. Face/route/cmap and
+ * allocation admission still cover every scalar, including these spaces.
+ * A third span containing any non-space scalar is not a separator exception. */
+export function registeredLatinSingleSeamCandidate(
+  spans: readonly Readonly<{ text: string }>[],
+): boolean {
+  if (spans.length < 2 || spans.length > 3) return false;
+  const lastIsSeparator = /^ +$/u.test(spans[spans.length - 1]!.text);
+  return spans.length - (lastIsSeparator ? 1 : 0) === 2;
+}
+
+/** Rebase semantic ownership after an actual retained-text slice. Physical
+ * shaping admission is re-proved over that slice by the text service. */
+export function semanticSlotStartIndex(
+  spans: NonNullable<TextShapeSpan['semanticSlotSpans']>, offset: number,
+): number {
+  let low = 0, high = spans.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (spans[middle]!.end <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+export function sliceSemanticSlotSpans(
+  spans: TextShapeSpan['semanticSlotSpans'], start: number, end: number,
+): TextShapeSpan['semanticSlotSpans'] {
+  if (!spans) return undefined;
+  const result: NonNullable<TextShapeSpan['semanticSlotSpans']>[number][] = [];
+  for (let index = semanticSlotStartIndex(spans, start); index < spans.length; index++) {
+    const span = spans[index]!;
+    if (span.start >= end) break;
+    const from = Math.max(start, span.start), to = Math.min(end, span.end);
+    if (from < to) result.push(Object.freeze({ ...span, start: from - start, end: to - start }));
+  }
+  return Object.freeze(result);
+}
+
+/** Validate against the owning transformed run, not merely a self-consistent
+ * fragment. Acquisition knows the full run; partial measurements inherit it. */
+export function assertTextShapeRunContext(
+  request: Readonly<Pick<TextShapeRequest, 'text' | 'substituteContext'>>,
+  fullRunText: string,
+): void {
+  const context = request.substituteContext;
+  if (!context || context.text !== fullRunText
+    || !Number.isInteger(context.offset) || context.offset < 0
+    || context.offset + request.text.length > fullRunText.length
+    || fullRunText.slice(context.offset, context.offset + request.text.length) !== request.text) {
+    throw new Error('Text shape request does not match its full run context; project the range explicitly');
+  }
+}
+
+/** Slice retained shaping input without re-judging a fragment's script proof.
+ * UTF-16 offsets match both Canvas text and the shared run-scope descriptor. */
+export function sliceTextShapeRequest(
+  request: Readonly<TextShapeRequest>,
+  start: number,
+  end: number,
+): TextShapeRequest {
+  const context = request.substituteContext ?? { text: request.text, offset: 0 };
+  const text = request.text.slice(start, end);
+  return {
+    ...request,
+    text,
+    registeredLatinPieceText: request.joinRegisteredLatinSlots === true
+      && request.registeredLatinPieceText === request.text ? text : undefined,
+    joinRegisteredGrapheme: start === 0 && end === request.text.length
+      ? request.joinRegisteredGrapheme : undefined,
+    substituteContext: { text: context.text, offset: context.offset + start },
+  };
+}
+
+/** A generated probe or ruby guide is independent text, even when its glyphs
+ * happen to occur in the base run. It must not inherit that run's Arabic proof. */
+export function independentTextShapeRequest(
+  request: Readonly<TextShapeRequest>,
+  text: string,
+): TextShapeRequest {
+  return { ...request, text, joinRegisteredGrapheme: undefined, joinRegisteredLatinSlots: undefined,
+    registeredLatinPieceText: undefined, substituteContext: { text, offset: 0 } };
+}
+
+/** Transform this range in its run (e.g. inserting justification kashidas),
+ * keeping proof on either side and recomputing scope for the transformed run. */
+export function replaceTextShapeRequest(
+  request: Readonly<TextShapeRequest>,
+  text: string,
+): TextShapeRequest {
+  const context = request.substituteContext ?? { text: request.text, offset: 0 };
+  return { ...request, text, joinRegisteredGrapheme: undefined, joinRegisteredLatinSlots: undefined,
+    registeredLatinPieceText: undefined, substituteContext: {
+    text: context.text.slice(0, context.offset) + text
+      + context.text.slice(context.offset + request.text.length),
+    offset: context.offset,
+  } };
 }
 
 export interface TextFontResolveRequest {
@@ -298,6 +448,10 @@ export interface TextFontResolveRequest {
   readonly weight?: number;
   readonly style?: FontStyle;
   readonly genericFamily?: 'serif' | 'sans-serif' | 'monospace';
+  /** Carried decision whether a script-scoped substitute covers this text,
+   * made by the shaper with the shared per-cluster scope rule. When omitted,
+   * the same rule judges `text` as a whole. */
+  readonly substituteScope?: boolean;
 }
 
 export interface GlyphMeasureRequest {
@@ -331,12 +485,44 @@ export interface GlyphInkBounds {
   readonly descentPt: number;
 }
 
+/** Two Canvas routes rasterizing the same text in the same tuple. */
+export interface GlyphRasterComparisonRequest {
+  readonly text: string;
+  readonly weight: number;
+  readonly style: FontStyle;
+  readonly route: CanvasFontRoute;
+  /** Single private family of one loaded exact face; the comparison route. */
+  readonly faceFamily: string;
+}
+
 export interface GlyphMeasurer {
   readonly fingerprint: string;
   measure(request: Readonly<GlyphMeasureRequest>): GlyphMeasurement;
+  /** True only when both routes paint pixel-identical non-empty glyph
+   * rasters for the request. Absent or unable to rasterize → no proof. */
+  sameGlyphRaster?(request: Readonly<GlyphRasterComparisonRequest>): boolean;
+  /** True only when every grapheme of `text` shapes with zero advance
+   * through the size-adjust:0% family, i.e. that exact source owns it. */
+  ownsGlyphs?(request: Readonly<GlyphOwnershipRequest>): boolean;
+}
+
+/** Glyph ownership through one source's size-adjust:0% registration. */
+export interface GlyphOwnershipRequest {
+  readonly text: string;
+  readonly weight: number;
+  readonly style: FontStyle;
+  readonly coverageProbeFamily: string;
 }
 
 export interface TextShapeSpan extends GlyphMeasurement {
+  /** Original ECMA-376 rFonts facts within one physical shape unit. These
+   * carry no competing advance or ink authority. */
+  readonly semanticSlotSpans?: readonly Readonly<{
+    start: number; end: number; script: FontScriptSlot; font: FontResolution;
+  }>[];
+  /** Run-context substitute decision: true selects the scoped face, false
+   * retains exclusion. Absence means this request has no scoped substitute. */
+  readonly substituteScope?: boolean;
   readonly text: string;
   readonly start: number;
   readonly end: number;
@@ -351,13 +537,25 @@ export interface TextShapeResult extends GlyphMeasurement {
   readonly spans: readonly TextShapeSpan[];
   /** UTF-16 offsets at which line splitting may legally separate graphemes. */
   readonly graphemeBoundaries: readonly number[];
-  /** Contextually measured source clusters, relative to the shaped request. */
+  /** Contextually measured source clusters, relative to the shaped request.
+   * For clusterGeometry:'spaces' these are scalar space ranges; the caller
+   * must preserve grapheme-safe cuts when allocating their advances. */
   readonly clusters?: readonly Readonly<{
     range: Readonly<{ start: number; end: number }>;
     offsetPt: number;
     advancePt: number;
   }>[];
   readonly diagnostics: readonly LayoutDiagnostic[];
+}
+
+/** Native font authority acquires glyph contours before layout paint. The
+ * numerical outline precision is in final point space, independent of DPR. */
+export interface GlyphContourRequest {
+  readonly spans: readonly Readonly<{ text: string; advancePt: number; fontRoute: CanvasFontRoute; font: Pick<FontResolution, 'weight' | 'style'> }>[];
+  readonly fontSizePt: number;
+  readonly ink: Readonly<{ xMinPt: number; xMaxPt: number; ascentPt: number; descentPt: number }>;
+  readonly maximumScale: number;
+  readonly maximumWork: number;
 }
 
 export interface TextLayoutService {
@@ -369,11 +567,23 @@ export interface TextLayoutService {
   readonly localMetrics: Readonly<Record<string, Readonly<ResolvedFontMetric>>>;
   resolve(request: Readonly<TextFontResolveRequest>): FontResolution;
   shape(request: Readonly<TextShapeRequest>): TextShapeResult;
+  glyphContours?(request: GlyphContourRequest): readonly (readonly Readonly<{x: number; y: number}>[])[] | undefined;
+  /** Per-source script-substitute proof, when configured. A mixed scope stays
+   * a semantic face-selection boundary; plain runs return no scope key. */
+  sourceScopeKey?(request: Readonly<TextShapeRequest>): string | undefined;
+  /** Cached {@link GlyphMeasurer.sameGlyphRaster} proof. */
+  sameGlyphRaster?(request: Readonly<GlyphRasterComparisonRequest>): boolean;
+  /** {@link FontResolver.exactLocalFaces} of this service's resolver. */
+  exactLocalFaces?(requestedFamily: string): readonly Readonly<{ resolvedFamily: string; weight: number; style: FontStyle; coverageProbeFamily?: string }>[];
+  /** {@link GlyphMeasurer.ownsGlyphs} of this service's measurer. */
+  ownsGlyphs?(request: Readonly<GlyphOwnershipRequest>): boolean;
 }
 
 export interface TextLayoutServiceInput {
   readonly fonts: FontResolver;
   readonly measurer: GlyphMeasurer;
+  readonly glyphContours?: TextLayoutService['glyphContours'];
+  readonly glyphContourFingerprint?: string;
   readonly cjkFallback?: CjkLang;
   readonly fontMetrics?: Readonly<Record<string, Readonly<ResolvedFontMetric>>>;
   /** Exact local aliases also participate in resolution; retained separately
@@ -414,6 +624,29 @@ type FontMetricSnapshot = Readonly<Record<string, Readonly<ResolvedFontMetric>>>
   readonly [FONT_METRIC_SNAPSHOT]: true;
 };
 
+function snapshotUnicodeRanges(
+  ranges: readonly (readonly [number, number])[],
+): readonly (readonly [number, number])[] {
+  if (ranges.length > 32_768) throw new RangeError('Font cmap coverage has too many ranges');
+  const sorted = ranges.map(([start, end]) => {
+    if (!Number.isInteger(start) || !Number.isInteger(end)
+      || start < 0 || end > 0x10ffff || start > end) {
+      throw new RangeError('Font cmap coverage contains an invalid range');
+    }
+    return [start, end] as const;
+  }).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<readonly [number, number]> = [];
+  for (const [start, end] of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && start <= last[1] + 1) {
+      merged[merged.length - 1] = [last[0], Math.max(last[1], end)];
+    } else {
+      merged.push([start, end]);
+    }
+  }
+  return Object.freeze(merged.map((range) => Object.freeze(range)));
+}
+
 /** Copy successful face routes once at the document boundary. The brand lets
  * downstream services share the same deeply frozen object without retaining
  * caller-owned mutable records. */
@@ -428,6 +661,14 @@ export function snapshotFontMetrics(
         && (!Number.isFinite(metric.lineHeightRatio) || metric.lineHeightRatio < 0)) {
         throw new RangeError(`Font metric ${key} lineHeightRatio must be finite and non-negative`);
       }
+      if (metric.designAscentRatio !== undefined
+        && (!Number.isFinite(metric.designAscentRatio) || metric.designAscentRatio < 0)) {
+        throw new RangeError(`Font metric ${key} designAscentRatio must be finite and non-negative`);
+      }
+      if (metric.designDescentRatio !== undefined
+        && (!Number.isFinite(metric.designDescentRatio) || metric.designDescentRatio < 0)) {
+        throw new RangeError(`Font metric ${key} designDescentRatio must be finite and non-negative`);
+      }
       if (metric.eastAsianLineHeightRatio !== undefined
         && (!Number.isFinite(metric.eastAsianLineHeightRatio) || metric.eastAsianLineHeightRatio < 0)) {
         throw new RangeError(`Font metric ${key} eastAsianLineHeightRatio must be finite and non-negative`);
@@ -436,17 +677,32 @@ export function snapshotFontMetrics(
         && (!Number.isFinite(metric.fontBoxRatio) || metric.fontBoxRatio <= 0)) {
         throw new RangeError(`Font metric ${key} fontBoxRatio must be finite and positive`);
       }
+      if (metric.averageCharWidthRatio !== undefined
+        && (!Number.isFinite(metric.averageCharWidthRatio) || metric.averageCharWidthRatio <= 0)) {
+        throw new RangeError(`Font metric ${key} averageCharWidthRatio must be finite and positive`);
+      }
       if (metric.weight !== undefined
         && (!Number.isFinite(metric.weight) || metric.weight < 1 || metric.weight > 1000)) {
         throw new RangeError(`Font metric ${key} weight must be finite and between 1 and 1000`);
       }
       const copy: ResolvedFontMetric = {
         family: metric.family,
+        ...(metric.requiresGlyphCoverage === undefined ? {} : { requiresGlyphCoverage: metric.requiresGlyphCoverage }),
+        ...(metric.glyphCoverageProbeFamily === undefined ? {} : { glyphCoverageProbeFamily: metric.glyphCoverageProbeFamily }),
+        ...(metric.farEastCodePage === undefined ? {} : { farEastCodePage: metric.farEastCodePage }),
         ...(metric.lineHeightRatio === undefined ? {} : { lineHeightRatio: metric.lineHeightRatio }),
+        ...(metric.designAscentRatio === undefined ? {} : { designAscentRatio: metric.designAscentRatio }),
+        ...(metric.designDescentRatio === undefined ? {} : { designDescentRatio: metric.designDescentRatio }),
         ...(metric.eastAsianLineHeightRatio === undefined
           ? {}
           : { eastAsianLineHeightRatio: metric.eastAsianLineHeightRatio }),
         ...(metric.fontBoxRatio === undefined ? {} : { fontBoxRatio: metric.fontBoxRatio }),
+        ...(metric.averageCharWidthRatio === undefined
+          ? {}
+          : { averageCharWidthRatio: metric.averageCharWidthRatio }),
+        ...(metric.unicodeRanges === undefined
+          ? {}
+          : { unicodeRanges: snapshotUnicodeRanges(metric.unicodeRanges) }),
         ...(metric.requestedFamily === undefined ? {} : { requestedFamily: metric.requestedFamily }),
         ...(metric.weight === undefined ? {} : { weight: metric.weight }),
         ...(metric.style === undefined ? {} : { style: metric.style }),
@@ -470,6 +726,22 @@ const LATIN1_CHINESE_EAST_ASIA = new Set([
   0x00e0, 0x00e1, 0x00e8, 0x00e9, 0x00ea, 0x00ec, 0x00ed,
   0x00f2, 0x00f3, 0x00f9, 0x00fa, 0x00fc,
 ]);
+
+const SCOPE_NEUTRAL_SCALAR = /^[\s\p{Cf}\p{M}]$/u;
+/** Recent run contexts whose substitute scope is retained (one per run). */
+const SCOPE_CACHE_LIMIT = 64;
+const SCOPE_CONFIGURATIONS_PER_RUN = 8;
+const SCOPE_SLOTS = ['ascii', 'highAnsi', 'eastAsia', 'complexScript'] as const;
+
+/** Two resolutions select the same registered face: the same resource,
+ * weight, style and source. Native and generic routes name no resource, so
+ * Canvas's eventual choice is unknown and they never compare equal. */
+function sameEffectiveFace(a: FontResolution, b: FontResolution): boolean {
+  if (a === b) return true;
+  if (a.source === 'native' || a.source === 'generic') return false;
+  return a.source === b.source && a.resolvedFamily === b.resolvedFamily
+    && a.resourceIdentity === b.resourceIdentity && a.weight === b.weight && a.style === b.style;
+}
 
 function scriptSlot(
   codePoint: number,
@@ -529,6 +801,8 @@ function scriptSlot(
   else if (codePoint >= 0x1e00 && codePoint <= 0x1eff) {
     tableSlot = hintedEastAsia && chinese ? 'eastAsia' : 'highAnsi';
   } else if (
+    // §17.3.2.26 General Punctuation: U+2014 follows hint, not language
+    // alone. Omitted/default hint selects highAnsi; eastAsia selects eastAsia.
     (codePoint >= 0x2000 && codePoint <= 0x27bf)
     || (codePoint >= 0xe000 && codePoint <= 0xf8ff)
     || (codePoint >= 0xfb00 && codePoint <= 0xfb1c)
@@ -541,7 +815,11 @@ function scriptSlot(
   return tableSlot;
 }
 
-function requestedFamily(
+/** ECMA-376 §17.3.2.26 slot family: a present theme reference (even one that
+ * resolved to no name) governs its slot, then the direct slot, then the ascii
+ * theme/direct fallback. Exported so resource preloading requests exactly the
+ * families this shaper will ask the font resolver for. */
+export function requestedFamily(
   request: Readonly<Pick<TextShapeRequest, 'fonts' | 'themeFonts' | 'themeFontPresence'>>,
   slot: FontScriptSlot,
 ): string | null | undefined {
@@ -556,6 +834,22 @@ function requestedFamily(
   return request.fonts.ascii;
 }
 
+/** Upper bound on distinct font routes a text service keeps ordinals for;
+ * reaching it retires the ordinals together with the measurement cache. */
+export const TEXT_ROUTE_ORDINAL_LIMIT = 4096;
+const routeOrdinalTableSizes = new WeakMap<object, () => number>();
+const scopeScanStats = new WeakMap<object, () => Readonly<{ scans: number; utf16Units: number }>>();
+
+/** Internal resource diagnostic: whole-run work, independent of wall-clock noise. */
+export function textScopeScanStats(service: TextLayoutService): Readonly<{ scans: number; utf16Units: number }> | undefined {
+  return scopeScanStats.get(service)?.();
+}
+
+/** Internal diagnostic: live route-ordinal entries held by a text service. */
+export function textRouteOrdinalTableSize(service: TextLayoutService): number | undefined {
+  return routeOrdinalTableSizes.get(service)?.();
+}
+
 /**
  * Shape per script span because ECMA-376 §17.3.2.26 selects rFonts slots per
  * Unicode character; choosing one family for an entire mixed-script run loses
@@ -566,17 +860,41 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     ...input.localMetrics,
     ...input.fontMetrics,
   });
+  const metricTupleKey = (identity: string, family: string, weight: number, style: FontStyle) =>
+    JSON.stringify([identity, family, weight, style]);
+  const registeredMetrics = new Map<string, Readonly<ResolvedFontMetric>>();
+  for (const metric of Object.values(fontMetrics)) {
+    if (metric.sourceIdentity && metric.weight !== undefined && metric.style !== undefined) {
+      registeredMetrics.set(metricTupleKey(metric.sourceIdentity, metric.family, metric.weight, metric.style), metric);
+    }
+  }
+  // Metric resources represented in this immutable snapshot, grouped by the
+  // case-insensitive Canvas family/weight/style tuple. This does not enumerate
+  // registrations outside the snapshot in an external FontFaceSet.
+  const canvasFaceKey = (family: string, weight: number, style: FontStyle) =>
+    JSON.stringify([normalizeFontMetricFamily(family), weight, style]);
+  const metricsByCanvasFace = new Map<string, Readonly<ResolvedFontMetric>[]>();
+  for (const metric of Object.values(fontMetrics)) {
+    const key = canvasFaceKey(metric.family, metric.weight ?? 400, metric.style ?? 'normal');
+    const peers = metricsByCanvasFace.get(key);
+    if (peers) peers.push(metric);
+    else metricsByCanvasFace.set(key, [metric]);
+  }
   const genericFamilies = Object.freeze(Object.fromEntries(
     Object.entries(input.genericFamilies ?? {})
-      .map(([family, generic]) => [family.trim().toLocaleLowerCase('en-US'), generic])
+      .map(([family, generic]) => [family.trim().toLowerCase(), generic])
       .sort(([a], [b]) => a.localeCompare(b)),
   ));
   const eastAsiaFontCharsets = Object.freeze(Object.fromEntries(
     Object.entries(input.eastAsiaFontCharsets ?? {})
-      .map(([family, charset]) => [family.trim().toLocaleLowerCase('en-US'), charset.trim()])
+      .map(([family, charset]) => [family.trim().toLowerCase(), charset.trim()])
       .sort(([a], [b]) => a.localeCompare(b)),
   ));
+  if (input.glyphContours && !input.glyphContourFingerprint?.trim()) {
+    throw new TypeError('Native glyph contour acquisition requires an authority fingerprint');
+  }
   const fingerprint = stableFingerprint('text', {
+    glyphContours: input.glyphContourFingerprint ?? 'unavailable',
     fonts: input.fonts.fingerprint,
     measurer: input.measurer.fingerprint,
     cjkFallback: input.cjkFallback ?? null,
@@ -587,7 +905,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
   const resolve = (request: Readonly<TextFontResolveRequest>): FontResolution => {
     const authoredFamily = requestedFamily(request, request.slot);
     const genericFamily = authoredFamily
-      ? genericFamilies[authoredFamily.trim().toLocaleLowerCase('en-US')]
+      ? genericFamilies[authoredFamily.trim().toLowerCase()]
         ?? request.genericFamily
         ?? 'sans-serif'
       // ECMA-376 §17.3.2.26 deliberately leaves the consumer's supported
@@ -596,8 +914,21 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       // evidence; every authored direct/theme face remains authoritative above.
       : request.genericFamily ?? defaultGenericForSlot(request.slot);
     const hasHan = containsHanScript(request.text ?? '');
+    // A scoped visual substitute (core substitute-script.ts) answers only text
+    // of its script. The shaper carries the shared per-cluster scope
+    // (`substituteScope`); otherwise the same shared rule judges `text` as a
+    // whole: a complex-script span is covered once it proves the script, any
+    // other span only when all of it belongs to the proven script.
+    const scoped = input.fonts.scopedSubstituteScript?.(authoredFamily, request.weight, request.style);
+    const covered = request.substituteScope ?? (scoped !== undefined && fontSubstituteScriptCoversText(
+      scoped,
+      request.text ?? '',
+      request.slot === 'complexScript' ? 'any' : 'exclusive',
+    ));
+    const substituteScript = scoped && covered ? scoped : undefined;
     return input.fonts.resolve({
       requestedFamily: authoredFamily,
+      ...(substituteScript ? { script: substituteScript } : {}),
       cjkFallback: hasHan ? input.cjkFallback : undefined,
       language: request.slot === 'eastAsia' && hasHan
         ? request.eastAsiaLanguage
@@ -607,23 +938,72 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
       style: request.style,
     });
   };
-  // Pagination convergence reacquires equal paragraphs under equal service
-  // fingerprints. Native Canvas metrics are pure for this complete request
-  // tuple, so retain one immutable document-scoped result across those passes.
+  // Pagination convergence and later view variants revisit text under the same
+  // service fingerprint. Keep recent pure results for those passes, but cap
+  // document lifetime retention after long documents finish paginating.
+  // The 295-page relayout probe used 33,024 distinct measurements and 73,436
+  // shapes; a smaller cap caused sequential variant layouts to thrash.
+  const measurementCacheLimit = 40960;
+  const shapeCacheLimit = 81920;
   const measurementCache = new Map<string, Readonly<GlyphMeasurement>>();
+  const cached = <T>(cache: Map<string, T>, key: string): T | undefined => {
+    const value = cache.get(key);
+    if (value !== undefined) {
+      cache.delete(key);
+      cache.set(key, value);
+    }
+    return value;
+  };
+  const retain = <T>(cache: Map<string, T>, key: string, value: T, limit: number): void => {
+    cache.set(key, value);
+    if (cache.size > limit) cache.delete(cache.keys().next().value as string);
+  };
+  // A route's identity is its (familyList, scope, fingerprint) triple. Spelling
+  // that triple into every measurement key made each retained key ~1.8 KB for
+  // a registered local face, so the measurement cache was dominated by copies
+  // of three distinct routes. Keys carry a service-scoped ordinal assigned
+  // one-to-one to the exact triple instead; the object map only skips
+  // re-deriving the ordinal for the shared resolver routes.
+  //
+  // The ordinal table must not outlive the bounded cache it serves: a document
+  // with ever-new routes would otherwise grow it without limit after the
+  // measurement cache had evicted every key that used them. Only measurement
+  // keys carry ordinals, so when the table reaches its bound, the table, the
+  // object map and the measurement cache are dropped together. No key that
+  // uses a retired ordinal survives, so a re-issued ordinal can never alias
+  // two routes; the reset is a memoization miss, never a different result.
+  let routeOrdinals = new Map<string, number>();
+  let routeOrdinalByObject = new WeakMap<object, number>();
+  const routeOrdinal = (route: Readonly<CanvasFontRoute>): number => {
+    const known = routeOrdinalByObject.get(route);
+    if (known !== undefined) return known;
+    const identity = JSON.stringify([route.familyList, route.scope, route.fingerprint]);
+    let ordinal = routeOrdinals.get(identity);
+    if (ordinal === undefined) {
+      if (routeOrdinals.size >= TEXT_ROUTE_ORDINAL_LIMIT) {
+        routeOrdinals = new Map();
+        routeOrdinalByObject = new WeakMap();
+        measurementCache.clear();
+      }
+      ordinal = routeOrdinals.size;
+      routeOrdinals.set(identity, ordinal);
+    }
+    // Only frozen routes are memoized by object: a mutable route could change
+    // its triple after the ordinal was recorded.
+    if (Object.isFrozen(route)) routeOrdinalByObject.set(route, ordinal);
+    return ordinal;
+  };
   const measureGlyph = (request: Readonly<GlyphMeasureRequest>): Readonly<GlyphMeasurement> => {
     const key = JSON.stringify([
       request.text,
-      request.fontRoute.familyList,
-      request.fontRoute.scope,
-      request.fontRoute.fingerprint,
+      routeOrdinal(request.fontRoute),
       request.fontSizePt,
       request.weight,
       request.style,
       request.letterSpacingPt,
       request.kerning ?? null,
     ]);
-    const retained = measurementCache.get(key);
+    const retained = cached(measurementCache, key);
     if (retained) return retained;
     const measured = input.measurer.measure(request);
     const snapshot = Object.freeze({
@@ -632,7 +1012,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         inkBounds: Object.freeze({ ...measured.inkBounds }),
       } : {}),
     });
-    measurementCache.set(key, snapshot);
+    retain(measurementCache, key, snapshot, measurementCacheLimit);
     return snapshot;
   };
   // Contextual cluster geometry measures every grapheme prefix of a script
@@ -644,14 +1024,159 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
     request: Readonly<GlyphMeasureRequest>,
   ): number => input.measurer.measure(request).advancePt;
   const shapeCache = new Map<string, TextShapeResult>();
-  return Object.freeze({
+  const scopeCache = new Map<string, Map<string, Uint8Array>>();
+  let scopeScans = 0;
+  let scopeUtf16Units = 0;
+  // Bounded per document service: authored family names are arbitrary.
+  const rasterProofs = new Map<string, boolean>();
+  const rasterProofLimit = 256;
+  const sameGlyphRaster = input.measurer.sameGlyphRaster
+    ? (request: Readonly<GlyphRasterComparisonRequest>): boolean => {
+        const key = JSON.stringify([request.route.fingerprint, request.faceFamily,
+          request.weight, request.style, request.text]);
+        const retained = rasterProofs.get(key);
+        if (retained !== undefined) return retained;
+        const proved = input.measurer.sameGlyphRaster!(request);
+        if (rasterProofs.size >= rasterProofLimit) rasterProofs.clear();
+        rasterProofs.set(key, proved);
+        return proved;
+      }
+    : undefined;
+  const service: TextLayoutService = Object.freeze({
+    ...(input.glyphContours ? { glyphContours: input.glyphContours } : {}),
+    ...(sameGlyphRaster ? { sameGlyphRaster } : {}),
+    ...(input.measurer.ownsGlyphs
+      ? { ownsGlyphs: (request: Readonly<GlyphOwnershipRequest>) => input.measurer.ownsGlyphs!(request) } : {}),
+    ...(input.fonts.exactLocalFaces
+      ? { exactLocalFaces: (family: string) => input.fonts.exactLocalFaces!(family) } : {}),
     fingerprint,
     fontMetrics,
     localMetrics: fontMetrics,
     resolve,
+    sourceScopeKey(request: Readonly<TextShapeRequest>): string | undefined {
+      if (!SCOPE_SLOTS.some(slot => input.fonts.scopedSubstituteScript?.(
+        requestedFamily(request, slot), request.weight, request.style))) return undefined;
+      const spans = service.shape({ ...request, measure: false, clusterGeometry: false }).spans;
+      const keys = [...new Set(spans.map(span => JSON.stringify([
+        span.fontRoute.fingerprint, span.substituteScope,
+      ])))];
+      // The independent run-scope rule must not borrow Arabic proof from a
+      // neighbouring run. Mixed scopes require their original source context.
+      return keys.length === 1 ? keys[0] : 'mixed';
+    },
     shape(request: Readonly<TextShapeRequest>): TextShapeResult {
       if (!Number.isFinite(request.fontSizePt) || request.fontSizePt < 0) {
         throw new RangeError('fontSizePt must be a finite non-negative number');
+      }
+      // Retained partial measurements must use sliceTextShapeRequest. Failing
+      // closed prevents a stale offset from silently selecting a different face
+      // than paint. Independent and transformed text have explicit helpers.
+      const context = request.substituteContext ?? { text: request.text, offset: 0 };
+      if (request.substituteContext) assertTextShapeRunContext(request, context.text);
+      const configuredBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
+      const scopedBySlot = new Map<FontScriptSlot, FontSubstituteScript>();
+      for (const slot of SCOPE_SLOTS) {
+        const family = requestedFamily(request, slot);
+        const configured = input.fonts.configuredSubstituteScript?.(family);
+        if (configured) configuredBySlot.set(slot, configured);
+        const scoped = input.fonts.scopedSubstituteScript?.(family, request.weight, request.style);
+        if (scoped) scopedBySlot.set(slot, scoped);
+      }
+      const eastAsiaFamily = requestedFamily(request, 'eastAsia');
+      const eastAsiaCharset = request.eastAsiaFontCharset
+        ?? (eastAsiaFamily
+          ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLowerCase()]
+          : undefined);
+      // ECMA-376 §17.3.2.26 (and the MS-OI29500 table) selects the rFonts slot
+      // per code point, including rFonts@hint. General text keeps that exactly.
+      type Scalar = { text: string; start: number; end: number; slot: FontScriptSlot; inScope: boolean };
+      const scalarsOf = (text: string): Scalar[] => {
+        const result: Scalar[] = [];
+        let offset = 0;
+        for (const character of text) {
+          const end = offset + character.length;
+          result.push({
+            text: character,
+            start: offset,
+            end,
+            slot: scriptSlot(
+              character.codePointAt(0) ?? 0,
+              request.complexScript ?? false,
+              request.fontHint,
+              request.eastAsiaLanguage,
+              eastAsiaCharset,
+            ),
+            inScope: false,
+          });
+          offset = end;
+        }
+        return result;
+      };
+      // Library substitution policy (§17.8.2), not an Office slot override:
+      // core's one proof/extension/neutral rule judges clusters over the run.
+      // Retain its scoped host slot at each UTF-16 position, including marks
+      // and transparent controls, so word/span cuts cannot change the face.
+      let scopeDescriptor: string | undefined;
+      if (scopedBySlot.size > 0) {
+        const key = JSON.stringify([
+          [...scopedBySlot], [...configuredBySlot], request.complexScript ?? false, request.fontHint ?? null,
+          request.eastAsiaLanguage ?? null, eastAsiaCharset ?? null,
+        ]);
+        // The raw run string is a Map key only once, never JSON-serialized or
+        // embedded in each word key. Parent tokens and their resolved children
+        // can alternate cs and scalar-slot classification on every word. Keep
+        // both configurations: replacing one descriptor would rescan the whole
+        // run per child, making layout quadratic. Both LRU levels are bounded
+        // resource policy (64 runs, 8 configurations per run); retained arrays
+        // remain linear in the retained run lengths, independent of word count.
+        let configurations = cached(scopeCache, context.text);
+        if (!configurations) {
+          configurations = new Map();
+          retain(scopeCache, context.text, configurations, SCOPE_CACHE_LIMIT);
+        }
+        let slots = cached(configurations, key);
+        if (!slots) {
+          scopeScans += 1;
+          scopeUtf16Units += context.text.length;
+          const contextScalars = scalarsOf(context.text);
+          const indexAt = new Map(contextScalars.map((scalar, index) => [scalar.start, index]));
+          slots = new Uint8Array(context.text.length);
+          for (const script of new Set(scopedBySlot.values())) {
+            const baseSlot = (start: number, end: number): FontScriptSlot | undefined => {
+              let first: FontScriptSlot | undefined;
+              for (let index = indexAt.get(start) ?? contextScalars.length; index < contextScalars.length
+                && contextScalars[index]!.start < end; index += 1) {
+                first ??= contextScalars[index]!.slot;
+                if (!SCOPE_NEUTRAL_SCALAR.test(contextScalars[index]!.text)) return contextScalars[index]!.slot;
+              }
+              return first;
+            };
+            const scope = fontSubstituteScriptScope(script, context.text, (start, end) => {
+              const slot = baseSlot(start, end);
+              return slot !== undefined && (configuredBySlot.get(slot) ?? scopedBySlot.get(slot)) === script;
+            });
+            let host: FontScriptSlot | undefined;
+            for (const cluster of scope) {
+              if (!cluster.inScope) {
+                host = undefined;
+                continue;
+              }
+              if (cluster.cls !== 'neutral') host = baseSlot(cluster.start, cluster.end);
+              // Surrounding Arabic can prove the run even when its own face
+              // is unavailable or authored. Only an actually selected scoped
+              // substitute may replace this cluster's normative scalar slots.
+              if (host !== undefined && scopedBySlot.get(host) === script) slots.fill(SCOPE_SLOTS.indexOf(host) + 1, cluster.start, cluster.end);
+            }
+          }
+          retain(configurations, key, slots, SCOPE_CONFIGURATIONS_PER_RUN);
+        }
+        // Exact, collision-free range descriptor: zero means normal scalar
+        // classification; 1–4 carry the in-scope host slot. Key size is O(word),
+        // and identical words with identical decisions share shapes across runs.
+        scopeDescriptor = Array.from(
+          slots.subarray(context.offset, context.offset + request.text.length),
+          (slot) => String.fromCharCode(48 + slot),
+        ).join('');
       }
       const shapeKey = JSON.stringify([
         request.text,
@@ -683,45 +1208,51 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         request.genericFamily ?? null,
         request.letterSpacingPt ?? null,
         request.kerning ?? null,
+        request.joinRegisteredGrapheme ?? null,
+        request.joinRegisteredLatinSlots ?? null,
+        request.registeredLatinPieceText !== undefined && request.registeredLatinPieceText === request.text,
         request.measure ?? null,
         request.clusterGeometry ?? null,
+        ...(scopeDescriptor !== undefined ? [scopeDescriptor] : []),
       ]);
-      const retainedShape = shapeCache.get(shapeKey);
+      const retainedShape = cached(shapeCache, shapeKey);
       if (retainedShape) return retainedShape;
       const grouped: {
         text: string; start: number; end: number; script: FontScriptSlot; breakBefore: boolean;
+        substituteScript: boolean;
       }[] = [];
       const graphemeBoundaries = Object.freeze(
         [...new Set([0, ...graphemeClusterOffsets(request.text), request.text.length])].sort((a, b) => a - b),
       );
       const graphemeStarts = new Set(graphemeBoundaries);
-      let start = 0;
-      for (const character of request.text) {
-        const end = start + character.length;
-        const eastAsiaFamily = requestedFamily(request, 'eastAsia');
-        const eastAsiaCharset = request.eastAsiaFontCharset
-          ?? (eastAsiaFamily
-            ? eastAsiaFontCharsets[eastAsiaFamily.trim().toLocaleLowerCase('en-US')]
-            : undefined);
-        const script = scriptSlot(
-          character.codePointAt(0) ?? 0,
-          request.complexScript ?? false,
-          request.fontHint,
-          request.eastAsiaLanguage,
-          eastAsiaCharset,
-        );
-        const previous = grouped.at(-1);
-        if (previous?.script === script) {
-          previous.text += character;
-          previous.end = end;
-        } else {
-          grouped.push({ text: character, start, end, script, breakBefore: graphemeStarts.has(start) });
+      const scalars = scalarsOf(request.text);
+      scalars.forEach((scalar) => {
+        const scopedSlot = Number(scopeDescriptor?.[scalar.start] ?? 0);
+        if (scopedSlot > 0) {
+          scalar.inScope = true;
+          scalar.slot = SCOPE_SLOTS[scopedSlot - 1]!;
         }
-        start = end;
+      });
+      for (const scalar of scalars) {
+        const previous = grouped.at(-1);
+        if (previous?.script === scalar.slot && previous.substituteScript === scalar.inScope) {
+          previous.text += scalar.text;
+          previous.end = scalar.end;
+        } else {
+          grouped.push({
+            text: scalar.text,
+            start: scalar.start,
+            end: scalar.end,
+            script: scalar.slot,
+            breakBefore: graphemeStarts.has(scalar.start),
+            substituteScript: scalar.inScope,
+          });
+        }
       }
 
-      const spans = grouped.map((group): TextShapeSpan => {
-        const font = resolve({
+      const resolvedGroups = grouped.map((group) => ({
+        ...group,
+        font: resolve({
           fonts: request.fonts,
           themeFonts: request.themeFonts,
           themeFontPresence: request.themeFontPresence,
@@ -731,7 +1262,105 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           weight: request.weight,
           style: request.style,
           genericFamily: request.genericFamily,
-        });
+          // Carry the shared per-cluster scope; a fragment is never re-judged.
+          ...(scopedBySlot.has(group.script) ? { substituteScope: group.substituteScript } : {}),
+        }),
+      }));
+      // Scoped text that resolves to the same effective face (same registered
+      // resource, weight, style and source) is one string for Canvas, whichever
+      // family name or slot requested it and whatever CSS fallback list follows.
+      // Shaping it apart would break Arabic joining. Only in-scope spans
+      // merge; ordinary spans start with per-slot runs, independently of the
+      // registered physical-unit admission below.
+      const merged: Array<(typeof resolvedGroups)[number] & Pick<TextShapeSpan, 'semanticSlotSpans'>> = [];
+      for (const group of resolvedGroups) {
+        const previous = merged.at(-1);
+        if (previous && previous.substituteScript && group.substituteScript
+          && sameEffectiveFace(previous.font, group.font)) {
+          merged[merged.length - 1] = { ...previous, text: previous.text + group.text, end: group.end };
+        } else {
+          merged.push(group);
+        }
+      }
+
+      // Semantic slots select faces per scalar (§17.3.2.26); they need not
+      // create a native shaping seam when the exact physical face is proven.
+      // Keep the existing scoped Arabic merge above independent of this gate.
+      // Uniform ordinary allocation permits one physical shape/paint across a
+      // SINGLE word slot seam: width correction with split paint loses GSUB.
+      // A builder-owned pure trailing U+0020 span is allowed separately; its
+      // full face/cmap/allocation proof is unchanged. Multiple ordinary WORD
+      // seams retain baseline partition/placement. Joining
+      // alternating slots would turn its cached one-scalar acquisitions into
+      // repeated full-tail native shaping during emergency wrapping. This is
+      // a structural admission limit, not a text-length or font heuristic.
+      // The existing one-grapheme contract remains independent; kerning-off
+      // multi-grapheme GSUB is unqualified and retains baseline as well.
+      const joinGrapheme = request.joinRegisteredGrapheme === true
+        && registeredLatinMarkGraphemeCandidate(request.text) && graphemeBoundaries.length === 2;
+      // Emergency slicing can leave only highAnsi body + its ASCII SPACE tail.
+      // Retained paint still draws this adopted physical piece as one string;
+      // splitting its measurement would lose a native body/separator pair.
+      // Only exact slices of a previously adopted piece get this zero-word-seam
+      // exception. Fresh words and expanded/generated probes keep the ordinary
+      // predicate. The parent's Latin character may have been cut away (e.g.
+      // km² SPACE -> ² SPACE); its alphabet bound is still checked on the slice.
+      // Every suffix scalar still passes the same face/route/cmap
+      // proof below; provenance alone never admits a resource or peer.
+      const joinedLatinSlice = request.registeredLatinPieceText === request.text
+        && merged.length === 2 && merged[0]!.script === 'highAnsi'
+        && merged[0]!.text.length > 0 && /^ +$/u.test(merged[1]!.text);
+      const joinLatin = request.joinRegisteredLatinSlots === true && request.kerning === true
+        && ((registeredLatinSingleSeamCandidate(merged) && registeredLatinSlotRunCandidate(request.text))
+          || (joinedLatinSlice && REGISTERED_LATIN_SLOT_CHARSET.test(request.text)));
+      if ((joinGrapheme || joinLatin) && merged.length > 1 && scopeDescriptor === undefined) {
+        const first = merged[0]!;
+        const face = first.font;
+        const metric = face.resourceIdentity ? registeredMetrics.get(metricTupleKey(
+          face.resourceIdentity, face.resolvedFamily, face.weight, face.style,
+        )) : undefined;
+        // Repeated letters/marks do not change cmap admission. Deduplicate
+        // coverage work for long pieces and avoid a per-peer filter allocation.
+        const scalars = [...new Set(Array.from(request.text, scalar => scalar.codePointAt(0)!))];
+        const coveredCount = (ranges: readonly (readonly [number, number])[]) => {
+          let count = 0;
+          for (const cp of scalars) {
+            let low = 0;
+            let high = ranges.length;
+            while (low < high) {
+              const middle = (low + high) >>> 1;
+              if (ranges[middle]![1] < cp) low = middle + 1;
+              else high = middle;
+            }
+            if (low < ranges.length && ranges[low]![0] <= cp) count += 1;
+          }
+          return count;
+        };
+        const ranges = metric?.unicodeRanges;
+        // This join guard is stricter than selected line-metric admission:
+        // every snapshot peer must explicitly cover all or none of the
+        // physical unit. Unknown or partial cmap coverage declines joining;
+        // geometry selection remains the separate line-metric policy.
+        const covered = ranges !== undefined && coveredCount(ranges) === scalars.length
+          && (metricsByCanvasFace.get(canvasFaceKey(face.resolvedFamily, face.weight, face.style)) ?? [])
+            .every(peer => peer === metric || (peer.unicodeRanges !== undefined
+              && [0, scalars.length].includes(coveredCount(peer.unicodeRanges))));
+        if ((face.source === 'embedded' || face.source === 'local') && face.resourceIdentity
+          && covered && merged.every(group => !group.substituteScript
+            && (group.script === 'ascii' || group.script === 'highAnsi')
+            && group.font.source === face.source && group.font.resourceIdentity === face.resourceIdentity
+            && group.font.resolvedFamily === face.resolvedFamily
+            && group.font.weight === face.weight && group.font.style === face.style
+            && group.font.route.fingerprint === face.route.fingerprint)) {
+          const semanticSlotSpans = Object.freeze(merged.map(group => Object.freeze({
+            start: group.start, end: group.end, script: group.script, font: group.font,
+          })));
+          merged.splice(0, merged.length, { ...first, text: request.text, end: request.text.length,
+            semanticSlotSpans });
+        }
+      }
+
+      const spans = merged.map(({ substituteScript, font, ...group }): TextShapeSpan => {
         const measurement = request.measure === false ? {
           advancePt: 0,
           ascentPt: 0,
@@ -743,13 +1372,17 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           weight: font.weight,
           style: font.style,
           letterSpacingPt: request.letterSpacingPt ?? 0,
-          kerning: request.kerning,
+          kerning: wordArabicTextKerned(group.text) ? true : request.kerning,
         });
         return Object.freeze({
           ...group, ...measurement, font, fontRoute: font.route,
+          // Excluded spans also depend on the full run: a mark attached to a
+          // Latin base must not become Arabic proof when measured in isolation.
+          ...(scopeDescriptor !== undefined ? { substituteScope: substituteScript } : {}),
         });
       });
-      const diagnostics = spans.flatMap((span) => span.font.diagnostics);
+      const diagnostics = spans.flatMap(span => span.semanticSlotSpans
+        ? span.semanticSlotSpans.flatMap(slot => slot.font.diagnostics) : span.font.diagnostics);
       const inkBounds = spans.length > 0 && spans.every((span) => span.inkBounds !== undefined)
         ? (() => {
             let originPt = 0;
@@ -768,7 +1401,15 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
             return Object.freeze({ xMinPt, xMaxPt, ascentPt, descentPt });
           })()
         : undefined;
-      const totalAdvancePt = spans.reduce((sum, span) => sum + span.advancePt, 0);
+      // A valid long run can retain one ordinary font slot per scalar. Keep
+      // metric aggregation independent of the engine's call-argument limit;
+      // spreading those spans into Math.max would throw before layout starts.
+      let totalAdvancePt = 0, ascentPt = 0, descentPt = 0;
+      for (const span of spans) {
+        totalAdvancePt += span.advancePt;
+        ascentPt = Math.max(ascentPt, span.ascentPt);
+        descentPt = Math.max(descentPt, span.descentPt);
+      }
       const clusters = request.clusterGeometry === false
         ? undefined
         : (() => {
@@ -794,7 +1435,7 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
                   weight: span.font.weight,
                   style: span.font.style,
                   letterSpacingPt: request.letterSpacingPt ?? 0,
-                  kerning: request.kerning,
+                  kerning: wordArabicTextKerned(span.text) ? true : request.kerning,
                 });
                 break;
               }
@@ -803,8 +1444,21 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
               prefixAdvances.set(boundary, advancePt);
               return advancePt;
             };
-            return Object.freeze(graphemeBoundaries.slice(0, -1).map((start, index) => {
-              const end = graphemeBoundaries[index + 1] ?? start;
+            const selected: Array<{ start: number; end: number }> = [];
+            if (request.clusterGeometry === 'spaces') {
+              // Scalar spaces need not start a grapheme (Prepend + SPACE).
+              // Acquire their exact contextual prefix difference; gap
+              // selection independently rejects cuts inside a grapheme.
+              for (let start = request.text.indexOf(' '); start >= 0;
+                start = request.text.indexOf(' ', start + 1)) {
+                selected.push({ start, end: start + 1 });
+              }
+            } else {
+              for (let index = 0; index < graphemeBoundaries.length - 1; index += 1) {
+                selected.push({ start: graphemeBoundaries[index]!, end: graphemeBoundaries[index + 1]! });
+              }
+            }
+            return Object.freeze(selected.map(({ start, end }) => {
               const offsetPt = prefixAdvance(start);
               return Object.freeze({
                 range: Object.freeze({ start, end }),
@@ -815,8 +1469,8 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           })();
       const result: TextShapeResult = Object.freeze({
         advancePt: totalAdvancePt,
-        ascentPt: Math.max(0, ...spans.map((span) => span.ascentPt)),
-        descentPt: Math.max(0, ...spans.map((span) => span.descentPt)),
+        ascentPt,
+        descentPt,
         ...(inkBounds ? { inkBounds } : {}),
         ...(inkBounds && spans.every((span) => span.horizontalInkBoundsAreTight === true)
           ? { horizontalInkBoundsAreTight: true }
@@ -826,8 +1480,11 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
         ...(clusters ? { clusters } : {}),
         diagnostics: Object.freeze(diagnostics),
       });
-      shapeCache.set(shapeKey, result);
+      retain(shapeCache, shapeKey, result, shapeCacheLimit);
       return result;
     },
   });
+  routeOrdinalTableSizes.set(service, () => routeOrdinals.size);
+  scopeScanStats.set(service, () => Object.freeze({ scans: scopeScans, utf16Units: scopeUtf16Units }));
+  return service;
 }

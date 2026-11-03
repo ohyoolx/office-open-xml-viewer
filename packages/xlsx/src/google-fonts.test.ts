@@ -1,5 +1,15 @@
-import { xlsxFontPreloadNames, xlsxCjkFallback } from './google-fonts.js';
-import type { ParsedWorkbook } from './types.js';
+import { xlsxFontPreloadNames, xlsxCjkFallback, xlsxWorksheetOfficeFontRequests } from './google-fonts.js';
+import type { ParsedWorkbook, Worksheet } from './types.js';
+
+it('preflights the Normal font even when no text cell uses it', () => {
+  const worksheet = {
+    defaultFontFamily: 'Arial', defaultFontBold: true,
+    defaultFontItalic: true, rows: [], shapeGroups: [],
+  } as unknown as Worksheet;
+  expect(xlsxWorksheetOfficeFontRequests(worksheet)).toEqual([
+    { family: 'Arial', weight: 700, style: 'italic' },
+  ]);
+});
 import { describe, expect, it } from 'vitest';
 import type { FontPreloadEntry } from '@silurus/ooxml-core';
 import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
@@ -30,13 +40,9 @@ const XLSX_GOOGLE_FONTS_OLD: Record<string, FontPreloadEntry> = {
 // Generic web fonts + Office face names the shared registry now contributes to
 // XLSX (previously only in docx/pptx). Each is either a plain Google web font
 // served under its own family name, or an Office face reducing to a metric
-// substitute already present (calibri light → Carlito, cambria math → Caladea).
-// All are inert unless a workbook actually styles a cell with that name, in
-// which case the cell now measures against the correct substitute instead of a
-// wider system fallback — strictly an improvement, no regression path.
+// substitute already present. Calibri Light and Cambria Math have distinct
+// capabilities, so neither inherits the base text-face substitution.
 const EXPECTED_ADDED = new Set([
-  'calibri light',
-  'cambria math',
   'franklin gothic book',
   'franklin gothic medium',
   'nunito sans',
@@ -52,9 +58,14 @@ const EXPECTED_ADDED = new Set([
 ]);
 
 describe('XLSX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
-  it('preserves every pre-consolidation entry byte-for-byte', () => {
+  it('preserves complete loading entries with explicit Arabic scope metadata', () => {
     for (const [key, entry] of Object.entries(XLSX_GOOGLE_FONTS_OLD)) {
-      expect(XLSX_GOOGLE_FONTS[key], `entry "${key}"`).toEqual(entry);
+      // Loading entries remain the frozen oracle; only these five authored
+      // visual alternatives carry the explicitly expected Arabic scope tag.
+      const scoped = new Set(['sakkal majalla', 'traditional arabic', 'simplified arabic',
+        'arabic typesetting', 'univers next arabic']);
+      expect(XLSX_GOOGLE_FONTS[key], `entry "${key}"`)
+        .toEqual(scoped.has(key) ? { ...entry, script: 'arabic' } : entry);
     }
   });
 
@@ -64,9 +75,8 @@ describe('XLSX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
       (k) => !oldKeys.has(k) && !k.startsWith('noto '),
     );
     expect(new Set(added)).toEqual(EXPECTED_ADDED);
-    // The two Office face names reduce to their base family's substitute.
-    expect(XLSX_GOOGLE_FONTS['calibri light']).toEqual(XLSX_GOOGLE_FONTS['calibri']);
-    expect(XLSX_GOOGLE_FONTS['cambria math']).toEqual(XLSX_GOOGLE_FONTS['cambria']);
+    expect(XLSX_GOOGLE_FONTS['calibri light']).toBeUndefined();
+    expect(XLSX_GOOGLE_FONTS['cambria math']).toBeUndefined();
     expect(XLSX_GOOGLE_FONTS['franklin gothic medium']).toMatchObject({
       loadFamily: 'Libre Franklin',
     });

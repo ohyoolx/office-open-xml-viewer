@@ -1,3 +1,4 @@
+import { imagePaintProjection, withImagePaintProjection, type ImagePaintProjectionOptions } from './crop';
 /** Optional image codecs that can be omitted from the base viewer bundle. */
 export type OptionalImageCodec = 'tiff';
 
@@ -40,35 +41,35 @@ export interface OptionalImagePlaceholderBounds {
   readonly height: number;
 }
 
-const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec, string>> = {
+const OPTIONAL_IMAGE_LABELS: Readonly<Record<OptionalImageCodec | 'pict' | 'equation', string>> = {
   tiff: 'TIFF image unavailable',
+  pict: 'PICT image unsupported',
+  equation: 'Equation unavailable',
 };
 
 /**
  * Paint the same bounded, non-throwing capability placeholder in every format.
+ * PICT is an opaque image resource, not an optional codec: callers may
+ * label that unsupported format without claiming that its pixels were decoded.
  * The fixed label avoids shaping package-controlled or attacker-controlled text.
  */
 export function paintOptionalImagePlaceholder(
   ctx: CanvasRenderingContext2D,
-  codec: OptionalImageCodec,
+  codec: OptionalImageCodec | 'pict' | 'equation',
   bounds: OptionalImagePlaceholderBounds,
+  options?: Readonly<ImagePaintProjectionOptions>,
 ): void {
   if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite)
     || bounds.width <= 0 || bounds.height <= 0) return;
-  ctx.save();
-  try {
-    ctx.fillStyle = '#888';
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    const label = OPTIONAL_IMAGE_LABELS[codec];
-    ctx.fillText(
-      label,
-      bounds.x + bounds.width / 2,
-      bounds.y + bounds.height / 2,
-      bounds.width,
-    );
-  } finally {
-    ctx.restore();
-  }
+  const paint = (x: number, y: number, width: number, height: number) => {
+    ctx.save();
+    try {
+      ctx.fillStyle = '#888'; ctx.font = '11px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(OPTIONAL_IMAGE_LABELS[codec], x + width / 2, y + height / 2, width);
+    } finally { ctx.restore(); }
+  };
+  if (!options) { paint(bounds.x, bounds.y, bounds.width, bounds.height); return; }
+  const plan = imagePaintProjection(bounds.width, bounds.height, null, options.transform);
+  withImagePaintProjection(ctx, bounds.x, bounds.y, plan, paint);
 }

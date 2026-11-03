@@ -57,6 +57,33 @@ function documentWithUnavailableDrawing(): DocxDocumentModel {
   } as unknown as DocxDocumentModel;
 }
 
+/** Reserved separator wire as a producer emits it. */
+function reservedSeparatorDocument(noteId = '1'): DocxDocumentModel {
+  const run = (fontSize: number) => ({
+    text: '', bold: false, italic: false, underline: false, strikethrough: false, fontSize,
+    color: null, fontFamily: 'Control Face', isLink: false, background: null, vertAlign: null, hyperlink: null,
+  });
+  const paragraph = {
+    alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0, spaceBefore: 0, spaceAfter: 0,
+    lineSpacing: null, numbering: null, tabStops: [], runs: [], defaultFontSize: 9,
+    paragraphMarkFontFacts: { fontSize: 9 },
+  };
+  const rule = (mark: 'short' | 'full') => ({
+    rule: { mark, control: { run: run(14) } },
+    paragraph: { paragraph, contentMark: { run: run(9) } },
+  });
+  const document = documentWithUnavailableDrawing();
+  document.footnotes = [{ id: noteId, content: [] }];
+  return { ...document, __noteLayoutSettings: {
+    footnoteSeparator: 'short', footnoteContinuationSeparator: 'full',
+    reservedSeparators: { footnote: {
+      separator: rule('short'),
+      continuationSeparator: rule('full'),
+      continuationNotice: {},
+    } },
+  } } as unknown as DocxDocumentModel;
+}
+
 describe('LayoutSourceStore', () => {
   it('caches one sealed normalized source for raw and normalized model identities', () => {
     const raw = documentWithUnavailableDrawing();
@@ -517,5 +544,146 @@ describe('LayoutSourceStore', () => {
         ).fontSizePt).toBe(fallback);
       }
     }
+  });
+  it('registers reserved separator stories under closed canonical roots', () => {
+    const settings = (store: LayoutSourceStore) => store.bodyLayoutInput.noteLayoutSettings;
+    const first = layoutSourceStore(reservedSeparatorDocument());
+    // The sealed layout input holds canonical role refs and no raw
+    // parser-shaped separator wire.
+    expect(settings(first)).not.toHaveProperty('reservedSeparators');
+    const roles = settings(first)?.reservedSeparatorRoles?.footnote;
+    expect(roles?.separator.root).toEqual({ story: 'footnote', storyInstance: 'reserved:separator', path: [] });
+    expect(roles?.separator.rule).toMatchObject({
+      mark: 'short', control: { storyInstance: 'reserved:separator', path: [0, 0] },
+    });
+    expect(roles?.continuationSeparator.rule?.mark).toBe('full');
+    const paragraph = first.blocks.resolve(roles!.separator.paragraph!.source);
+    if (paragraph.type !== 'paragraph') throw new Error('Expected a reserved separator paragraph');
+    // Control and content mark stay distinct participants with their own properties.
+    expect(paragraph.runs.map((run) => run.type === 'text'
+      ? [run.noteSeparatorCharacter, run.fontSize] : null))
+      .toEqual([['rule-control', 14], ['paragraph-mark', 9]]);
+    // An empty notice stays addressable without a fabricated paragraph, and
+    // reserved roots are not numbered note bodies.
+    expect(first.blocks.storyRoot(roles!.continuationNotice.root)).toEqual([]);
+    expect(roles?.continuationNotice.paragraph).toBeUndefined();
+    expect(first.blocks.footnotes.map((note) => note.id)).toEqual(['1']);
+    // A face used only by the control joins the document font ownership.
+    expect(first.fonts.renderedFamilies).toContain('Control Face');
+
+    const streamed = layoutSourceModelAdapterFromOwnedModel(
+      reservedSeparatorDocument(), reservedSeparatorDocument(),
+    ).source;
+    expect(streamed.bodyLayoutInput).toEqual(first.bodyLayoutInput);
+    expect(streamed.blocks.resolve(roles!.separator.paragraph!.source)).toEqual(paragraph);
+  });
+
+  it.each([false, true])('resolves reserved-story automatic margins with document fixed=%s before immutable acquisition', (fixed) => {
+    const document = reservedSeparatorDocument() as DocxDocumentModel & {
+      __noteLayoutSettings: { reservedSeparators: { footnote: Record<string, Record<string, unknown>> } };
+    };
+    document.settings = { doNotUseHtmlParagraphAutoSpacing: fixed };
+    const stories = document.__noteLayoutSettings.reservedSeparators.footnote;
+    const wrapper = stories.separator!.paragraph as {
+      paragraph: DocParagraph;
+      contentMark: unknown;
+    };
+    Object.assign(wrapper.paragraph, { spaceBefore: 5, spaceAfter: 7, beforeAutospacing: true, afterAutospacing: false });
+    stories.continuationNotice = {
+      paragraph: { ...wrapper, paragraph: { ...wrapper.paragraph, afterAutospacing: true } },
+    };
+    const original = structuredClone(document);
+    const source = layoutSourceStore(document);
+    const roles = source.bodyLayoutInput.noteLayoutSettings?.reservedSeparatorRoles?.footnote;
+    if (!roles?.separator.paragraph || !roles.continuationNotice.paragraph) throw new Error('Expected reserved paragraphs');
+    const rule = source.blocks.resolve(roles.separator.paragraph.source);
+    const notice = source.blocks.resolve(roles.continuationNotice.paragraph.source);
+    if (rule.type !== 'paragraph' || notice.type !== 'paragraph') throw new Error('Expected reserved paragraphs');
+    // Paragraph base is 9pt; the 14pt rule control does not define the em.
+    expect([rule.spaceBefore, rule.spaceAfter]).toEqual(fixed ? [5, 7] : [9, 7]);
+    expect([notice.spaceBefore, notice.spaceAfter]).toEqual(fixed ? [5, 7] : [9, 9]);
+    expect(document).toEqual(original);
+    expect(Object.isFrozen(rule)).toBe(true);
+    const streamed = layoutSourceModelAdapterFromOwnedModel(structuredClone(document), structuredClone(document)).source;
+    expect(streamed.blocks.resolve(roles.separator.paragraph.source)).toEqual(rule);
+    // Settings and source mutations cannot change an acquired story or its owner.
+    document.settings.doNotUseHtmlParagraphAutoSpacing = !fixed;
+    wrapper.paragraph.spaceBefore = 90;
+    expect(source.blocks.resolve(roles.separator.paragraph.source)).toBe(rule);
+    expect([rule.spaceBefore, rule.spaceAfter]).toEqual(fixed ? [5, 7] : [9, 7]);
+  });
+
+  it.each(['rule-control', 'rule-mark', 'notice-mark'] as const)(
+    'rejects a reserved %s glyph before metric-only normalization can discard it',
+    (participant) => {
+      const document = reservedSeparatorDocument() as DocxDocumentModel & {
+        __noteLayoutSettings: { reservedSeparators: { footnote: Record<string, Record<string, unknown>> } };
+      };
+      const stories = document.__noteLayoutSettings.reservedSeparators.footnote;
+      const paragraph = stories.separator!.paragraph as Record<string, unknown>;
+      let character: { run: { text: string } };
+      if (participant === 'rule-control') {
+        character = (stories.separator!.rule as { control: typeof character }).control;
+      } else if (participant === 'rule-mark') {
+        character = paragraph.contentMark as typeof character;
+      } else {
+        // A paragraph-only notice follows the ordinary empty-paragraph path,
+        // so its content mark must be checked even without a rule participant.
+        const mark = structuredClone(paragraph.contentMark) as typeof character;
+        stories.continuationNotice = { paragraph: { ...paragraph, contentMark: mark } };
+        character = mark;
+      }
+      // A producer's symbol substitution can give an empty control text.
+      character.run.text = '\u03a9';
+      expect(() => layoutSourceStore(document)).toThrow('carries unsupported authored text');
+    },
+  );
+
+  it('rejects reserved root collisions and inconsistent reserved separator shapes before layout', () => {
+    expect(() => layoutSourceStore(reservedSeparatorDocument('reserved:separator')))
+      .toThrow('collides with a reserved note separator story');
+    const mutate = (edit: (stories: Record<string, Record<string, unknown>>) => void) => {
+      const document = reservedSeparatorDocument() as DocxDocumentModel & {
+        __noteLayoutSettings: { reservedSeparators: { footnote: Record<string, Record<string, unknown>> } };
+      };
+      edit(document.__noteLayoutSettings.reservedSeparators.footnote);
+      return () => layoutSourceStore(document);
+    };
+    // Malformed records fail closed instead of sealing as empty stories,
+    // which would suppress the scalar separator of their note kind.
+    for (const [label, edit] of [
+      ['number story', (stories) => { stories.separator = 42 as never; }],
+      ['array story', (stories) => { stories.separator = [] as never; }],
+      ['null rule', (stories) => { stories.separator!.rule = null; }],
+      ['null paragraph', (stories) => { stories.continuationNotice!.paragraph = null; }],
+      ['missing role', (stories) => { delete stories.continuationNotice; }],
+      ['unknown story field', (stories) => { stories.continuationNotice!.guardCp = 7; }],
+      ['non-record control', (stories) => {
+        (stories.separator!.rule as Record<string, unknown>).control = 'x';
+      }],
+      ['non-boolean flag', (stories) => {
+        (stories.separator!.paragraph as Record<string, unknown>).numbered = 0;
+      }],
+    ] as const satisfies readonly (readonly [string, (stories: Record<string, Record<string, unknown>>) => void])[]) {
+      expect(mutate(edit), label).toThrow('Unsupported reserved note separator story');
+    }
+    const kind = (value: unknown) => {
+      const document = reservedSeparatorDocument() as DocxDocumentModel & {
+        __noteLayoutSettings: { reservedSeparators: Record<string, unknown> };
+      };
+      document.__noteLayoutSettings.reservedSeparators.endnote = value;
+      return () => layoutSourceStore(document);
+    };
+    expect(kind(null)).toThrow('Unsupported reserved note separator story');
+    expect(kind([])).toThrow('Unsupported reserved note separator story');
+    // An absent kind is not a malformed one.
+    expect(kind(undefined)).not.toThrow();
+    // A rule always comes with the paragraph whose mark ends it.
+    expect(mutate((stories) => { delete stories.separator!.paragraph; }))
+      .toThrow('Unsupported reserved note separator story');
+    // Presence-only frame/numbering flags mean the owned properties were not kept.
+    expect(mutate((stories) => {
+      (stories.separator!.paragraph as Record<string, unknown>).framed = true;
+    })).toThrow('Unsupported reserved note separator story');
   });
 });

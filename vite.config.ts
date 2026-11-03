@@ -4,6 +4,9 @@ import { dts } from 'rolldown-plugin-dts';
 import { resolve, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { readFile } from 'fs/promises';
+import { rolldown } from 'rolldown';
+import { docxCompatibilityMetadata } from './scripts/docx-compatibility-build.mjs';
+import { optionalRendererMarkers } from './scripts/optional-renderer-markers.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -14,18 +17,17 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * Vite **library mode** force-inlines every `?url` asset as a
  * `data:<mime>;base64,…` string regardless of `assetsInlineLimit` (a number or a
  * `() => false` function does NOT override it — `build.lib` unconditionally
- * returns `true` from Vite's internal `shouldInline`). Two heavy asset kinds ride
- * on this path:
+ * returns `true` from Vite's internal `shouldInline`). Heavy asset kinds on
+ * this path include:
  *   - the three parser WASM modules (`*_parser_bg.wasm?url`, ~0.6–0.7 MB each) —
  *     base64 inflates them +33 % and blocks `WebAssembly.compileStreaming`
  *     (a data URL cannot be fetch-streamed; the worker must `atob` by hand);
  *   - the MathJax + STIX Two Math engine (`assets/mathjax-stix2.js?url`, ~3 MB) —
  *     inlined it turned the opt-in `math.mjs` chunk into a 4.1 MB base64 blob,
  *     even though consumers only import it when a document actually has equations.
- *
- * All of these are `?url` imports in a single owner module each (the format
- * main-thread handles — `document.ts` / `presentation.ts` / `workbook.ts` — and
- * `math/engine.ts`). We intercept the `?url` variant here, `emitFile` the bytes
+ * The parser and math assets use plain `?url` imports in their owner modules
+ * (the format main-thread handles and `math/engine.ts`). We intercept those
+ * imports here, `emitFile` the bytes
  * as an asset next to the chunk, and hand back the standard ESM asset reference
  * `new URL('<name>', import.meta.url)` — the form Vite / webpack 5 / Rollup /
  * Turbopack rewrite when they re-bundle our `.mjs`, and which resolves
@@ -40,7 +42,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * bare `.wasm`, and every `?url` here is a real on-disk asset we want emitted —
  * exactly what Vite's non-lib mode would do anyway.
  */
-export function wasmAssetUrl(): Plugin {
+export function wasmAssetUrl(
+  readAsset: (path: string) => Promise<Uint8Array> = readFile,
+  modulePlugins: Plugin[] = [],
+): Plugin {
   const SUFFIX = '?url';
   return {
     name: 'wasm-asset-url',
@@ -53,10 +58,18 @@ export function wasmAssetUrl(): Plugin {
     async load(id) {
       if (!id.endsWith(SUFFIX)) return null;
       const filePath = id.slice(0, -SUFFIX.length);
-      const source = await readFile(filePath);
+      // A `?url` import of a TypeScript module names a self-contained ES
+      // module asset (an application-loaded model source module, see
+      // packages/legacy-office/src/legacy-*.ts). It is bundled on its own,
+      // with every dependency inlined and its exports preserved, because the
+      // realm that imports it by URL cannot resolve sibling chunks.
+      const moduleAsset = /\.[cm]?ts$/.test(filePath);
+      const source = moduleAsset
+        ? await bundleSelfContainedModule(filePath, modulePlugins)
+        : await readAsset(filePath);
       const referenceId = this.emitFile({
         type: 'asset',
-        name: basename(filePath),
+        name: moduleAsset ? basename(filePath).replace(/\.[cm]?ts$/, '.mjs') : basename(filePath),
         source,
       });
       // `import.meta.ROLLUP_FILE_URL_<id>` expands at render time to Rollup's
@@ -71,22 +84,126 @@ export function wasmAssetUrl(): Plugin {
       // Turbopack / Vite statically rewrite when re-bundling our `.mjs`.
       return `export default import.meta.ROLLUP_FILE_URL_${referenceId};`;
     },
+    renderChunk(code, _chunk, output) {
+      if (output.format !== 'cjs') return null;
+      // Oxc lowers `import.meta` to `{}` before Rolldown resolves emitted
+      // asset URLs for CJS. Restore the Node entry's own file URL for static
+      // sidecars; otherwise importing the CJS package throws immediately.
+      const restored = code.replace(
+        /new URL\((["'`])([^"'`]+\.(?:wasm|ttf|mjs))\1,\s*\{\}\.url\)\.href/g,
+        (_match, _quote, file) =>
+          `new URL(${JSON.stringify(file)}, require('node:url').pathToFileURL(__filename)).href`,
+      );
+      return restored === code ? null : { code: restored, map: null };
+    },
   };
 }
 
+/** Resolve the emitted chunk graph, including aliases, before publishing. */
+export function legacyBundleBoundary(): Plugin {
+  return {
+    name: 'legacy-bundle-boundary',
+    generateBundle(_options, bundle) {
+      // Every root entry and worker must stay independent of the companion.
+      // Follow static and dynamic edges so a relay outside the guarded
+      // source roots cannot hide a reader in a shared chunk.
+      const entries = Object.values(bundle).filter((output) =>
+        output.type === 'chunk' && output.isEntry
+        && !output.fileName.startsWith('.types-work/'));
+      const visited = new Set<string>();
+      const pending = [...entries];
+      while (pending.length > 0) {
+        const output = pending.pop()!;
+        if (output.type !== 'chunk') continue;
+        if (visited.has(output.fileName)) continue;
+        visited.add(output.fileName);
+        for (const moduleId of Object.keys(output.modules)) {
+          if (/(?:^|[\\/])packages[\\/]legacy-office(?:[\\/]|$)/.test(moduleId)
+            || /@silurus\/ooxml-legacy-office/.test(moduleId)) {
+            this.error(`${output.fileName} contains forbidden legacy module ${moduleId}`);
+          }
+        }
+        for (const imported of [...output.imports, ...(output.dynamicImports ?? [])]) {
+          const child = bundle[imported];
+          if (child?.type === 'chunk') pending.push(child);
+        }
+      }
+    },
+  };
+}
+
+/** The installed viewer owns layout, selected-source sidecars and transport.
+ * Check retained modules after tree shaking: importing stateless WASM guards
+ * through core's worker barrel must not count its unused transport exports.
+ * Apply this to opaque source-module builds too; the outer build sees only
+ * their emitted asset bytes, not their dependency graphs. */
+export function companionBundleBoundary(): Plugin {
+  return {
+    name: 'companion-bundle-boundary',
+    generateBundle(_options, bundle) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== 'chunk') continue;
+        for (const [id, module] of Object.entries(output.modules)) {
+          if (module.renderedLength === 0) continue;
+          const path = id.replaceAll('\\', '/');
+          if (/\/packages\/(?:docx|xlsx|pptx|node)\/src\//.test(path)
+            || /\/packages\/core\/src\/source\/model-source\.ts$/.test(path)
+            || (/\/packages\/core\/src\/worker\//.test(path)
+              && !/\/(?:index|wasm-guard)\.ts$/.test(path))) {
+            this.error(`${output.fileName} contains viewer-owned runtime ${id}`);
+          }
+        }
+      }
+    },
+  };
+}
+
+/** Bundle one ES module with all of its imports inlined and its exports kept. */
+async function bundleSelfContainedModule(entry: string, plugins: Plugin[]): Promise<string> {
+  const bundle = await rolldown({
+    input: entry,
+    plugins: [docxCompatibilityMetadata(), ...plugins],
+    platform: 'neutral',
+    resolve: {
+      alias: {
+        '@silurus/ooxml-core/worker': resolve(__dirname, 'packages/core/src/worker/index.ts'),
+        '@silurus/ooxml-core/internal/model-source': resolve(__dirname, 'packages/core/src/source/model-source.ts'),
+        '@silurus/ooxml-core': resolve(__dirname, 'packages/core/src/index.ts'),
+      },
+      extensionAlias: { '.js': ['.ts', '.js'] },
+    },
+    preserveEntrySignatures: 'strict',
+  });
+  try {
+    const { output } = await bundle.generate({ format: 'es', codeSplitting: false, minify: true });
+    if (output.length !== 1 || output[0].type !== 'chunk') {
+      throw new Error(`${basename(entry)} did not bundle into one self-contained module`);
+    }
+    return output[0].code;
+  } finally {
+    await bundle.close();
+  }
+}
+
 export default defineConfig(({ command, mode }) => ({
+  // The private comparison build removes selected-source dispatch and code
+  // reachable only through it. Published and dev builds always use true.
+  define: { __OOXML_MODEL_SOURCES__: mode === 'model-sources-off' ? 'false' : 'true' },
   // Published library assets must resolve from the imported module URL, not
   // from the hosting page's origin root. This is especially important for the
   // standalone module workers and sibling assets when consumers serve the
   // package below a subpath or from a CDN.
   base: './',
   plugins: [
+    docxCompatibilityMetadata(),
+    optionalRendererMarkers(),
     wasmAssetUrl(),
     wasm(),
+    legacyBundleBoundary(),
     // Storybook loads the root Vite config in serve mode. The declaration
     // plugins are build-only: their Rolldown buildStart hooks expect library
     // inputs and fail against Storybook's dev-server graph.
-    ...(command === 'build' && mode !== 'runtime'
+    ...(command === 'build' && mode !== 'runtime' && mode !== 'model-sources-off'
       ? dts({
           // TypeScript 7 is the repository's sole compiler. Its native tsgo
           // declaration generator avoids the removed JavaScript Compiler API.
@@ -102,6 +219,8 @@ export default defineConfig(({ command, mode }) => ({
   },
   build: {
     lib: {
+      // Keep both comparison builds on the same entry set: changing the set
+      // would also change shared-chunk factoring and distort the byte delta.
       entry: {
         index: resolve(__dirname, 'src/index.ts'),
         pptx:  resolve(__dirname, 'src/pptx.ts'),
@@ -121,6 +240,7 @@ export default defineConfig(({ command, mode }) => ({
         // Opt-in TIFF 6.0 software decoder. Native raster users retain only the
         // lightweight codec contract and header guard.
         tiff: resolve(__dirname, 'src/tiff.ts'),
+        'internal-companion': resolve(__dirname, 'src/internal-companion.ts'),
         // Node-only bounded sessions and server render helpers. Kept as a
         // separate entry so browser consumers never load Node built-ins.
         node:  resolve(__dirname, 'src/node.ts'),
@@ -136,6 +256,9 @@ export default defineConfig(({ command, mode }) => ({
           : `${name}.mjs`,
     },
     rollupOptions: {
+      // Keep consumer PURE annotations; omit only per-module debug regions.
+      // The boundary checks retain their explicit ownership markers instead.
+      experimental: { attachDebugInfo: 'none' },
       external: [/^node:/, 'skia-canvas'],
       output: {
         assetFileNames: '[name][extname]',
@@ -152,8 +275,9 @@ export default defineConfig(({ command, mode }) => ({
     // Built-in worker renderers lazy-import the same optional math engine. Keep
     // its ~3 MB `?url` asset external in nested worker builds too; otherwise
     // library mode base64-inlines one copy into every format worker chunk.
-    plugins: () => [wasmAssetUrl(), wasm()],
+    plugins: () => [docxCompatibilityMetadata(), wasmAssetUrl(), wasm(), legacyBundleBoundary()],
     rollupOptions: {
+      experimental: { attachDebugInfo: 'none' },
       output: {
         assetFileNames: '[name][extname]',
         // The published format entry is commonly re-bundled by a consumer.

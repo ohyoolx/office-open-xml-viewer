@@ -17,6 +17,7 @@ import type {
   TableLayoutInput,
   TableRowLayoutInput,
 } from './types.js';
+import { gapParagraph } from '../test-support/gap-paragraph.test-support.js';
 import { layoutParagraph } from './paragraph.js';
 import { validateFloatingTableRegistryDelta } from './floating-table-transaction.js';
 
@@ -235,6 +236,26 @@ describe('retained table pagination', () => {
     vi.restoreAllMocks();
   });
 
+  it('splits a cell only after every gap of its admitted physical line', () => {
+    const p = gapParagraph().paragraph;
+    const result = take(acquisition([row(0, 30, { paragraph: p })]), 10);
+    const cell = result.fragment?.rows[0]?.cells[0];
+    expect(cell?.contentRanges).toEqual([{ kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 1 }]);
+    const retained = cell?.blocks[0]?.layout;
+    if (retained?.kind !== 'paragraph') throw new Error('missing cell paragraph');
+    expect(retained.lines[0]?.placements).toHaveLength(2);
+    expect(retained.advancePt).toBe(10);
+  });
+
+  it('applies cell widow control to physical lines rather than gap count', () => {
+    const p = gapParagraph().paragraph;
+    const original = row(0, 30, { paragraph: p });
+    const source = acquisition([{ ...original, cells: [{ ...original.cells[0]!,
+      blocks: [{ layout: p, sourceBlockIndex: 0, widowControl: true }],
+    }] }]);
+    expect(take(source, 20, startTableFragmentCursor(), { freshPageHeightPt: 30 }).requiresFreshPage).toBe(true);
+  });
+
   it('charges a completed partial row from a bounded row window, not the whole suffix', () => {
     const original = tableModule.layoutTable;
     const completedPartialRowCounts: number[] = [];
@@ -350,6 +371,21 @@ describe('retained table pagination', () => {
       // The column-0 interval ends at row 1, but the column-1 interval opening
       // at row 1 reaches row 3, so the window must extend to row 3.
       expect(completedPartialRowWindowEnd(rows[0]!, rows, 0)).toBe(3);
+    });
+
+    it('covers the interval a projected segment-opening continuation opens', () => {
+      // A cell-owner segment whose first own row (logical row 1) opens with a
+      // continuation: in the window's grid it is a projected empty owner
+      // (table.ts projectedMergeRole) reaching the continuations below it.
+      const rows = [
+        mergedRow(1, [mergedCell(1, 0, 'none'), mergedCell(1, 1, 'continue')]),
+        mergedRow(2, [mergedCell(2, 0, 'none'), mergedCell(2, 1, 'continue')]),
+        mergedRow(3, [mergedCell(3, 0, 'none'), mergedCell(3, 1, 'continue')]),
+        mergedRow(4, [mergedCell(4, 0, 'none'), mergedCell(4, 1, 'none')]),
+      ];
+      expect(completedPartialRowWindowEnd(rows[0]!, rows, 0, 1)).toBe(2);
+      // Without the projection fact the same continuations open nothing.
+      expect(completedPartialRowWindowEnd(rows[0]!, rows, 0)).toBe(0);
     });
   });
 
@@ -1026,6 +1062,127 @@ describe('retained table pagination', () => {
     expect(result.nextCursor).toEqual(cursor);
   });
 
+  it('defers a split row when its cell-owned anchor would paint beyond the page', () => {
+    const first = paragraph('anchored', [20]);
+    const anchored = layoutParagraph({
+      ...first,
+      lines: first.lines.map((line) => ({
+        ...line,
+        placements: [...line.placements, {
+          kind: 'drawing' as const,
+          range: line.range,
+          drawingId: 'cell-owned-anchor',
+          bounds: { xPt: 0, yPt: 10, widthPt: 20, heightPt: 70 },
+          advancePt: 0,
+        }],
+      })),
+      drawings: [{
+        kind: 'drawing', id: 'cell-owned-anchor', source: first.source,
+        flowDomainId: first.flowDomainId, ordinaryFlow: false,
+        flowBounds: { xPt: 0, yPt: 10, widthPt: 20, heightPt: 70 },
+        inkBounds: { xPt: 0, yPt: 10, widthPt: 20, heightPt: 70 },
+        advancePt: 0, commands: [],
+        anchorLayer: {
+          occurrenceId: 'cell-owned-anchor', behindDoc: false,
+          relativeHeight: 1, sourceOrder: 0,
+          horizontalOwnership: 'host', verticalOwnership: 'host',
+          layoutInCell: true,
+        },
+      }],
+    });
+    const base = row(0, 49, { heightRule: 'atLeast', paragraph: anchored });
+    const source = acquisition([{
+      ...base,
+      cells: [{
+        ...base.cells[0]!,
+        blocks: [anchored, paragraph('trailing-1', [20]), paragraph('trailing-2', [20]),
+          paragraph('trailing-3', [20]), paragraph('trailing-4', [20])]
+          .map((layout, sourceBlockIndex) => ({
+            layout, sourceBlockIndex,
+          })),
+      }],
+    }]);
+
+    const constrained = take(source, 60, startTableFragmentCursor(), {
+      freshPageHeightPt: 150,
+    });
+    expect(constrained.fragment).toBeNull();
+    expect(constrained.requiresFreshPage).toBe(true);
+
+    const stillVisible = take(source, 90, startTableFragmentCursor(), {
+      freshPageHeightPt: 150,
+    });
+    expect(stillVisible.fragment?.rows[0]?.fragmentIndex).toBe(0);
+    expect(stillVisible.nextCursor?.rowFragmentIndex).toBe(1);
+
+    const fresh = take(source, 150, startTableFragmentCursor(), {
+      freshPageHeightPt: 150,
+    });
+    expect(fresh.fragment?.rows).toHaveLength(1);
+    expect(fresh.nextCursor).toBeNull();
+
+    const preceding = row(0, 20);
+    const following = { ...base, logicalRowIndex: 1, cells: source.input.rows[0]!.cells };
+    const withPrecedingRow = acquisition([preceding, following]);
+    const cut = take(withPrecedingRow, 80, startTableFragmentCursor(), {
+      freshPageHeightPt: 150,
+    });
+    expect(cut.fragment?.rows.map((item) => item.logicalRowIndex)).toEqual([0]);
+    expect(cut.nextCursor?.rowIndex).toBe(1);
+    expect(cut.nextCursor?.rowFragmentIndex).toBe(0);
+  });
+
+  it('keeps a table-cell paragraph widow off the next page', () => {
+    const original = row(0, 30, { paragraph: paragraph('cell-widow', [10, 10, 10]) });
+    const source = acquisition([{
+      ...original,
+      cells: [{
+        ...original.cells[0]!,
+        blocks: [{
+          layout: original.cells[0]!.blocks[0]!.layout,
+          sourceBlockIndex: 0,
+          widowControl: true,
+        }],
+      }],
+    }]);
+
+    const result = take(source, 20, startTableFragmentCursor(), {
+      freshPageHeightPt: 30,
+    });
+
+    expect(result.fragment).toBeNull();
+    expect(result.requiresFreshPage).toBe(true);
+  });
+
+  it('moves a keepLines cell paragraph while allowing an ordinary row to split', () => {
+    const original = row(0, 30, { paragraph: paragraph('cell-lines', [10, 10, 10]) });
+    const withPolicy = (keepLines: boolean) => acquisition([{
+      ...original,
+      cells: [{
+        ...original.cells[0]!,
+        blocks: [{
+          layout: original.cells[0]!.blocks[0]!.layout,
+          sourceBlockIndex: 0,
+          keepLines,
+          widowControl: false,
+        }],
+      }],
+    }]);
+
+    const kept = take(withPolicy(true), 20, startTableFragmentCursor(), {
+      freshPageHeightPt: 30,
+    });
+    const ordinary = take(withPolicy(false), 20, startTableFragmentCursor(), {
+      freshPageHeightPt: 30,
+    });
+
+    expect(kept.requiresFreshPage).toBe(true);
+    expect(kept.fragment).toBeNull();
+    expect(ordinary.fragment?.rows[0]?.cells[0]?.contentRanges).toEqual([
+      { kind: 'paragraph', blockIndex: 0, lineStart: 0, lineEnd: 2 },
+    ]);
+  });
+
   it('moves a fully retained exact-height row instead of discarding its authored box', () => {
     const source = acquisition([row(0, 90, {
       heightRule: 'exact',
@@ -1172,6 +1329,7 @@ describe('retained table pagination', () => {
     expect(result.fragment?.advancePt).toBe(100);
     expect(result.fragment?.flowBounds.heightPt).toBe(100);
     expect(result.fragment?.clipBounds?.heightPt).toBe(100);
+    expect(result.fragment?.unpaintedOverflowPt).toBe(20);
     expect(result.nextCursor).toBeNull();
   });
 

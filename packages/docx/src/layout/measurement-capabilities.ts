@@ -1,3 +1,5 @@
+import type { WritingMode } from './types.js';
+
 /** Canvas capabilities that retained layout may use synchronously.
  *
  * Vertical OpenType feature probing is deliberately excluded: it needs the
@@ -23,9 +25,15 @@ export interface VerticalGlyphMeasurementService {
     fontKerning: CanvasFontKerning;
     fontSizePt: number;
     letterSpacingPt: number;
+    /** Per-scalar grid/fit contribution, independent of run tracking. */
+    characterGridDeltaPt?: number;
     charScale: number;
     growTrRotateInk: boolean;
-    writingMode: 'horizontal-tb' | 'vertical-rl' | 'vertical-lr';
+    writingMode: WritingMode;
+    /** Punctuation compression and width balance of a source range, floored
+     * with the cell (WORD_CONDENSED_SPACING_ADVANCE_FLOOR); when supplied,
+     * reported advances include it. */
+    characterAdjustmentPt?: (start: number, end: number) => number;
   }>): readonly Readonly<{
     range: Readonly<{ start: number; end: number }>;
     text: string;
@@ -35,5 +43,7 @@ export interface VerticalGlyphMeasurementService {
     drawOffsetPt: Readonly<{ xPt: number; yPt: number }>;
     verticalFeature: boolean;
     blockAxisInkBounds?: Readonly<{ startPt: number; endPt: number }>;
+    floored?: true;
+    naturalAdvancePt?: number;
   }>[];
 }

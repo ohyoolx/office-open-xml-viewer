@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+} from './internal/worksheet-policy.js';
+import { bindWorksheetPolicy, getWorksheetPolicy } from './worksheet-policy-context.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyAutoRowHeights,
+  bindXlsxOfficeFontRoutes,
   getGridGeometryForWorksheet,
   invalidateAutoRowHeights,
   markAutoRowHeightsPrepared,
@@ -8,7 +14,10 @@ import {
 } from './renderer.js';
 import { worksheetWithAutoRowHeights } from './render-orchestrator.js';
 import { GridGeometry } from './internal/grid-geometry.js';
+import { setRowResizeRanges } from './internal/row-resize-overrides.js';
 import type { CellFont, CellXf, Styles, Worksheet } from './types.js';
+
+afterEach(() => vi.unstubAllGlobals());
 
 function measurementContext(): CanvasRenderingContext2D {
   let font = '15px sans-serif';
@@ -134,6 +143,55 @@ function worksheet(): Worksheet {
 }
 
 describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', () => {
+  it.each(['projection', 'prepared'] as const)('keeps %s fitting on the worksheet language snapshot', (mode) => {
+    const ws = worksheet();
+    ws.themeJapaneseMinorFont = 'Meiryo';
+    const themedStyles: Styles = {
+      ...styles,
+      fonts: styles.fonts.map((font) => ({ ...font, scheme: 'minor' })),
+    };
+    const ctx = measurementContext();
+    ctx.measureText = (text: string) => ({
+      width: [...text].length * (ctx.font.includes('"Meiryo"') ? 14 : 7),
+    }) as TextMetrics;
+    const fit = (sheet: Worksheet): Worksheet => {
+      bindXlsxOfficeFontRoutes(ctx, sheet);
+      if (mode === 'projection') return worksheetWithAutoRowHeights(ctx, sheet, themedStyles);
+      applyAutoRowHeights(ctx, sheet, themedStyles);
+      return sheet;
+    };
+    vi.stubGlobal('navigator', { language: 'en-US' });
+    const english = fit(ws);
+    const englishHeight = english.rowHeights[1];
+    for (const language of ['ja-JP', 'en-US']) {
+      vi.stubGlobal('navigator', { language });
+      expect(fit(ws)).toBe(english);
+      expect(fit(ws).rowHeights[1]).toBe(englishHeight);
+    }
+    vi.stubGlobal('navigator', { language: 'ja-JP' });
+    const fresh = worksheet();
+    fresh.themeJapaneseMinorFont = ws.themeJapaneseMinorFont;
+    expect(fit(fresh).rowHeights[1]).toBeGreaterThan(englishHeight);
+    // A real size invalidation must still measure with the original language.
+    invalidateAutoRowHeights(english);
+    expect(fit(english).rowHeights[1]).toBe(englishHeight);
+    expect(english.rowHeights[2]).toBe(15);
+  });
+
+  it('preserves compact manual row dimensions through auto-height clones and column refits', () => {
+    const ws = worksheet();
+    setRowResizeRanges(ws, [{ first: 1, last: 1048576, height: 63 }]);
+    const projection = worksheetWithAutoRowHeights(measurementContext(), ws, styles);
+    expect(getGridGeometryForWorksheet(projection).row.sizeOf(1)).toBe(84);
+    expect(getGridGeometryForWorksheet(projection).row.sizeOf(1048576)).toBe(84);
+    expect(ws.rowHeights).toEqual({ 2: 15 });
+    invalidateAutoRowHeights(projection);
+    projection.colWidths[1] = 30;
+    GridGeometry.invalidate(projection);
+    applyAutoRowHeights(measurementContext(), projection, styles);
+    expect(getGridGeometryForWorksheet(projection).row.sizeOf(1)).toBe(84);
+    expect(projection.rowHeights).toEqual({ 2: 15 });
+  });
   it('fits wrapped, rich, large, and rotated text while preserving explicit and merged rows', () => {
     const ws = worksheet();
     expect(applyAutoRowHeights(measurementContext(), ws, styles)).toBe(true);
@@ -223,6 +281,25 @@ describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', (
     expect(applyAutoRowHeights(measured.ctx, ws, styles)).toBe(false);
     expect(ws.rowHeights).toEqual({});
     expect(measured.count()).toBe(0);
+  });
+
+  it('gates automatic rows on the Normal font, not the larger default font', () => {
+    // <fonts>[0] (column MDW) is 20pt while the Normal style is 11pt: a 20pt
+    // cell still exceeds the Normal line box and must be measured.
+    const ws = worksheet();
+    ws.defaultFontFamily = 'Calibri';
+    ws.defaultFontSize = 20;
+    ws.normalFontSize = 11;
+    ws.rows = [{
+      index: 1,
+      height: null,
+      cells: [{ row: 1, col: 1, styleIndex: 2, value: { type: 'text', text: 'large' } }],
+    }];
+    ws.rowHeights = {};
+    ws.mergeCells = [];
+
+    expect(applyAutoRowHeights(measurementContext(), ws, styles)).toBe(true);
+    expect(ws.rowHeights[1]).toBeGreaterThan(ws.defaultRowHeight);
   });
 
   it('uses the tallest rich run for an unwrapped automatic row', () => {
@@ -322,6 +399,28 @@ describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', (
     expect(withIcon.rowHeights[1]).toBeGreaterThan(base.rowHeights[1] ?? base.defaultRowHeight);
   });
 
+  it('measures a wrapped General boolean with the inset paint uses', () => {
+    // General centres booleans (§18.18.40); like paint, measurement keeps the
+    // General indent inset, so an indented TRUE in a narrow wrapping column
+    // fits exactly as the same General text does.
+    const general = (value: Worksheet['rows'][number]['cells'][number]['value']): Worksheet => ({
+      ...worksheet(),
+      rows: [{ index: 1, height: null, cells: [{ row: 1, col: 1, styleIndex: 0, value }] }],
+      colWidths: { 1: 1.5 },
+      rowHeights: {},
+      mergeCells: [],
+    });
+    const generalStyles: Styles = {
+      ...styles,
+      cellXfs: [{ ...xf(0, { wrapText: true, indent: 1 }), alignH: null }],
+    };
+    const bool = general({ type: 'bool', bool: true });
+    const text = general({ type: 'text', text: 'TRUE' });
+    applyAutoRowHeights(measurementContext(), bool, generalStyles);
+    applyAutoRowHeights(measurementContext(), text, generalStyles);
+    expect(bool.rowHeights[1]).toBe(text.rowHeights[1]);
+  });
+
   it('preserves the caller-authoritative MDW on a render-local auto-height projection', () => {
     const source = worksheet();
     source.rowHeights = {};
@@ -381,4 +480,18 @@ describe('XLSX automatic row height (ECMA-376 §18.3.1.73 / Office auto-fit)', (
     expect(rendered.rowHeights[1]).toBe(30);
     expect(measured.count()).toBe(0);
   });
+});
+
+it('does not reuse a render-local autoheight projection under an older worksheet policy', () => {
+  const source = worksheet();
+  source.mergeCells = [];
+  const raised = normalizeXlsxWorksheetPolicy({ xlsxWorksheetLimits: { maxCells: 300_000 } });
+  bindWorksheetPolicy(source, raised);
+  const ctx = measurementContext();
+  const first = worksheetWithAutoRowHeights(ctx, source, styles);
+  expect(getWorksheetPolicy(first)).toBe(raised);
+  expect(worksheetWithAutoRowHeights(ctx, source, styles)).toBe(first);
+  bindWorksheetPolicy(source, DEFAULT_XLSX_WORKSHEET_POLICY);
+  const lowered = worksheetWithAutoRowHeights(ctx, source, styles);
+  expect(getWorksheetPolicy(lowered)).toBe(DEFAULT_XLSX_WORKSHEET_POLICY);
 });

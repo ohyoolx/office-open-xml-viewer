@@ -60,6 +60,11 @@ describe('formatChartValWithCode — percent & null', () => {
 });
 
 describe('chart date1904 (c:date1904 §21.2.2.38 / §18.17.4.1)', () => {
+  it('shares fractional-second carry with worksheet cells in either date system', () => {
+    expect(formatChartValWithCode(59.96 / 86400, 'mm:ss.0')).toBe('01:00.0');
+    expect(formatCategoryLabel(String(59.96 / 86400), 'mm:ss.0', true)).toBe('01:00.0');
+  });
+
   it('localizes worksheet built-in short-date format 14', () => {
     expect(formatLocalizedExcelShortDate(45_658, false, 'ja-JP')).toBe('2025/1/1');
     expect(formatLocalizedExcelShortDate(45_658, false, 'en-US')).toBe('1/1/2025');
@@ -79,6 +84,28 @@ describe('chart date1904 (c:date1904 §21.2.2.38 / §18.17.4.1)', () => {
   });
   it('date1904 does not affect non-date (numeric) codes', () => {
     expect(formatChartValWithCode(1234567, '#,##0', true)).toBe('1,234,567');
+  });
+});
+
+describe('chart time fields (§18.17.4.2 time fraction)', () => {
+  it('rounds the stored fraction to the millisecond instead of truncating', () => {
+    // 8:00 is stored a hair under 28 800 000 ms.
+    expect(formatChartValWithCode(45292.33333333333, 'hh:mm')).toBe('08:00');
+    expect(formatChartValWithCode(0.33333333333333331, 'h:mm:ss')).toBe('8:00:00');
+  });
+  it('keeps minutes after an escaped time separator', () => {
+    expect(formatChartValWithCode(45292.34375, 'h\\:mm')).toBe('8:15');
+  });
+  it('reads a negative elapsed duration from one absolute duration', () => {
+    expect(formatChartValWithCode(-1.5104166666666667, '[h]:mm', true)).toBe('-36:15');
+  });
+  it('treats an era-only code as a date', () => {
+    expect(formatCategoryLabel('45292', '[$-411]ggge')).toBe('令和6');
+  });
+  it('carries a rounded midnight into the next day', () => {
+    // 1 ms short of 2024-01-02 00:00 rounds up to it.
+    const serial = 45293 - 0.4 / 86_400_000;
+    expect(formatChartValWithCode(serial, 'yyyy-mm-dd hh:mm')).toBe('2024-01-02 00:00');
   });
 });
 
@@ -115,5 +142,25 @@ describe('formatCategoryLabel — category-axis numFmt (§21.2.2.71)', () => {
     expect(formatCategoryLabel('45658', 'mmm\\-yy')).toBe('Jan-25');
     expect(formatCategoryLabel('45658', 'mmmm yyyy')).toBe('January 2025');
     expect(formatCategoryLabel('45658', 'mm/dd/yy')).toBe('01/01/25');
+  });
+});
+
+
+describe('shared date formatting range (#1710)', () => {
+  it('marks invalid calendar and clock serials without throwing in charts or format 14', () => {
+    expect(formatLocalizedExcelShortDate(12345678901, false, 'en-US')).toBe('#');
+    expect(formatChartValWithCode(12345678901, 'd-mmm-yy')).toBe('#');
+    expect(formatChartValWithCode(-1, 'h:mm:ss')).toBe('#');
+    expect(formatChartValWithCode(2957004, 'yyyy-mm-dd', true)).toBe('#');
+  });
+  it('preserves elapsed durations but rejects invalid calendar fields mixed with them', () => {
+    expect(formatChartValWithCode(-1.5104166666666667, '[h]:mm')).toBe('-36:15');
+    expect(formatChartValWithCode(12345678901, '[h]:mm')).toBe('296296293624:00');
+    expect(formatChartValWithCode(12345678901, '[h] yyyy')).toBe('#');
+    expect(formatChartValWithCode(12345678901, '[h] "yyyy"')).toBe('296296293624 yyyy');
+    expect(formatChartValWithCode(Infinity, '[h]:mm')).toBe('#');
+  });
+  it('keeps the last millisecond on the final day when binary rounding reaches midnight', () => {
+    expect(formatChartValWithCode(2958466 - 0.4 / 86400000, 'yyyy-mm-dd h:mm:ss')).toBe('9999-12-31 23:59:59');
   });
 });

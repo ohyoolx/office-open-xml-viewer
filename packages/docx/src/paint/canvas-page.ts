@@ -47,10 +47,11 @@ export function createCanvasPaintResourcePainter(
       kind: PaintResourceKind,
       bounds: LayoutRect,
       ctx: PaintCanvas2D,
+      coverageBounds?: LayoutRect,
     ): void {
       switch (kind) {
         case 'image':
-          handlers.image(session.resolve(resourceKey, kind), bounds, ctx);
+          handlers.image(session.resolve(resourceKey, kind), bounds, ctx, coverageBounds);
           return;
         case 'chart':
           handlers.chart(session.resolve(resourceKey, kind), bounds, ctx);
@@ -82,22 +83,29 @@ function paintNode(node: PaintNode, context: CanvasPaintContext): void {
       paintTableLayout(node, context, node.resolvedFloatingTables ?? []);
       return;
     case 'note': {
+      // A note paints either its scalar library rule or its native leading
+      // occurrence (paragraph decorations, then the control's rule ink); the
+      // occurrences are outside the story clip like the scalar rule.
       node.separator.forEach((segment) => paintStrokeSegment(segment, context));
+      if (node.leading?.paragraph) paintNode(node.leading.paragraph, context);
+      if (node.leading?.rule) paintStrokeSegment(node.leading.rule.segment, context);
       const paintStory = () => node.story.blocks.forEach((block) => paintNode(block, context));
       if (!node.story.clipBounds) {
         paintStory();
-        return;
+      } else {
+        const clip = node.story.clipBounds;
+        context.ctx.save();
+        try {
+          context.ctx.beginPath();
+          context.ctx.rect(clip.xPt, clip.yPt, clip.widthPt, clip.heightPt);
+          context.ctx.clip();
+          paintStory();
+        } finally {
+          context.ctx.restore();
+        }
       }
-      const clip = node.story.clipBounds;
-      context.ctx.save();
-      try {
-        context.ctx.beginPath();
-        context.ctx.rect(clip.xPt, clip.yPt, clip.widthPt, clip.heightPt);
-        context.ctx.clip();
-        paintStory();
-      } finally {
-        context.ctx.restore();
-      }
+      if (node.trailing?.paragraph) paintNode(node.trailing.paragraph, context);
+      if (node.trailing?.rule) paintStrokeSegment(node.trailing.rule.segment, context);
       return;
     }
     case 'textbox':
@@ -225,8 +233,7 @@ function paintDrawingEntry(
   }
 }
 
-/** Paint a completed page into an already initialized point-space surface. */
-export function paintLayoutPageContent(
+function paintPageContents(
   page: LayoutPage,
   context: CanvasPaintContext,
 ): void {
@@ -288,6 +295,22 @@ export function paintLayoutPageContent(
   if (page.pageBorder?.zOrder !== 'back' && page.pageBorder) {
     paintPageBorderLayout(page.pageBorder, context);
   }
+}
+
+/** Paint a completed page into an already initialized point-space surface. */
+export function paintLayoutPageContent(
+  page: LayoutPage,
+  context: CanvasPaintContext,
+): void {
+  // word-drawingml-pattern-page-grid: capture the page frame before
+  // region, anchor, or shape transforms so the 8pt tile keeps page axes and
+  // phase. Only DrawingML shapes consume this frame; chart and VML hosts keep
+  // their separate fill-coordinate policies.
+  const canvas = context.ctx as CanvasRenderingContext2D;
+  const pageToDevice = canvas.getTransform?.() ?? {
+    a: context.scale * context.dpr, d: context.scale * context.dpr,
+  };
+  paintPageContents(page, { ...context, patternPageToDevice: pageToDevice });
 }
 
 export async function paintLayoutPage(

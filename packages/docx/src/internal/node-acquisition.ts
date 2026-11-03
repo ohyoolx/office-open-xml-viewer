@@ -1,15 +1,16 @@
+import { normalizeDocxParserError } from './parser-errors.js';
 import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   normalizeLoadResourceOptions,
   OoxmlResourceMetricsSession,
-  parseResourceLimitError,
+  parseTypedParserError,
   resourcePolicyForWasm,
   type PullSessionCommand,
   type PullSessionResponse,
 } from '@silurus/ooxml-core/worker';
 import { InProcessPullTransport } from '@silurus/ooxml-core/internal/in-process-pull-transport';
 import {
-  WasmRuntimeGenerationHost,
+  wasmRuntimeSingleton,
   type WasmArchiveHandle,
   type WasmModuleRuntime,
 } from '@silurus/ooxml-core/internal/wasm-runtime-generation';
@@ -20,6 +21,9 @@ import {
 } from '../document-pull-worker.js';
 // @ts-ignore wasm-pack generated module has no declaration entry
 import * as docxWasm from '../wasm/docx_parser.js';
+import { createAbortError, throwIfAborted } from '@silurus/ooxml-core/internal/abort';
+
+const ABORT_MESSAGE = 'DOCX document session was aborted';
 
 export interface DocxNodeAcquisitionOptions {
   readonly resourceLimits?: import('@silurus/ooxml-core').OoxmlResourceLimits;
@@ -32,9 +36,21 @@ export interface DocxNodeAcquisitionOptions {
 export interface DocxNodeArchive extends DocxDocumentCursorArchive {
   free(): void;
   extract_image(path: string): Uint8Array;
-  document_cursor_resource_usage(): Uint8Array;
+  /** `undefined` when the package has no document-cursor checkpoint. */
+  document_cursor_resource_usage(): Uint8Array | undefined;
   resource_usage(): Uint8Array;
 }
+
+/**
+ * The archive a Node DOCX session reads after acquisition: the DOCX parser
+ * archive, or a model-source archive whose ZIP accounting is optional.
+ */
+export interface DocxNodeSessionArchive extends DocxDocumentCursorArchive {
+  extract_image(path: string): Uint8Array;
+  /** Absent when the source has no ZIP accounting; absence is not zero usage. */
+  resource_usage?(): Uint8Array;
+}
+
 
 interface DocxArchiveConstructor {
   new (
@@ -45,21 +61,10 @@ interface DocxArchiveConstructor {
   ): DocxNodeArchive;
 }
 
-let runtimeModule: WebAssembly.Module | undefined;
-let runtimeHost: WasmRuntimeGenerationHost<DocxNodeArchive> | undefined;
-
-function formatRuntime(module: WebAssembly.Module): WasmRuntimeGenerationHost<DocxNodeArchive> {
-  if (!runtimeHost) {
-    runtimeModule = module;
-    runtimeHost = new WasmRuntimeGenerationHost(
-      docxWasm as unknown as WasmModuleRuntime,
-      module,
-    );
-  } else if (runtimeModule !== module) {
-    throw new Error('DOCX runtime was already initialized with another WebAssembly.Module');
-  }
-  return runtimeHost;
-}
+const formatRuntime = wasmRuntimeSingleton<DocxNodeArchive>(
+  docxWasm as unknown as WasmModuleRuntime,
+  'DOCX',
+);
 
 export type DocxNodePullIdentity = Readonly<{
   sessionId: number;
@@ -75,7 +80,7 @@ export type DocxNodePullOptions = Readonly<{
 }>;
 
 export interface AcquiredDocxNodeDocument<TResult> {
-  readonly archive: DocxNodeArchive;
+  readonly archive: DocxNodeSessionArchive;
   readonly result: TResult;
   readonly usage: OoxmlResourceUsageSnapshot | undefined;
   readonly metrics: OoxmlResourceMetricsSession;
@@ -85,7 +90,7 @@ export interface AcquiredDocxNodeDocument<TResult> {
 /** Format-owned DOCX archive, cursor transport, accounting, and cleanup. */
 export async function acquireDocxNodeDocument<TResult>(
   bytes: Uint8Array,
-  module: WebAssembly.Module,
+  wasmModule: WebAssembly.Module,
   options: DocxNodeAcquisitionOptions,
   consume: (
     transport: DocxNodePullTransport,
@@ -108,18 +113,18 @@ export async function acquireDocxNodeDocument<TResult>(
   let pull: DocumentPullWorker | undefined;
   let transport: DocxNodePullTransport | undefined;
   try {
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(resourceOptions.policy);
     const Archive = (docxWasm as unknown as { DocxArchive: DocxArchiveConstructor }).DocxArchive;
-    handle = await formatRuntime(module).open(
+    handle = await formatRuntime(wasmModule).open(
       () => new Archive(bytes, maxEntry, maxTotal, maxEntries),
       {
         signal: options.signal,
-        abortError: createAbortError,
+        abortError: () => createAbortError(ABORT_MESSAGE),
         disposeOnAbort: (archive) => archive.free(),
       },
     );
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const archive = handle.proxy;
     metrics.checkpoint('container ready');
     pull = new DocumentPullWorker(() => archive);
@@ -153,19 +158,8 @@ export async function acquireDocxNodeDocument<TResult>(
     await pull?.reset().catch(() => undefined);
     transport?.terminate();
     try { handle?.close((archive: DocxNodeArchive) => archive.free()); } catch {}
-    const normalized = parseResourceLimitError(error) ?? error;
+    const normalized = parseTypedParserError(error) ?? normalizeDocxParserError(error);
     metrics.fail(normalized);
     throw normalized;
   }
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) return;
-  throw createAbortError();
-}
-
-function createAbortError(): Error {
-  const error = new Error('DOCX document session was aborted');
-  error.name = 'AbortError';
-  return error;
 }

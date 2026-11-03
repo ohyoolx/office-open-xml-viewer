@@ -6,9 +6,12 @@ export {
   type WorkerRequestOptions,
 } from './bridge.js';
 export { decodeDataUrl } from './decode-data-url.js';
+// Parser adapters share the wire error class without loading the rendering barrel.
+export { OoxmlError } from '../errors/ooxml-error.js';
 export {
   WasmParserHost,
   WasmTrapError,
+  detachWasmBindgenResource,
   isWasmTrap,
   type WasmTrapErrorCode,
   type WasmInit,
@@ -21,6 +24,9 @@ export {
   decodeOoxmlResourceUsage,
   deserializeWorkerError,
   parseResourceLimitError,
+  withWasmResourceErrors,
+  parseTypedParserError,
+  resourceLimitMessage,
   serializeWorkerError,
   type WorkerErrorPayload,
 } from './error-wire.js';
@@ -31,6 +37,7 @@ export {
   isPullSessionInsufficientCreditError,
   normalizePullSessionInsufficientCreditError,
   parsePullSessionInsufficientCreditError,
+  pullWithCreditRetry,
   requiredPullCredit,
   type PullSessionInsufficientCreditDetails,
 } from './pull-credit-error.js';
@@ -101,7 +108,6 @@ export {
   WorkerSvgDecodeClient,
   boundedSvgRasterSize,
   decodeSvgBlobOnMainThread,
-  isWorkerSvgDecodeRequest,
   isWorkerSvgDecodeResponse,
   respondToWorkerSvgDecodeRequest,
   type SvgBlobDecoder,
@@ -111,7 +117,6 @@ export {
 } from './svg-decode-bridge.js';
 export {
   BoundedPullSession,
-  DEFAULT_PULL_CANCEL_GRACE_MS,
   PULL_SESSION_PROTOCOL,
   PullSessionHost,
   PullSessionHostCoordinator,

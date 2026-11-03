@@ -10,16 +10,10 @@ use crate::theme::{
 };
 use crate::types::*;
 use crate::{attr, attr_f64, attr_i64, attr_r, child, parse_preflighted_pptx_xml};
-use ooxml_common::blip::{mime_from_ext, parse_blip_duotone, parse_src_rect};
+use ooxml_common::blip::{mime_from_ext, parse_blip_duotone, parse_blip_effects, parse_src_rect};
 use ooxml_common::color::ThemeResolver;
 use std::collections::HashMap;
 
-/// Parse `<a:blip><a:alphaModFix amt="..."/></a:blip>` from a blipFill node
-/// (ECMA-376 §20.1.8.6). Thin re-export of the shared
-/// [`ooxml_common::blip::parse_blip_alpha`] so the three formats read the blip
-/// alpha identically (previously a pptx-local copy). Returns the fraction
-/// `amt/100000` when present and < 1.0; `None` otherwise.
-pub(crate) use ooxml_common::blip::parse_blip_alpha;
 pub(crate) use ooxml_common::fill::{parse_fill_rect, parse_tile};
 
 // ===========================
@@ -74,9 +68,9 @@ fn parse_fill_tint(
     parse_fill_with_resolver(node, &PptxSchemeResolver { theme }, tint_mode)
 }
 
-fn parse_fill_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_fill_with_resolver(
     node: roxmltree::Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> Option<Fill> {
     for c in node.children().filter(|n| n.is_element()) {
@@ -140,7 +134,7 @@ pub(crate) fn parse_style_matrix_fill_from_source(
         StyleMatrixLookup::Missing => return None,
         StyleMatrixLookup::Entry(entry) => entry,
     };
-    let entry_xml = entry.to_xml();
+    let entry_xml = entry.to_xml().ok()?;
     let document = roxmltree::Document::parse(&entry_xml).ok()?;
     let theme = theme_source.colors();
     let placeholder_color = parse_color_node_tint(style_ref, theme, TintMode::PowerPointLinear);
@@ -201,6 +195,9 @@ pub(crate) fn parse_style_matrix_fill(
 
     let placeholder_color = parse_color_node_tint(style_ref, theme, PowerPointLinear);
 
+    // Shared style-reparse budget (see `ooxml_common::theme::to_xml`),
+    // charged before the wrapper is materialized.
+    ooxml_common::theme::charge_style_reparse(fragment.len() + 160).ok()?;
     let wrapped = format!(
         r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{fragment}</root>"#
     );
@@ -228,14 +225,17 @@ pub(crate) fn parse_style_matrix_fill(
 /// part); the mime is derived from that path. The renderer fetches the bytes
 /// lazily by path rather than from an inlined data URL.
 ///
-/// Both fill-modes are honoured and mutually exclusive:
-/// - `stretch` (§20.1.8.56): the `fillRect` (§20.1.8.30) is captured so the
-///   renderer can place the (possibly overscanned) image into the box.
+/// Both fill-modes are recorded as authored:
+/// - `stretch` (§20.1.8.56): presence is kept in `stretch`, and the `fillRect`
+///   (§20.1.8.30) is captured so the renderer can place the (possibly
+///   overscanned) image into the box.
 /// - `tile` (§20.1.8.58): the tile offset/scale/flip/align descriptor is
 ///   captured so the renderer can repeat the blip at its native (scaled) size.
 ///
-/// When neither child is present the blip defaults to full-box placement
-/// (stretch with no fillRect).
+/// The parser does not invent a mode when neither child is present, and does
+/// not resolve a schema-invalid tile+stretch pair; each renderer surface
+/// decides. The slide-background painter keeps its established tile-first,
+/// otherwise full-box placement; ordinary shape fills fail closed.
 ///
 /// `theme` resolves the `<a:duotone>` (§20.1.8.23) endpoint colours through the
 /// slide palette (PowerPoint linear tint), so a picture FILL recolours exactly
@@ -248,18 +248,25 @@ pub(crate) fn parse_blip_fill<F: FnMut(&str) -> Option<String>>(
     parse_blip_fill_with_color_resolver(blip_fill, &PptxSchemeResolver { theme }, resolve_blip)
 }
 
-fn parse_blip_fill_with_color_resolver<
-    R: ThemeResolver + ?Sized,
-    F: FnMut(&str) -> Option<String>,
->(
+fn parse_blip_fill_with_color_resolver<F: FnMut(&str) -> Option<String>>(
     blip_fill: roxmltree::Node<'_, '_>,
-    color_resolver: &R,
+    color_resolver: &dyn ThemeResolver,
     resolve_blip: &mut F,
 ) -> Option<Fill> {
     let r_id = child(blip_fill, "blip").and_then(|b| attr_r(&b, "embed"))?;
     let image_path = resolve_blip(&r_id)?;
     let mime_type = mime_from_ext(&image_path).to_owned();
-    let alpha = parse_blip_alpha(blip_fill);
+    let svg_image_path = child(blip_fill, "blip")
+        .and_then(|blip| {
+            blip.descendants()
+                .find(|node| node.is_element() && node.tag_name().name() == "svgBlip")
+        })
+        .and_then(|node| attr_r(&node, "embed"))
+        .and_then(|rid| resolve_blip(&rid));
+    let dpi = attr(&blip_fill, "dpi").and_then(|value| value.parse().ok());
+    let rot_with_shape = attr(&blip_fill, "rotWithShape")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let alpha = None /* alpha is baked by the ordered blip chain */;
     // §20.1.8.23 duotone recolour, resolved through the theme with PowerPoint's
     // linear tint (same call the `<p:pic>` paths use). `None` ⇒ no effect.
     let duotone = parse_blip_duotone(
@@ -267,28 +274,50 @@ fn parse_blip_fill_with_color_resolver<
         color_resolver,
         ooxml_common::color::TintMode::PowerPointLinear,
     );
-    // §20.1.8.58 tile takes precedence when present (stretch/tile are an
-    // either-or choice in CT_BlipFillProperties).
+    // CT_Blip grayscl/biLevel/clrChange pixel effects in document order.
+    let mut blip_effects = parse_blip_effects(
+        blip_fill,
+        color_resolver,
+        ooxml_common::color::TintMode::PowerPointLinear,
+    );
+    ooxml_common::blip::resolve_blip_effect_images(&mut blip_effects, resolve_blip);
+    // EG_FillModeProperties (§20.1.8.14) is an optional choice of `tile`
+    // (§20.1.8.58) or `stretch` (§20.1.8.56) with no schema default. Record
+    // both authored facts as-is: `stretch` is the presence of `<a:stretch>`
+    // even beside `<a:tile>`, so a schema-invalid pair stays visible to the
+    // renderer, which owns the per-surface decision (ordinary shapes fail
+    // closed on a missing or conflicting mode; see `shapeImageFillModeIsPaintable`).
+    let stretch = child(blip_fill, "stretch").is_some();
     if let Some(tile_node) = child(blip_fill, "tile") {
         return Some(Fill::Image {
             image_path,
             mime_type,
+            svg_image_path,
+            dpi,
+            rot_with_shape,
             src_rect: parse_src_rect(blip_fill),
             fill_rect: None,
+            stretch,
             tile: Some(parse_tile(tile_node)),
             alpha,
             duotone,
+            blip_effects,
         });
     }
     let fill_rect = child(blip_fill, "stretch").and_then(parse_fill_rect);
     Some(Fill::Image {
         image_path,
         mime_type,
+        svg_image_path,
+        dpi,
+        rot_with_shape,
         src_rect: parse_src_rect(blip_fill),
         fill_rect,
+        stretch,
         tile: None,
         alpha,
         duotone,
+        blip_effects,
     })
 }
 
@@ -418,17 +447,6 @@ pub(crate) fn parse_shadow(
     parse_shadow_node(child(effect_lst, "outerShdw")?, theme)
 }
 
-/// Parse spPr > effectLst > innerShdw into a Shadow. ECMA-376 §20.1.8.21
-/// (CT_InnerShadowEffect) — same field shape as outerShdw, semantics differ
-/// at render time (cast inward).
-#[cfg(test)]
-pub(crate) fn parse_inner_shadow(
-    effect_lst: roxmltree::Node<'_, '_>,
-    theme: &HashMap<String, String>,
-) -> Option<Shadow> {
-    parse_shadow_node(child(effect_lst, "innerShdw")?, theme)
-}
-
 /// Shared field reader for innerShdw / outerShdw. Both elements expose
 /// blurRad, dist, dir, and a color child with optional alphaModFix.
 pub(crate) fn parse_shadow_node(
@@ -442,47 +460,14 @@ pub(crate) fn parse_shadow_node(
     )
 }
 
-fn parse_shadow_node_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_shadow_node_with_resolver(
     n: roxmltree::Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> Option<Shadow> {
     Some(ooxml_common::effect::parse_shadow_effect(
         n, resolver, tint_mode,
     ))
-}
-
-/// Parse spPr > effectLst > glow into a Glow effect — ECMA-376 §20.1.8.17
-/// (CT_GlowEffect): a coloured halo with a blur radius, no offset.
-#[cfg(test)]
-pub(crate) fn parse_glow(
-    effect_lst: roxmltree::Node<'_, '_>,
-    theme: &HashMap<String, String>,
-) -> Option<Glow> {
-    let g = child(effect_lst, "glow")?;
-    parse_glow_node_with_resolver(
-        g,
-        &PptxSchemeResolver { theme },
-        ooxml_common::color::TintMode::PowerPointLinear,
-    )
-}
-
-#[cfg(test)]
-fn parse_glow_node_with_resolver<R: ThemeResolver + ?Sized>(
-    g: roxmltree::Node<'_, '_>,
-    resolver: &R,
-    tint_mode: ooxml_common::color::TintMode,
-) -> Option<Glow> {
-    Some(ooxml_common::effect::parse_glow_effect(
-        g, resolver, tint_mode,
-    ))
-}
-
-/// Parse spPr > effectLst > softEdge into a SoftEdge — ECMA-376 §20.1.8.31.
-#[cfg(test)]
-pub(crate) fn parse_soft_edge(effect_lst: roxmltree::Node<'_, '_>) -> Option<SoftEdge> {
-    let n = child(effect_lst, "softEdge")?;
-    Some(ooxml_common::effect::parse_soft_edge_effect(n))
 }
 
 /// Parse spPr > effectLst > reflection — ECMA-376 §20.1.8.27. Defaults
@@ -522,9 +507,9 @@ pub(crate) fn parse_effect_lst(
     )
 }
 
-fn parse_effect_lst_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_effect_lst_with_resolver(
     effect_lst: Option<roxmltree::Node<'_, '_>>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> EffectLst {
     effect_lst
@@ -556,6 +541,11 @@ pub(crate) fn parse_style_matrix_effects(
         theme,
         ooxml_common::color::TintMode::PowerPointLinear,
     );
+    // Shared style-reparse budget (see `ooxml_common::theme::to_xml`),
+    // charged before the wrapper is materialized.
+    if ooxml_common::theme::charge_style_reparse(fragment.len() + 80).is_err() {
+        return StyleMatrixEffects::default();
+    }
     let wrapped = format!(
         r#"<root xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{fragment}</root>"#
     );
@@ -654,9 +644,9 @@ pub(crate) fn parse_sp3d(
     )
 }
 
-fn parse_sp3d_with_resolver<R: ThemeResolver + ?Sized>(
+fn parse_sp3d_with_resolver(
     sppr: roxmltree::Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: ooxml_common::color::TintMode,
 ) -> Option<Sp3d> {
     let n = child(sppr, "sp3d")?;
@@ -686,9 +676,32 @@ pub(crate) fn parse_cust_geom(
     shape_w: f64,
     shape_h: f64,
 ) -> Vec<Vec<PathCmd>> {
+    parse_cust_geom_with_paint(cust_geom, shape_w, shape_h).0
+}
+
+/// Like [`parse_cust_geom`], also returning the per-path paint flags
+/// (ECMA-376 20.1.9.15) when any path departs from `norm` fill and stroke.
+pub(crate) fn parse_cust_geom_with_paint(
+    cust_geom: roxmltree::Node<'_, '_>,
+    shape_w: f64,
+    shape_h: f64,
+) -> (Vec<Vec<PathCmd>>, Option<Vec<PathPaint>>) {
     use ooxml_common::custom_geometry::{parse_custom_geometry, PathCommand};
 
-    parse_custom_geometry(cust_geom, shape_w, shape_h)
+    let geometry = parse_custom_geometry(cust_geom, shape_w, shape_h);
+    let paint: Vec<PathPaint> = geometry
+        .paths
+        .iter()
+        .map(|path| PathPaint {
+            fill: path.fill.clone(),
+            stroke: path.stroke,
+        })
+        .collect();
+    let paint = paint
+        .iter()
+        .any(|p| p.fill.is_some() || !p.stroke)
+        .then_some(paint);
+    let paths = geometry
         .paths
         .into_iter()
         .map(|path| {
@@ -739,7 +752,8 @@ pub(crate) fn parse_cust_geom(
                 })
                 .collect()
         })
-        .collect()
+        .collect();
+    (paths, paint)
 }
 
 // ===========================
@@ -808,8 +822,9 @@ pub(crate) fn parse_background<F: FnMut(&str) -> Option<String>>(
 
 /// Resolve a table-style `<a:fill>` wrapper's colour. PowerPoint applies the
 /// ECMA-376 §20.1.2.3.34 retained-input tint in linear sRGB for these DrawingML
-/// fills, just as it does for other presentation fills. Gradient/pattern/blip
-/// fills (rare in table styles) defer to the generic `parse_fill`.
+/// fills, just as it does for other presentation fills. Gradient/pattern fills
+/// defer to `parse_fill`; the host resolves explicit blips with the style
+/// part's relationships before calling this colour-only parser.
 pub(crate) fn parse_table_style_fill(
     fill_wrapper: roxmltree::Node<'_, '_>,
     theme: &HashMap<String, String>,
