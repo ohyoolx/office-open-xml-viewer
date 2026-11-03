@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createLayoutServices } from './layout-runtime.js';
+import { layoutDocument } from './document-layout.js';
 import { renderDocumentToCanvas } from './renderer.js';
 import { testFontSnapshot } from './layout/test-font-snapshot.js';
 import type {
@@ -35,7 +36,7 @@ type Any = any;
 // ---------- recording 2D context ----------
 interface FillTextCall { text: string; x: number; y: number; font: string; }
 
-function makeRecordingCanvas(): {
+function makeRecordingCanvas(metricRatios?: readonly [number, number]): {
   canvas: HTMLCanvasElement;
   fillTextCalls: FillTextCall[];
 } {
@@ -50,8 +51,8 @@ function makeRecordingCanvas(): {
       const p = px();
       return {
         width: [...s].length * p,
-        fontBoundingBoxAscent: p * 0.8,
-        fontBoundingBoxDescent: p * 0.2,
+        fontBoundingBoxAscent: p * (metricRatios?.[0] ?? 0.8),
+        fontBoundingBoxDescent: p * (metricRatios?.[1] ?? 0.2),
         actualBoundingBoxAscent: p * 0.8,
         actualBoundingBoxDescent: p * 0.2,
       } as TextMetrics;
@@ -79,7 +80,7 @@ function makeRecordingCanvas(): {
 
 // A SYNTHETIC, untabled font: the mock canvas reports a clean 1.0 em box
 // (ascent 0.8 / descent 0.2) for it, so these tests isolate the line-spacing
-// MULTIPLIER from the substituted-font single-line FLOOR (intendedSingleLinePx).
+// MULTIPLIER from any selected-resource or reference single-line floor.
 const TEST_FONT = 'Synthetic Untabled Serif';
 
 function textRun(text: string): DocxTextRun {
@@ -138,6 +139,436 @@ const atLeast = (pt: number): LineSpacing => ({ value: pt, rule: 'atLeast', expl
 const ASCENT = 8;
 const NATURAL = 10;
 const TOL = 0.05;
+
+describe('inline objects on a line grid', () => {
+  it.each([
+    ['lines', true, auto(1), 240],
+    ['linesAndChars', true, null, 240],
+    ['lines', false, auto(1), 221.2],
+    [null, true, auto(1), 221.2],
+    ['lines', true, exact(225), 225],
+    ['lines', true, atLeast(18), 221.2],
+  ] as const)('advances the following paragraph with grid=%s, snap=%s, spacing=%j', async (
+    gridType, snapToGrid, spacing, expectedAdvance,
+  ) => {
+    const picture = {
+      ...paragraph('', spacing), alignment: 'center', snapToGrid,
+      runs: [{ type: 'image', imagePath: 'word/media/picture.png', mimeType: 'image/png',
+        widthPt: 100, heightPt: 221.2, anchor: false }],
+    } as BodyElement;
+    const model = docWith(picture, paragraph('Following', auto(1)));
+    model.section.marginTop = 72;
+    model.section.docGridType = gridType;
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layoutServices = createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]), measureContext: canvas.getContext('2d'),
+    });
+    const first = layoutDocument(model, layoutServices).pages[0].layers.body[0];
+    if (first.kind !== 'paragraph') throw new Error('expected picture paragraph');
+    const image = first.lines[0].placements.find((item) => item.kind === 'resource');
+    expect(image?.bounds.yPt).toBeCloseTo(72 + (expectedAdvance - 221.2) / 2, 6);
+    const tops: number[] = [];
+    await renderDocumentToCanvas(model, canvas, 0, {
+      dpr: 1, width: 400, layoutServices,
+      onTextRun: (run) => { if (run.text === 'Following') tops.push(run.y); },
+    });
+    expect(tops).toHaveLength(1);
+    expect(tops[0]).toBeCloseTo(72 + expectedAdvance, 6);
+  });
+});
+
+describe('line-grid page-bottom admission', () => {
+  it.each([
+    [false, false], [true, false], [false, true], [true, true],
+  ])('charges the full grid cell beside a new footnote with continuation=%s, keepNext=%s', (allowFootnoteContinuation, keepNext) => {
+    const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+    caption.defaultFontSize = 16;
+    caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16 },
+      { type: 'text', ...textRun(''), noteRef: { kind: 'footnote', id: '1' } }];
+    const model = docWith(...(keepNext
+      ? [paragraph('Preceding', exact(10)), { ...paragraph('Heading', exact(10)), keepNext } as BodyElement]
+      : [paragraph('Preceding', exact(20))]), caption);
+    model.footnotes = [{ id: '1', content: [paragraph('Note', exact(10))] }];
+    model.section.pageHeight = 54;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'), allowFootnoteContinuation,
+    }));
+    // 20pt preceding + 20pt cell + (6pt separator + 10pt note) exceeds
+    // 54pt, although the centered caption's natural box fits above the band.
+    expect(layout.pages).toHaveLength(2);
+    expect(layout.pages[0].layers.body).toHaveLength(1);
+    expect(layout.pages[0].layers.notes).toHaveLength(0);
+    expect(layout.pages[1].layers.body).toHaveLength(keepNext ? 2 : 1);
+    expect(layout.pages[1].layers.notes.some(node => node.kind === 'note')).toBe(true);
+  });
+
+  it('charges the full grid cell above an already committed footnote band', () => {
+    const preceding = paragraph('Preceding', exact(20)) as Extract<BodyElement, { type: 'paragraph' }>;
+    preceding.runs.push({ type: 'text', ...textRun(''), noteRef: { kind: 'footnote', id: '1' } });
+    const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+    caption.defaultFontSize = 16;
+    caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16 }];
+    const model = docWith(preceding, caption);
+    model.footnotes = [{ id: '1', content: [paragraph('Note', exact(10))] }];
+    model.section.pageHeight = 54;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    expect(layout.pages).toHaveLength(2);
+    expect(layout.pages.map(page => page.layers.body.length)).toEqual([1, 1]);
+    expect(layout.pages[0].layers.notes.some(node => node.kind === 'note')).toBe(true);
+    expect(layout.pages[1].layers.notes).toHaveLength(0);
+  });
+
+  it.each([
+    ['bar-tab', 'complete'], ['bar-tab', 'continuing'], ['bar-tab', 'keep-next'],
+    ['run-border', 'complete'], ['run-border', 'continuing'], ['run-border', 'keep-next'],
+  ] as const)(
+    'charges a %s caption its full grid cell on the %s path', (decoration, path) => {
+      const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+      caption.defaultFontSize = 16;
+      caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16 }];
+      if (path === 'continuing') caption.runs.push(
+        { type: 'break', breakType: 'line' },
+        { type: 'text', ...textRun('Continuation'), fontSize: 16 },
+      );
+      if (decoration === 'bar-tab') {
+        caption.tabStops = [{ pos: 40, alignment: 'bar', leader: 'none' }];
+      } else {
+        for (const run of caption.runs) if (run.type === 'text') {
+          run.border = { style: 'single', color: '000000', width: 1, space: 1 };
+        }
+      }
+      const preceding = path === 'keep-next'
+        ? [paragraph('Preceding', exact(10)), { ...paragraph('Heading', exact(10)), keepNext: true } as BodyElement]
+        : [paragraph('Preceding', exact(20))];
+      const model = docWith(...preceding, caption);
+      model.section.pageHeight = 38;
+      model.section.docGridType = 'lines';
+      model.section.docGridLinePitch = 20;
+      const { canvas } = makeRecordingCanvas();
+      const layout = layoutDocument(model, createLayoutServices(model, {
+        localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+        measureContext: canvas.getContext('2d'),
+      }));
+      // Text ends at 38pt, but the bar paints through 40pt, and the
+      // run border through 41.5pt (cell + spacing + half the stroke).
+      // A continuation must defer that line; keep-next must move its heading too.
+      expect(layout.pages).toHaveLength(path === 'continuing' ? 3 : 2);
+      expect(layout.pages[0].layers.body).toHaveLength(1);
+      let barCount = 0;
+      for (const page of layout.pages) for (const block of page.layers.body) {
+        if (block.kind !== 'paragraph') continue;
+        for (const line of block.lines) for (const rule of decoration === 'bar-tab'
+          ? line.barTabRules ?? []
+          : line.placements.flatMap(placement => placement.kind === 'text'
+            ? placement.runBorderFragments ?? [] : [])) {
+          barCount += 1;
+          expect(Math.max(rule.from.yPt, rule.to.yPt) + rule.widthPt / 2).toBeLessThanOrEqual(38);
+        }
+      }
+      expect(barCount).toBe((path === 'continuing' ? 2 : 1) * (decoration === 'run-border' ? 4 : 1));
+    },
+  );
+
+  it.each([
+    { underline: true }, { strikethrough: true }, { doubleStrikethrough: true },
+    { highlight: 'yellow' }, { background: 'EEEEEE' }, { emphasisMark: 'dot' as const },
+    { ruby: { text: 'Guide', fontSizePt: 8 } },
+  ])('charges a decorated text run its full grid cell: %j', decoration => {
+    const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+    caption.defaultFontSize = 16;
+    caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16, ...decoration }];
+    const model = docWith(paragraph('Preceding', exact(20)), caption);
+    model.section.pageHeight = 38;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    expect(layout.pages.map(page => page.layers.body.length)).toEqual([1, 1]);
+  });
+
+  it.each(['top border', 'between border', 'bar border', 'shading', 'inline image'] as const)(
+    'retains the full grid cell for a caption with %s', decoration => {
+      const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+      caption.defaultFontSize = 16;
+      caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16 }];
+      if (decoration === 'bar border') {
+        // CT_PBdr's legacy bar is preserved in the private typography input,
+        // independently of the five public paragraph border edges.
+        const missing = { status: 'missing', raw: null, value: null } as const;
+        Object.assign(caption, { __paragraphTypographyAcquisition: { borders: { bar: {
+          val: { status: 'valid', raw: 'single', value: 'single' },
+          color: missing, themeColor: missing, themeTint: missing, themeShade: missing,
+          sizePt: { status: 'valid', raw: '8', value: 1 },
+          spacePt: { status: 'valid', raw: '0', value: 0 },
+          shadow: missing, frame: missing,
+        } } } });
+      } else if (decoration === 'shading') caption.shading = 'EEEEEE';
+      else if (decoration === 'inline image') caption.runs.push({
+        type: 'image', imagePath: 'word/media/picture.png', mimeType: 'image/png',
+        widthPt: 10, heightPt: 16, anchor: false,
+      });
+      else caption.borders = {
+        top: null, left: null, right: null, bottom: null, between: null,
+        [decoration === 'top border' ? 'top' : 'between']:
+          { style: 'single', color: '000000', width: 1, space: 0 },
+      };
+      const model = docWith(paragraph('Preceding', exact(20)), caption);
+      model.section.pageHeight = 38;
+      model.section.docGridType = 'lines';
+      model.section.docGridLinePitch = 20;
+      const { canvas } = makeRecordingCanvas();
+      const layout = layoutDocument(model, createLayoutServices(model, {
+        localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+        measureContext: canvas.getContext('2d'),
+      }));
+      expect(layout.pages.map(page => page.layers.body.length)).toEqual([1, 1]);
+    },
+  );
+
+  it('keeps a bordered paragraph ineligible after its top border is sliced away', () => {
+    const caption = paragraph('First', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+    caption.defaultFontSize = 16;
+    caption.runs = ['First', 'Second', 'Third'].flatMap((text, index) => [
+      ...(index ? [{ type: 'break' as const, breakType: 'line' as const }] : []),
+      { type: 'text' as const, ...textRun(text), fontSize: 16 },
+    ]);
+    caption.borders = {
+      top: { style: 'single', color: '000000', width: 1, space: 0 },
+      left: null, right: null, bottom: null, between: null,
+    };
+    const model = docWith(caption);
+    model.section.pageHeight = 38;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    expect(layout.pages.map(page => page.layers.body.flatMap(block =>
+      block.kind === 'paragraph' ? block.lines.length : []))).toEqual([[1], [1], [1]]);
+  });
+
+  it.each([[40, 2], [41, 2], [41.5, 1]])('keeps the grid caption bottom-border stroke inside body bottom %s', (bodyBottom, pages) => {
+    const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+    caption.defaultFontSize = 16;
+    caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16 }];
+    caption.borders = {
+      top: null, left: null, right: null, between: null,
+      bottom: { style: 'single', color: '000000', width: 1, space: 1 },
+    };
+    const model = docWith(paragraph('Preceding', exact(20)), caption);
+    model.section.pageHeight = bodyBottom;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    // Text ends at 38pt, but the retained border center is at 41pt and
+    // its 1pt stroke ends at 41.5pt. Grid leading cannot exempt that ink.
+    expect(layout.pages).toHaveLength(pages);
+    const retained = layout.pages[pages - 1].layers.body.at(-1);
+    if (retained?.kind !== 'paragraph') throw new Error('expected caption paragraph');
+    const bottom = retained.borders.find(border => border.edge === 'bottom');
+    if (!bottom) throw new Error('expected bottom border');
+    expect(bottom.to.yPt + bottom.widthPt / 2).toBeLessThanOrEqual(bodyBottom);
+  });
+
+  it('preserves authored atLeast spacing at the page bottom on a grid', () => {
+    const model = docWith(paragraph('Preceding', exact(20)), paragraph('Minimum', atLeast(60)));
+    model.section.pageHeight = 70;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    // 20 + 60 cannot fit a 70pt body, even though the glyphs alone would fit.
+    expect(layout.pages).toHaveLength(2);
+    const minimum = layout.pages[1].layers.body[0];
+    if (minimum.kind !== 'paragraph') throw new Error('expected minimum-spaced paragraph');
+    expect(minimum.advancePt).toBe(60);
+  });
+
+  it.each([[38, 2], [39, 1]])('charges the atLeast box when only added grid leading may cross body bottom %s', (bodyBottom, pages) => {
+    const model = docWith(paragraph('Preceding', exact(20)), paragraph('Minimum', atLeast(18)));
+    model.section.pageHeight = bodyBottom;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    // 18pt authored box centered in a 20pt cell: only its last 1pt is grid leading.
+    expect(layout.pages).toHaveLength(pages);
+  });
+
+  it.each([
+    [false, false], [true, false], [true, true],
+  ])('admits a heading and grid caption together with keepNext=%s, border=%s', (keepNext, bordered) => {
+    const heading = { ...paragraph('Heading', exact(20)), keepNext } as BodyElement;
+    const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+    caption.defaultFontSize = 16;
+    caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16 }];
+    if (bordered) caption.borders = {
+      top: null, left: null, right: null, between: null,
+      bottom: { style: 'single', color: '000000', width: 1, space: 1 },
+    };
+    const model = docWith(paragraph('Preceding', exact(20)), heading, caption);
+    model.section.pageHeight = 58;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    // Natural content ends at 58pt; a bottom border ends at 61.5pt, so
+    // keepNext must move both the heading and caption when decorated.
+    expect(layout.pages).toHaveLength(bordered ? 2 : 1);
+    expect(layout.pages[0].layers.body.map(block => block.flowBounds.yPt))
+      .toEqual(bordered ? [0] : [0, 20, 40]);
+    if (bordered) expect(layout.pages[1].layers.body.map(block => block.flowBounds.yPt)).toEqual([0, 20]);
+  });
+
+  it.each([
+    [38, 1], // Natural box ends exactly at the body bottom; grid cell ends at 40.
+    [37, 2], // The same natural box crosses the body bottom.
+  ])('paginates a centered natural box with body bottom %s', (bodyBottom, pageCount) => {
+    const caption = paragraph('Caption', auto(1)) as Extract<BodyElement, { type: 'paragraph' }>;
+    caption.defaultFontSize = 16;
+    caption.runs = [{ type: 'text', ...textRun('Caption'), fontSize: 16 }];
+    const model = docWith(paragraph('Preceding', exact(20)), caption);
+    model.section.pageHeight = bodyBottom;
+    model.section.docGridType = 'lines';
+    model.section.docGridLinePitch = 20;
+    const { canvas } = makeRecordingCanvas();
+    const layout = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: TEST_FONT }]),
+      measureContext: canvas.getContext('2d'),
+    }));
+    expect(layout.pages).toHaveLength(pageCount);
+    const retained = layout.pages[pageCount - 1].layers.body.at(-1);
+    if (retained?.kind !== 'paragraph') throw new Error('expected caption paragraph');
+    // Admission must preserve the full grid advance and centered paint geometry.
+    expect(retained.lines[0].advancePt).toBe(20);
+    expect(retained.lines[0].baselinePt).toBeCloseTo(
+      (pageCount === 1 ? 20 : 0) + 2 + 16 * 0.8, 6,
+    );
+  });
+});
+
+describe('Word for Mac uniform positioned text in an automatic line', () => {
+  const arial = (text: string, position: number, size = 10, family = 'Arial'): BodyElement => {
+    const p = paragraph(text, auto(276 / 240)) as Any;
+    p.defaultFontFamily = family;
+    p.defaultFontSize = size;
+    p.runs[0].fontFamily = family;
+    p.runs[0].fontSize = size;
+    p.runs[0].position = position;
+    return p as BodyElement;
+  };
+
+  async function baselines(...paragraphs: BodyElement[]): Promise<number[]> {
+    const family = (paragraphs[0] as Any).runs[0].fontFamily as string;
+    const ratios: readonly [number, number] = family === 'Calibri'
+      ? [1950 / 2048, 550 / 2048]
+      : [1854 / 2048, 434 / 2048];
+    const { canvas, fillTextCalls } = makeRecordingCanvas(ratios);
+    const model = docWith(...paragraphs) as Any;
+    model.fontFamilyClasses = { [family]: 'swiss' };
+    // The recording Canvas models a loaded Office face. Make that identity
+    // explicit so its pinned hhea reference is not lent to a CSS fallback.
+    const exactLocal = testFontSnapshot([{ family }]);
+    const key = family.toLowerCase();
+    exactLocal[key] = {
+      ...exactLocal[key], sourceIdentity: `office-local:local("${family}")`,
+    };
+    await renderDocumentToCanvas(model, canvas, 0, {
+      dpr: 1,
+      width: 400,
+      layoutServices: createLayoutServices(model, {
+        localMetrics: exactLocal,
+        measureContext: canvas.getContext('2d'),
+      }),
+    });
+    return paragraphs.map((p) => {
+      const label = (p as Any).runs[0].text as string;
+      const call = fillTextCalls.find((c) => c.text === label);
+      expect(call, label).toBeDefined();
+      return call!.y;
+    });
+  }
+
+  it('keeps raised 10pt Arial at the Word-observed baseline pitch', async () => {
+    const y = await baselines(arial('A', 3), arial('B', 3), arial('C', 3));
+    // Word for Mac PDF: 14.16, 14.16, 13.92 pt after twip rounding.
+    expect(y[1]! - y[0]!).toBeCloseTo(13.2 + 3 - 434 / 2048 * 10, 1);
+    expect(y[2]! - y[1]!).toBeCloseTo(13.2 + 3 - 434 / 2048 * 10, 1);
+  });
+
+  it('keeps a smaller raise inside the 16pt face descent reserve', async () => {
+    const y = await baselines(arial('A', 3, 16), arial('B', 3, 16));
+    // At 16pt, 3pt is below Arial's 3.39pt descent; Word stays at 21.12pt.
+    expect(y[1]! - y[0]!).toBeCloseTo(16 * 1.15 * 276 / 240, 1);
+  });
+
+  it('uses Calibri’s larger descent reserve without a font-specific offset', async () => {
+    const y = await baselines(
+      arial('A', 3, 10, 'Calibri'),
+      arial('B', 3, 10, 'Calibri'),
+    );
+    // Word for Mac: 14.32pt; the OpenType projection yields about 14.35pt.
+    expect(y[1]! - y[0]!).toBeCloseTo((2500 / 2048) * 10 * 1.15 + 3 - (550 / 2048) * 10, 1);
+  });
+
+  it('retains Word’s ordinary pitch for a uniformly lowered run', async () => {
+    const y = await baselines(arial('A', -3), arial('B', -3));
+    expect(y[1]! - y[0]!).toBeCloseTo(10 * 1.15 * 276 / 240, 1);
+  });
+
+  it('retains the full relative shift when positions are mixed on a line', async () => {
+    const mixed = (label: string): BodyElement => {
+      const p = arial(label, 0) as Any;
+      p.runs.push({ ...p.runs[0], text: 'X', position: 3 });
+      return p as BodyElement;
+    };
+    const y = await baselines(mixed('A'), mixed('B'));
+    // Word's mixed 0/+3pt control advances by about 16.2pt.
+    expect(y[1]! - y[0]!).toBeGreaterThan(16.1);
+    expect(y[1]! - y[0]!).toBeLessThan(16.4);
+  });
+
+  it('does not shrink exact or atLeast line allocation', async () => {
+    const raised = arial('A', 3) as Any;
+    raised.lineSpacing = exact(15);
+    const next = arial('B', 3) as Any;
+    next.lineSpacing = atLeast(15);
+    const last = arial('C', 3) as Any;
+    last.lineSpacing = atLeast(15);
+    const y = await baselines(raised, next, last);
+    expect(y[1]! - y[0]!).toBeCloseTo(15, 1);
+    expect(y[2]! - y[1]!).toBeGreaterThanOrEqual(15);
+  });
+});
 
 describe('lineRule=auto (multiple spacing) pins the baseline at natural ascent — extra leading below (§17.3.1.33, #990)', () => {
   it('1.0× places the baseline at top + ascent (no extra)', async () => {

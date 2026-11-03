@@ -1,3 +1,4 @@
+import { HEADER_W, HEADER_H } from './renderer.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { XlsxSheetViewer } from './viewer.js';
 import { XlsxWorkbook, loadXlsxSheetSource } from './workbook.js';
@@ -268,7 +269,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       currentWorksheet: Worksheet;
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      selectionOverlay: FakeEl;
+      overlayHost: { selection: FakeEl };
     } }).engine;
     engine.currentWorksheet = worksheetWithChart('Objects');
     engine.canvasArea.clientWidth = 800;
@@ -283,7 +284,7 @@ describe('XlsxSheetViewer canvas mount', () => {
     await expect(contexts[0]).resolves.toMatchObject({
       format: 'xlsx', kind: 'element', elementType: 'chart',
     });
-    expect(engine.selectionOverlay.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
+    expect(engine.overlayHost.selection.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
     viewer.destroy();
   });
 
@@ -469,7 +470,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       currentWorksheet: Worksheet;
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      selectionOverlay: FakeEl;
+      overlayHost: { selection: FakeEl };
     } }).engine;
     engine.currentWorksheet = worksheetWithChart('Objects');
     engine.canvasArea.clientWidth = 800;
@@ -497,7 +498,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       currentWorksheet: Worksheet;
       canvasArea: FakeEl;
       scrollHost: FakeEl;
-      selectionOverlay: FakeEl;
+      overlayHost: { selection: FakeEl };
     } }).engine;
     engine.currentWorksheet = worksheetWithChart('Objects');
     engine.canvasArea.clientWidth = 800;
@@ -512,12 +513,12 @@ describe('XlsxSheetViewer canvas mount', () => {
       format: 'xlsx', kind: 'element', sheetName: 'Objects', elementType: 'chart',
       text: expect.stringContaining('Revenue'),
     });
-    expect(engine.selectionOverlay.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
+    expect(engine.overlayHost.selection.querySelector('[data-xlsx-element-context-outline]')).not.toBeNull();
 
     engine.scrollHost.dispatch('pointerdown', pointerEvent({ clientX: 700, clientY: 500 }));
     engine.scrollHost.dispatch('pointerup', pointerEvent({ clientX: 700, clientY: 500 }));
     expect(viewer.getSelectionContext()?.kind).toBe('range');
-    expect(engine.selectionOverlay.querySelector('[data-xlsx-element-context-outline]')).toBeNull();
+    expect(engine.overlayHost.selection.querySelector('[data-xlsx-element-context-outline]')).toBeNull();
     viewer.destroy();
   });
 
@@ -638,6 +639,55 @@ describe('XlsxSheetViewer canvas mount', () => {
     );
     expect(borders).toHaveLength(1);
     expect(borders[0].getAttribute('d')?.match(/[MHV]/g)).toHaveLength(6);
+    viewer.destroy();
+  });
+
+  it.each([
+    { range: 'B:D', scale: 1.5, freezeRows: 1, freezeCols: 1, rtl: false, scrollX: 24, scrollY: 12 },
+    { range: '2:4', scale: 1.5, freezeRows: 1, freezeCols: 1, rtl: false, scrollX: 24, scrollY: 12 },
+    { range: 'B:D', scale: 0.65, freezeRows: 0, freezeCols: 0, rtl: false, scrollX: 20, scrollY: 240 },
+    { range: '2:4', scale: 1, freezeRows: 0, freezeCols: 16_384, rtl: true, scrollX: 0, scrollY: 0 },
+  ])('closes whole-band outer edges ($range, scale=$scale, RTL=$rtl)', ({ range, scale, freezeRows, freezeCols, rtl, scrollX, scrollY }) => {
+    installDom();
+    const viewer = new XlsxSheetViewer(makeEl('canvas') as unknown as HTMLCanvasElement, { cellScale: scale });
+    const engine = (viewer as unknown as { engine: {
+      currentWorksheet: Worksheet;
+      canvasArea: FakeEl;
+      scrollHost: FakeEl;
+      viewportTop: number;
+      viewport: { setViewportSize(width: number, height: number): void; setExtent(width: number, height: number): void };
+      setViewportLeft(left: number): void;
+      overlayHost: { selection: FakeEl };
+    } }).engine;
+    engine.currentWorksheet = { ...worksheet('Whole bands'), defaultColWidth: 8.43, freezeRows, freezeCols, rightToLeft: rtl };
+    engine.canvasArea.clientWidth = 800;
+    engine.canvasArea.clientHeight = 600;
+    engine.scrollHost.clientWidth = 800;
+    engine.scrollHost.clientHeight = 600;
+    // Model a loaded sheet with scrollable content; without an extent the
+    // viewport can clamp the supplied scroll offset back to zero.
+    engine.viewport.setViewportSize(800, 600);
+    engine.viewport.setExtent(3000, 4000);
+    engine.setViewportLeft(scrollX);
+    engine.viewportTop = scrollY;
+    if (freezeRows === 0 && scrollY > 0) {
+      expect(viewer.getCellViewportRect('A1')?.y).toBeLessThan(0);
+    }
+    viewer.setSelection(range);
+    const boundary = descendants(engine.overlayHost.selection).find(
+      (element) => element.getAttribute('data-xlsx-selection-border') !== null,
+    );
+    const segments = [...(boundary?.getAttribute('d') ?? '').matchAll(/M(-?[\d.]+) (-?[\d.]+)([HV])(-?[\d.]+)/g)]
+      .map((match) => ({ x: Number(match[1]), y: Number(match[2]), axis: match[3], end: Number(match[4]) }));
+    const caps = segments.filter((segment) => segment.axis === (range === 'B:D' ? 'H' : 'V'));
+    // A cap on the overlay edge is inset by 1 CSS pixel so the clip keeps the
+    // whole two-pixel stroke; a cap beside the headers stays on the grid line,
+    // where an ordinary cell selection draws it. Pane seams get no cap.
+    expect(caps, boundary?.getAttribute('d') ?? 'No selection border').toHaveLength(2);
+    expect(caps.map((segment) => range === 'B:D' ? segment.y : segment.x).sort((a, b) => a - b))
+      .toEqual(range === 'B:D' ? [Math.round(HEADER_H * scale), 599]
+        : rtl ? [1, 800 - Math.round(HEADER_W * scale)]
+          : [Math.round(HEADER_W * scale), 799]);
     viewer.destroy();
   });
 
@@ -1540,6 +1590,9 @@ describe('XlsxSheetViewer canvas mount', () => {
       sheetNames: ['Sheet1', 'Sheet2'],
       tabColors: {} as Record<number, string>,
       getWorksheet,
+      acquireWorksheetLease: async (index: number) => ({
+        worksheet: await getWorksheet(index), release: () => undefined,
+      }),
       isHidden: () => false,
       destroy,
     } as unknown as XlsxWorkbook;
@@ -1594,6 +1647,7 @@ describe('XlsxSheetViewer canvas mount', () => {
       sheetNames: ['Shared'],
       tabColors: {} as Record<number, string>,
       getWorksheet: vi.fn().mockResolvedValue(source),
+      acquireWorksheetLease: async () => ({ worksheet: source, release: () => undefined }),
       isHidden: () => false,
       destroy: vi.fn(),
     } as unknown as XlsxWorkbook;

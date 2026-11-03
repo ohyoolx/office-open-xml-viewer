@@ -11,8 +11,9 @@ import type {
 
 // Issue #981 (dense-page bottom fill).
 //
-// Word's page-break test is baseline-based: a line whose baseline sits within the
-// text area may let its below-baseline whitespace (descent + half of any leading)
+// The existing off-grid empty-mark page-break test is baseline-based: a line
+// whose baseline sits within the text area may let its below-baseline whitespace
+// (descent + half of any leading)
 // extend into the bottom margin. An empty paragraph's mark line paints no ink, so an
 // empty paragraph that would otherwise be the last line on a page is KEPT on the page
 // when only that invisible whitespace overflows the bottom content edge — rather than
@@ -88,12 +89,13 @@ function para(text: string, extra: Partial<DocParagraph> = {}): DocParagraph {
   } as unknown as DocParagraph;
 }
 
-function doc(body: BodyElement[], pageHeight: number): DocxDocumentModel {
+function doc(body: BodyElement[], pageHeight: number, sectionOverrides: Partial<SectionProps> = {}): DocxDocumentModel {
   const section: SectionProps = {
     pageWidth: 200, pageHeight,
     marginTop: 10, marginRight: 10, marginBottom: 10, marginLeft: 10,
     headerDistance: 4, footerDistance: 4, titlePage: false, evenAndOddHeaders: false,
     sectionStart: 'nextPage', columns: null,
+    ...sectionOverrides,
   } as SectionProps;
   return {
     section, body,
@@ -117,6 +119,54 @@ const bodyPages = (model: DocxDocumentModel) => layoutDocument(
 const PAGE_HEIGHT = 77;
 
 describe('canonical body layout — trailing empty-paragraph mark grazes the bottom margin (issue #981)', () => {
+  // trr3 family C: compare the following paragraph, never caret Y to line top.
+  it.each([
+    { arrival: 'auto', mode: 14, keepNext: false, before: 0 },
+    { arrival: 'auto', mode: 15, keepNext: true, before: 0 },
+    { arrival: 'auto', mode: 14, keepNext: false, before: 0, lineBreak: true },
+    { arrival: 'hard', mode: 14, keepNext: false, before: 0 },
+    { arrival: 'pbb', mode: 14, keepNext: false, before: 15 },
+    { arrival: 'pbb', mode: 15, keepNext: false, before: 0 },
+  ])('places After behind a textual heading: $arrival mode $mode', ({ arrival, mode, keepNext, before, lineBreak }) => {
+    const body: BodyElement[] = B(para('F', { lineSpacing: { rule: 'exact', value: 100 } }));
+    if (arrival === 'hard') body.push({ type: 'pageBreak', origin: 'authored' } as BodyElement);
+    const afterIndex = body.length + 1;
+    body.push(...B(para('', { ...(lineBreak ? { runs: [{ type: 'break', breakType: 'line' } as const] } : {}),
+      spaceBefore: 15, spaceAfter: 2,
+      lineSpacing: { rule: 'exact', value: 36 }, keepNext, pageBreakBefore: arrival === 'pbb' }), para('After')));
+    const model = { ...doc(body, 140), settings: { compatibilityMode: mode } };
+    const pages = bodyPages(model);
+    expect(pages[1]!.find(node => node.source.path[0] === afterIndex)!.flowBounds.yPt)
+      .toBe(10 + before + (lineBreak ? 72 : 36) + 2);
+  });
+
+  // Windows Word 16.0.20430 trr3 family D (272 controls): lines and
+  // linesAndChars, modes 14/15, with/without a preceding empty mark. Both
+  // empty marks and a single character stay at 15.5pt remaining, move at 15pt.
+  // The deterministic face below has a 14.3pt own box, centered in 16.4pt:
+  // its bottom is 15.35pt from the cell top. Baseline-only and full-cell
+  // admission each fail one side. A second font size prevents a fixed allowance.
+  it.each([
+    { remainingPt: 15, fontPt: 11, stays: false },
+    { remainingPt: 15.5, fontPt: 11, stays: true },
+    { remainingPt: 14.5, fontPt: 10, stays: false },
+    { remainingPt: 15, fontPt: 10, stays: true },
+    { remainingPt: 15.5, fontPt: 11, stays: false, minimumPt: 16.4 },
+  ])('admits a grid mark by its own box: $fontPt pt font, $remainingPt pt left, minimum $minimumPt', ({ remainingPt, fontPt, stays, minimumPt }) => {
+    const model = doc(B(para('F', { lineSpacing: { rule: 'exact', value: 60 } }),
+      para('', { defaultFontSize: fontPt, ...(minimumPt === undefined ? {}
+        : { lineSpacing: { rule: 'atLeast' as const, value: minimumPt } }) }), para('After')), 80 + remainingPt,
+      { docGridType: 'lines', docGridLinePitch: 16.4 });
+    const pages = layoutDocument(model, createLayoutServices(model, {
+      localMetrics: testFontSnapshot([{ family: 'Times New Roman', lineHeightRatio: 1.3 }]),
+    }), { currentDateMs: 0 }).pages;
+    const markPage = pages.findIndex(page => page.layers.body.some(node => node.source.path[0] === 1));
+    expect(markPage).toBe(stays ? 0 : 1);
+    // Admission leaves the complete cell advance intact for following flow.
+    const mark = pages[markPage]!.layers.body.find(node => node.source.path[0] === 1)!;
+    expect(mark.advancePt).toBeCloseTo(16.4);
+  });
+
   it('KEEPS an inkless empty paragraph on the page when ink-bearing content follows and only its below-baseline whitespace overflows', () => {
     // a,b,c,d fill page 1; the empty grazes the bottom (baseline within the band) and
     // is KEPT (page 1 = a,b,c,d,empty = 5); the following visible "e" flows to page 2.

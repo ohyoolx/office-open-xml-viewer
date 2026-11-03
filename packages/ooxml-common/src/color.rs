@@ -114,9 +114,9 @@ pub fn apply_signed_tint_or_shade(hex: &str, amount: f64, tint_mode: TintMode) -
         return hex.to_owned();
     }
     let (Ok(r), Ok(g), Ok(b)) = (
-        u8::from_str_radix(&hex[0..2], 16),
-        u8::from_str_radix(&hex[2..4], 16),
-        u8::from_str_radix(&hex[4..6], 16),
+        u8::from_str_radix(hex.get(0..2).unwrap_or(""), 16),
+        u8::from_str_radix(hex.get(2..4).unwrap_or(""), 16),
+        u8::from_str_radix(hex.get(4..6).unwrap_or(""), 16),
     ) else {
         return hex.to_owned();
     };
@@ -143,8 +143,8 @@ pub fn apply_signed_tint_or_shade(hex: &str, amount: f64, tint_mode: TintMode) -
         byte(transformed.1),
         byte(transformed.2)
     );
-    if hex.len() >= 8 {
-        result.push_str(&hex[6..8].to_uppercase());
+    if let Some(alpha) = hex.get(6..8) {
+        result.push_str(&alpha.to_uppercase());
     }
     result
 }
@@ -156,24 +156,26 @@ pub fn apply_color_transforms(hex: &str, node: Node, tint_mode: TintMode) -> Str
     if hex.len() < 6 {
         return hex.to_owned();
     }
-    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+    let r = u8::from_str_radix(hex.get(0..2).unwrap_or(""), 16).unwrap_or(0);
+    let g = u8::from_str_radix(hex.get(2..4).unwrap_or(""), 16).unwrap_or(0);
+    let b = u8::from_str_radix(hex.get(4..6).unwrap_or(""), 16).unwrap_or(0);
 
     let mut rf = r as f64 / 255.0;
     let mut gf = g as f64 / 255.0;
     let mut bf = b as f64 / 255.0;
     let mut alpha = if hex.len() >= 8 {
-        u8::from_str_radix(&hex[6..8], 16).unwrap_or(255) as f64 / 255.0
+        u8::from_str_radix(hex.get(6..8).unwrap_or(""), 16).unwrap_or(255) as f64 / 255.0
     } else {
         1.0
     };
 
     let attr_pct = |t: &Node, name: &str, default: f64| -> f64 {
+        // ST_Percentage accepts both Transitional integers and Strict
+        // percentage lexemes (ECMA-376 §20.1.10.40). All color transforms,
+        // including fill/duotone alpha, share the same unit conversion.
         t.attribute(name)
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(default)
-            / 100_000.0
+            .and_then(crate::units::drawingml_percentage_to_fraction)
+            .unwrap_or(default / 100_000.0)
     };
 
     for t in node.children().filter(|n| n.is_element()) {
@@ -320,6 +322,9 @@ pub fn apply_color_transforms(hex: &str, node: Node, tint_mode: TintMode) -> Str
         }
     }
 
+    // One nearest-byte rounding for every colour. Office's exact-.5 ties go
+    // either way (its internal fixed-point HSL arithmetic decides), so no
+    // tie rule is justified; a 1/255 residual is accepted.
     let r = (rf.clamp(0.0, 1.0) * 255.0).round() as u8;
     let g = (gf.clamp(0.0, 1.0) * 255.0).round() as u8;
     let b = (bf.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -488,6 +493,10 @@ pub fn extract_color_source<'a, 'input>(
 /// Returning `None` leaves the color unresolved (the caller then falls back —
 /// e.g. to a shape's style color). Implementations must return the base
 /// **without** a leading `#` so the shared transform sees clean input.
+// The shared color/fill/line/effect parsers borrow this object-safe resolver
+// through `&dyn ThemeResolver`: only slot lookup varies by host. Keep the XML
+// grammar compiled once instead of monomorphizing it for every theme adapter.
+// Dispatch adds no allocation and preserves each format's resolver/tint policy.
 pub trait ThemeResolver {
     /// Resolve a scheme/logical color name to its base hex (no `#`). `name` is
     /// the raw `<a:schemeClr val>` string.
@@ -541,9 +550,9 @@ impl<R: ThemeResolver + ?Sized> ThemeResolver for StyleMatrixColorResolver<'_, R
 /// casing / `#` convention in a thin adapter. `tint_mode` selects the Word vs
 /// PowerPoint `<a:tint>` interpretation ([`TintMode`]). Returns `None` when no
 /// color child is present or a `schemeClr` fails to resolve.
-pub fn parse_color_node<R: ThemeResolver + ?Sized>(
+pub fn parse_color_node(
     container: Node<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Option<String> {
     resolve_color_source(extract_color_source(container)?, resolver, tint_mode)
@@ -618,9 +627,9 @@ pub fn color_source_from_element<'a, 'input>(
 /// applying its EG_ColorTransform children. Split out of [`parse_color_node`] so
 /// callers that already hold a `ColorSource` (e.g. from
 /// [`color_source_from_element`]) can resolve it without re-scanning.
-pub fn resolve_color_source<R: ThemeResolver + ?Sized>(
+pub fn resolve_color_source(
     source: ColorSource<'_, '_>,
-    resolver: &R,
+    resolver: &dyn ThemeResolver,
     tint_mode: TintMode,
 ) -> Option<String> {
     match source {
@@ -720,8 +729,9 @@ pub fn rgb_to_hls(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     (h / 6.0, l, s)
 }
 
-/// HLS → RGB conversion. (h, l, s) are each in [0, 1]; returns linear-RGB
-/// triple in [0, 1].
+/// HLS → RGB conversion. (h, l, s) are each in [0, 1]; returns an RGB triple
+/// in [0, 1], in the same space (encoded sRGB or linear light) that the HLS
+/// triple was decomposed from. Callers choose that space explicitly.
 pub fn hls_to_rgb(h: f64, l: f64, s: f64) -> (f64, f64, f64) {
     if s < 1e-10 {
         return (l, l, l);
@@ -823,6 +833,24 @@ mod tests {
             parse(&xml, TintMode::PowerPointLinear).as_deref(),
             Some("FF8000")
         );
+    }
+
+    /// A malformed hex value whose bytes are not all ASCII (ST_HexColorRGB
+    /// allows hex digits only) must not panic on a char-boundary slice: like
+    /// any other non-hex digit pair it reads as channel 0, and the result is
+    /// always ASCII hex that callers may slice.
+    #[test]
+    fn non_ascii_hex_values_resolve_without_panicking() {
+        for val in ["a\u{e9}000", "\u{e9}\u{e9}\u{e9}", "00000\u{e9}0"] {
+            for mode in [TintMode::WordLiteral, TintMode::PowerPointLinear] {
+                let xml = format!(
+                    r#"<a:solidFill xmlns:a="{NS}"><a:srgbClr val="{val}"><a:lumMod val="50000"/></a:srgbClr></a:solidFill>"#
+                );
+                let hex = parse(&xml, mode).expect("color");
+                assert!(hex.is_ascii() && hex.len() >= 6, "{val:?} -> {hex:?}");
+            }
+            assert!(apply_signed_tint_or_shade(val, -0.5, TintMode::WordLiteral).len() >= 6);
+        }
     }
 
     /// sysClr uses lastClr; a transform child (lumMod) is applied on top.
@@ -1043,6 +1071,22 @@ mod tests {
         assert_eq!(
             apply_signed_tint_or_shade("156082", 0.35, TintMode::PowerPointLinear),
             "A1AFBB"
+        );
+    }
+
+    #[test]
+    fn strict_percentage_color_transforms_match_transitional_values() {
+        let parse = |modifiers: &str| {
+            let xml = format!(
+                r#"<a:solidFill xmlns:a="{NS}"><a:srgbClr val="FF0000">{modifiers}</a:srgbClr></a:solidFill>"#
+            );
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            parse_color_node(doc.root_element(), &MapResolver, TintMode::WordLiteral)
+        };
+        assert_eq!(parse(r#"<a:alpha val="50%"/>"#), Some("FF000080".into()));
+        assert_eq!(
+            parse(r#"<a:satMod val="50%"/><a:lumMod val="75%"/><a:tint val="80%"/>"#),
+            parse(r#"<a:satMod val="50000"/><a:lumMod val="75000"/><a:tint val="80000"/>"#)
         );
     }
 

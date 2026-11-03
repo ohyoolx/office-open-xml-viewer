@@ -95,7 +95,7 @@ export function createPaintResourceSession(
     handles.set(entry.resourceKey, Object.freeze({ kind: entry.kind, handle: entry.handle }));
   }
   const keys = Object.freeze([...handles.keys()].sort());
-  return Object.freeze({
+  const session: PaintResourceSession = Object.freeze({
     keys,
     resolve<K extends PaintResourceDescriptorKind>(
       resourceKey: string,
@@ -116,6 +116,7 @@ export function createPaintResourceSession(
       return Object.freeze({ descriptor, handle: entry.handle });
     },
   });
+  return session;
 }
 
 export function createProductionPaintResourceSession(

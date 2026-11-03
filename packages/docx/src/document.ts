@@ -1,8 +1,13 @@
+import { measureHostFontLines, loadDocxOfficeFontFallbacks as loadOfficeFontFallbacks } from './host-font-line-metrics.js';
+import { recordResourceDiagnostics, resourceDiagnosticsOf } from './resource-diagnostics.js';
+import type { DocxDiagnostic } from './types.js';
 import { resolveCjkFallback, type CjkLang } from '@silurus/ooxml-core';
 import InlineWorker from './worker.ts?worker&inline';
 import wasmAssetUrl from './wasm/docx_parser_bg.wasm?url';
 import {
+  activeFontSet,
   preloadGoogleFonts,
+  unloadOfficeFontFallbacks,
   releaseOwnedBitmap,
   unloadGoogleFonts,
   unregisterEmbeddedFonts,
@@ -13,6 +18,7 @@ import {
   resolveOoxmlContainer,
   toArrayBuffer,
   type LoadOptions as CoreLoadOptions,
+  type ModelSource,
   type ProgressiveLayoutPartial,
   type ProgressiveLayoutProgress,
   type MathRenderer,
@@ -41,11 +47,12 @@ import { ProgressiveLayoutLifecycle } from '@silurus/ooxml-core/internal/progres
 import { ProgressiveLayoutObserverNotifier } from '@silurus/ooxml-core/internal/progressive-layout-observers';
 import type { DocxDocumentModel, RenderPageOptions, WorkerRequest, WorkerResponse, DocComment, DocNote, DocRevision } from './types';
 import { renderLayoutSourceToCanvas, documentHasMath, prepareMathRuns, type DocxTextRunInfo } from './renderer';
-import { createLayoutServices } from './layout-runtime.js';
+import { createLayoutServices, nativeRouteLineRequests } from './layout-runtime.js';
+import { mainThreadFallbackWarning } from './main-thread-fallback.js';
+import { admitDocxNativeRouteLines, measureDocxNativeRouteLines } from './native-route-line-metrics.js';
 import { buildBookmarkPageMap } from './bookmark-nav';
-import { DOCX_GOOGLE_FONTS, docxFontPreloadNames } from './google-fonts';
+import { DOCX_GOOGLE_FONTS, docxGoogleFontPlan, docxOfficeFontFallbackRequests } from './google-fonts';
 import { loadEmbeddedFonts } from './embedded-fonts';
-import { docxResolvedFontMetricCandidates } from './document-content.js';
 import {
   attachDocumentLayoutRuntime,
   documentLayoutRuntimeOf,
@@ -95,10 +102,12 @@ import { PaginationAbortError } from './layout/pagination-scheduler.js';
 import { normalizeLayoutOptions, type LayoutOptions } from './layout/options.js';
 import type { LayoutVariantStore } from './layout/variant-store.js';
 import { publishDocxLayout } from './document-layout-events.js';
+import { unchangedLeadingPageCount } from './layout/unchanged-pages.js';
 import {
   docxLayoutViewRequester,
   publishDocxLayoutView,
 } from './document-layout-view.js';
+import { deferred, type Deferred } from '@silurus/ooxml-core/internal/deferred';
 
 /** Options for {@link DocxDocument.load}. Extends the shared load-options type
  *  from `@silurus/ooxml-core` (`useGoogleFonts`, `resourceLimits`, and the
@@ -107,6 +116,21 @@ import {
  *  must not require an application font catalog or device-font permission.
  *  Embedded fonts and the existing optional web-font preload remain supported. */
 export interface LoadOptions extends CoreLoadOptions {
+  /** Continue paragraph footnotes across physical pages. Omitted means true:
+   * the library's default display policy, chosen to follow Word's page
+   * allocation in finite controls rather than as a normative ECMA-376 rule.
+   * Pass `false` to keep the previous whole-note pagination. With continuation,
+   * table splitting and changed source cuts can reject layout,
+   * and full-note acquisition is subject to the library source/page budgets. */
+  allowFootnoteContinuation?: boolean;
+  /**
+   * Opt-in model source for document input that is not an OOXML package (a
+   * `ModelSource<'docx'>`). When its `claim()` accepts the raw bytes, it
+   * opens them in the parser realm through its own module; otherwise the
+   * ordinary OOXML path runs unchanged. A source for another format is a
+   * `TypeError`. Omitting this option imports and runs nothing extra.
+   */
+  legacyDoc?: ModelSource<'docx'>;
   /**
    * Opt-in OMML equation engine. Import it from the separate `@silurus/ooxml/math`
    * entry and pass it in: `import { math } from '@silurus/ooxml/math'`. When
@@ -135,8 +159,7 @@ export interface LoadOptions extends CoreLoadOptions {
    * has no additional effect unless progressive layout is enabled. `load()`
    * still resolves only once layout is complete.
    *
-   * Off by default: for small documents the slicing is pure overhead, and
-   * existing callers should not silently change scheduling behaviour.
+   * On by default in main mode. Pass `false` to run the same layout synchronously.
    */
   sliceLayout?: boolean;
   /**
@@ -227,6 +250,16 @@ export interface LoadOptions extends CoreLoadOptions {
   currentDate?: Date | number;
 }
 
+/** Internal viewer ownership signal. Kept outside LoadOptions so the public
+ * load contract and declaration baseline do not acquire a cancellation option. */
+export const docxViewerLoadSignal = Symbol('docxViewerLoadSignal');
+export interface DocxViewerLoadControl {
+  readonly signal: AbortSignal;
+  /** Defined only after an explicit view toggle during this load. */
+  readonly requestedView: () => boolean | undefined;
+  readonly subscribeViewChange: (listener: () => void) => () => void;
+}
+
 /** Options for {@link DocxDocument.collectPageRuns}. */
 export type CollectPageRunsOptions = Pick<
   RenderPageOptions,
@@ -272,12 +305,6 @@ interface WorkerProgressiveLoad {
   settled: boolean;
 }
 
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  readonly resolve: (value: T) => void;
-  readonly reject: (error: unknown) => void;
-}
-
 /** LayoutOptions are already normalized; absent and explicit false select the
  * same retained variant. */
 function sameLayoutView(
@@ -287,13 +314,6 @@ function sameLayoutView(
   return left !== null
     && left.currentDateMs === right.currentDateMs
     && (left.showTrackedChanges === true) === (right.showTrackedChanges === true);
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
-  return { promise, resolve, reject };
 }
 
 /** Identity-stable empties for the two anchor projections.
@@ -319,8 +339,19 @@ function snapshotReviewData(
 }
 
 export class DocxDocument {
+  /** Parser/layout limitations and resource acquisition failures. Updated after
+   * load/layout and page rendering; fallback content may still be displayed. */
+  get diagnostics(): readonly DocxDiagnostic[] {
+    return snapshotPlainData([
+      ...(this._mode === 'worker' ? this._meta?.diagnostics ?? [] : this._getLayout()?.diagnostics ?? []),
+      ...(this._meta?.resourceDiagnostics ?? []),
+      ...resourceDiagnosticsOf(this),
+    ], 'DOCX diagnostics') as readonly DocxDiagnostic[];
+  }
+
   private _metrics: OoxmlResourceMetricsSession | null = null;
   private _cjkFallback: CjkLang = 'jp';
+  private _allowFootnoteContinuation = false;
   private _document: DocxDocumentModel | null = null;
   private _source: LayoutSourceStore | null = null;
   private _meta: DocumentMeta | null = null;
@@ -380,6 +411,13 @@ export class DocxDocument {
    *  the shared FontFaceSet for the lifetime of the SPA (deduped + refcounted in
    *  core, so a font shared with another open document survives until both go). */
   private _embeddedFontFaces: FontFace[] = [];
+  /** Library-owned exact-local or pinned substitute faces in main mode. */
+  private _officeFontFaces: FontFace[] = [];
+  /** Why a worker-mode load continued on the main thread. */
+  private _mainThreadFallbackReason: 'vertical' | 'nativeRouteSentinels' = 'vertical';
+  /** Native route sentinels (native-route-line-metrics.ts), main mode. */
+  private _nativeRouteFaces: FontFace[] = [];
+  private _nativeRouteFacesReleased = false;
   /** Google-Fonts `FontFace` objects this document preloaded into `document.fonts`
    *  (main mode only — in worker mode the worker owns them and terminates with its
    *  own FontFaceSet). Released in {@link destroy} so they do not leak into the
@@ -440,6 +478,21 @@ export class DocxDocument {
   }
 
   static async load(source: string | ArrayBuffer, opts: LoadOptions = {}): Promise<DocxDocument> {
+    const control = (opts as LoadOptions & { [docxViewerLoadSignal]?: DocxViewerLoadControl })[docxViewerLoadSignal];
+    const signal = control?.signal;
+    const checkAbort = () => {
+      if (signal?.aborted) throw new PaginationAbortError();
+    };
+    checkAbort();
+    if (__OOXML_MODEL_SOURCES__ && opts.legacyDoc !== undefined) {
+      const { loadDocxModelSource } = await import('./internal/document-model-source.js');
+      const modelDocument = await loadDocxModelSource(source, opts, control);
+      if (signal?.aborted) {
+        modelDocument.destroy();
+        throw new PaginationAbortError();
+      }
+      return modelDocument;
+    }
     const cjkFallback = resolveCjkFallback(opts.cjkFallback);
     const resourceOptions = normalizeLoadResourceOptions(opts);
     const defaultCurrentDateMs = Date.now();
@@ -458,16 +511,18 @@ export class DocxDocument {
     }
     let buffer: ArrayBuffer;
     if (typeof source === 'string') {
-      const res = await fetch(source);
+      const res = await fetch(source, { signal });
       if (!res.ok) throw new Error(`Failed to fetch: ${res.status} ${res.statusText}`);
       buffer = await res.arrayBuffer();
     } else {
       buffer = source;
     }
+    checkAbort();
     // Resolve the container on the main thread before spinning up the worker.
     // Container errors remain typed OoxmlError instances here; `instanceof`
     // would not survive the worker boundary.
     buffer = toArrayBuffer(await resolveOoxmlContainer(buffer, opts.password));
+    checkAbort();
     metrics.setSourceBytes(buffer.byteLength);
     metrics.checkpoint('container ready');
     // The render worker is reachable only through this dynamic import, so
@@ -479,10 +534,22 @@ export class DocxDocument {
     const rendererDescriptors = mode === 'worker' ? workerRendererDescriptors(opts) : undefined;
     const workerProgressive = mode === 'worker' && !!opts.progressiveLayout;
     let doc: DocxDocument | undefined;
+    let disposed = false;
+    const abortDocument = () => {
+      if (disposed || !doc) return;
+      disposed = true;
+      doc.destroy();
+    };
     try {
       doc = new DocxDocument(worker, mode, defaultCurrentDateMs, opts.wasmUrl);
+      signal?.addEventListener('abort', abortDocument, { once: true });
+      checkAbort();
       doc._metrics = metrics;
       doc._cjkFallback = cjkFallback;
+      // Library default: continuation unless the caller passes exactly false
+      // (LoadOptions.allowFootnoteContinuation). The normalized boolean then
+      // reaches main, sliced and worker layout explicitly.
+      doc._allowFootnoteContinuation = opts.allowFootnoteContinuation !== false;
       // The variant the caller will actually render, recorded for BOTH render
       // modes and recorded BEFORE the parse: geometry accessors and the
       // per-call option fill-in (`_withActiveView`) read it, the wire options
@@ -520,11 +587,10 @@ export class DocxDocument {
             }
           : undefined,
       );
+      checkAbort();
       if (mode === 'worker' && doc._mode === 'main') {
         metrics.setMode('main');
-        console.warn(
-          "[ooxml] mode: 'worker' fell back to main-thread rendering because this document requires DOM OpenType vertical glyph selection.",
-        );
+        console.warn(mainThreadFallbackWarning(doc._mainThreadFallbackReason));
       }
       if (opts.math && doc._mode === 'worker' && !rendererDescriptors?.math) {
         console.warn(
@@ -555,25 +621,69 @@ export class DocxDocument {
         );
       }
       doc._tiff = doc._mode === 'worker' ? undefined : opts.tiff;
-      if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
-        doc._googleFontFaces = await preloadGoogleFonts(
-          docxFontPreloadNames(doc._document, cjkFallback),
-          DOCX_GOOGLE_FONTS,
-        );
-      }
       // ECMA-376 §17.8.1 / §17.8.3 — register the document's embedded fonts (via
       // the worker's zip-entry extraction) before the lazy first pagination, so
       // text measures/draws with the authored typeface. Worker mode does this
       // inside the worker (before it paginates); here it runs on the main thread.
       let embeddedMetrics: Awaited<ReturnType<typeof loadEmbeddedFonts>>['metrics'] | undefined;
+      let embeddedRoutes: Awaited<ReturnType<typeof loadEmbeddedFonts>>['routes'] | undefined;
+      // Absent authored faces (native-route-line-metrics.ts): native family
+      // lists do not depend on which resources load, so the document-realm
+      // measurement starts here and overlaps the font loading below; admission
+      // waits for every font. The sentinels stay with this document (they
+      // judge glyph ownership during layout) and are released by destroy().
+      const measuringDocument = doc;
+      const nativeRoutesPending = doc._mode === 'main' && doc._document && doc._source
+        ? measureDocxNativeRouteLines(nativeRouteLineRequests(doc._source, doc._document, {
+            useGoogleFonts: !!opts.useGoogleFonts, cjkFallback,
+          }), true).then((measured) => {
+            if (measuringDocument._nativeRouteFacesReleased) {
+              unloadOfficeFontFallbacks(measured.faces);
+              return null;
+            }
+            measuringDocument._nativeRouteFaces.push(...measured.faces);
+            return measured;
+          }, () => null)
+        : null;
       if (doc._mode === 'main' && doc._document?.embeddedFonts?.length) {
         const loadingDocument = doc;
         const loadedEmbedded = await loadEmbeddedFonts(
           doc._document,
           (p) => loadingDocument.getFontBytes(p),
         );
+        // destroy() may have run while FontFace.load() was pending. A late
+        // acquisition is not in the document's arrays that destroy() drained.
+        if (signal?.aborted) {
+          unregisterEmbeddedFonts(loadedEmbedded.faces);
+          throw new PaginationAbortError();
+        }
+        recordResourceDiagnostics(doc, loadedEmbedded.diagnostics);
         doc._embeddedFontFaces = loadedEmbedded.faces;
         embeddedMetrics = loadedEmbedded.metrics;
+        embeddedRoutes = loadedEmbedded.routes;
+      }
+      const officeFonts = doc._mode === 'main' && doc._document
+        ? await loadOfficeFontFallbacks(docxOfficeFontFallbackRequests(doc._document, { useGoogleFonts: opts.useGoogleFonts, cjkFallback: cjkFallback }).filter((request) =>
+            request.presenceOnly || !embeddedRoutes?.some((route) => route.requestedFamily.toLowerCase() === request.family.toLowerCase()
+              && route.weight === (request.weight ?? 400) && route.style === (request.style ?? 'normal'))))
+        : { faces: [], routes: {} };
+      if (signal?.aborted) {
+        unloadOfficeFontFallbacks(officeFonts.faces);
+        throw new PaginationAbortError();
+      }
+      doc._officeFontFaces = officeFonts.faces;
+      let installedSubstituteFamilies: readonly string[] = [];
+      if (doc._mode === 'main' && opts.useGoogleFonts && doc._document) {
+        // An installed authored face is never displaced by a different-family
+        // substitute (docxGoogleFontPlan).
+        const plan = docxGoogleFontPlan(doc._document, cjkFallback, officeFonts);
+        installedSubstituteFamilies = plan.installedSubstituteFamilies;
+        const googleFaces = await preloadGoogleFonts(plan.names, DOCX_GOOGLE_FONTS);
+        if (signal?.aborted) {
+          unloadGoogleFonts(googleFaces);
+          throw new PaginationAbortError();
+        }
+        doc._googleFontFaces = googleFaces;
       }
       // Equations are converted + rasterized before pagination (which reads their
       // extents synchronously). Requires the opt-in `math` engine; without it,
@@ -583,22 +693,30 @@ export class DocxDocument {
       if (doc._mode === 'main' && opts.math && doc._document && documentHasMath(doc._document)) {
         preparedMath = await prepareMathRuns(doc._document, opts.math);
       }
+      checkAbort();
       if (doc._mode === 'main' && doc._document && doc._source) {
         const layoutDocument = doc;
         const runtime = documentLayoutRuntimeOf(doc);
-        runtime.services = createLayoutServices(doc._source, {
+        const serviceOptions = {
+          allowFootnoteContinuation: doc._allowFootnoteContinuation,
           fontMetrics: embeddedMetrics,
-          measureResolvedFontMetrics: true,
-          resolvedFontMetricCandidates: docxResolvedFontMetricCandidates(
-            doc._document,
-            doc._source.fontFamilyCharsets,
-          ),
           useGoogleFonts: !!opts.useGoogleFonts,
           cjkFallback,
-          embeddedFaces: doc._embeddedFontFaces,
+          embeddedRoutes,
+          officeRoutes: Object.values(officeFonts.routes),
           googleFaces: doc._googleFontFaces,
+          installedSubstituteFamilies,
+          installedFamilies: 'installed' in officeFonts ? officeFonts.installed : undefined,
           mathResources: preparedMath?.records,
           mathDrawables: preparedMath?.drawables,
+        };
+        const nativeRoutes = await nativeRoutesPending;
+        checkAbort();
+        runtime.services = createLayoutServices(doc._source, {
+          ...serviceOptions,
+          nativeRouteMetrics: nativeRoutes && nativeRoutes.faces.length > 0
+            ? admitDocxNativeRouteLines(nativeRoutes.lines, activeFontSet())
+            : undefined,
         });
         const services = runtime.services;
         const retained = retainRenderWorkerDocumentLayout(
@@ -609,7 +727,7 @@ export class DocxDocument {
         // Worker mode must build this layout to return parsedMeta. Main mode does
         // the same work here so layout failures reject load() in both modes.
         //
-        // Sliced when asked: the same pagination generator, drained across
+        // Sliced by default in main mode: the same pagination generator, drained across
         // event-loop turns instead of in one blocking call, then deposited in
         // the variant store so every later synchronous render selects it
         // normally. The layout is identical either way.
@@ -651,6 +769,7 @@ export class DocxDocument {
               onPreview: (preview) => {
                 if (!ownsPublication) return;
                 const first = publishedLayout === null;
+                const unchangedPages = unchangedLeadingPageCount(publishedLayout?.pages, preview.layout.pages);
                 const retainedPreview = progressiveDocument._replaceMainLayoutPublication(
                   store,
                   layoutOptions,
@@ -676,6 +795,7 @@ export class DocxDocument {
                     pageCount: preview.layout.pages.length,
                     exact: preview.exact,
                     complete: false,
+                    unchangedPages,
                   });
                   progressiveDocument._layoutObservers.notify('onLayoutPartial', opts.onLayoutPartial, {
                     availableUnits: preview.layout.pages.length,
@@ -695,7 +815,9 @@ export class DocxDocument {
           ).then((layout) => {
             // Replace only the exact prefix this drain last published. A newer
             // synchronous rebuild of the same variant owns the key otherwise.
+            let unchangedPages: number | undefined;
             if (ownsPublication) {
+              unchangedPages = unchangedLeadingPageCount(publishedLayout?.pages, layout.pages);
               const authoritative = progressiveDocument._replaceMainLayoutPublication(
                 store,
                 layoutOptions,
@@ -712,6 +834,9 @@ export class DocxDocument {
               pageCount: progressiveDocument.pageCount,
               exact: true,
               complete: true,
+              // Only this session's own publications were on screen.
+              ...(ownsPublication && progressiveDocument._isLayoutViewActive(layoutOptions)
+                && unchangedPages !== undefined ? { unchangedPages } : {}),
             });
             // The terminal success callback fires exactly once per load,
             // whether or not any partial was published — consumers must not
@@ -754,14 +879,54 @@ export class DocxDocument {
             );
           });
           await firstPublication.promise;
-        } else if (deferrable && (opts.sliceLayout || opts.onLayoutProgress)) {
-          const layout = await layoutDocumentInputAsync(
-            doc._source.bodyLayoutInput,
-            services,
-            layoutOptions,
-            scheduler,
-          );
-          retained.layoutVariants.prime(layoutOptions, layout);
+        } else if (deferrable && (opts.sliceLayout !== false || opts.onLayoutProgress)) {
+          // Vertical OpenType glyph selection can force worker mode back to
+          // main-thread measurement, but it does not require one-shot layout:
+          // the canonical paginator's suspension points retain identical
+          // geometry for vertical and horizontal page frames.
+          // An in-flight viewer toggle invalidates this variant. Cancel at the
+          // next paginator suspension point and restart against the same parsed
+          // source; the original load promise still resolves only for the
+          // authoritative requested view.
+          for (;;) {
+            checkAbort();
+            const requestedView = control?.requestedView();
+            const currentOptions = requestedView === undefined
+              ? layoutOptions
+              : normalizeLayoutOptions(opts.currentDate, runtime.defaultCurrentDateMs, requestedView);
+            runtime.activeLayoutOptions = currentOptions;
+            const abort = new AbortController();
+            let viewChanged = false;
+            const unsubscribe = control?.subscribeViewChange(() => {
+              // Viewer callbacks may re-apply their setting on every progress
+              // update. Only a different view invalidates this in-flight
+              // pagination; repeated notifications must not restart it.
+              const requested = control.requestedView();
+              if (viewChanged || requested === undefined
+                || (requested === true) === (currentOptions.showTrackedChanges === true)) return;
+              viewChanged = true;
+              abort.abort();
+            });
+            doc._layoutAbort = abort;
+            try {
+              const layout = await layoutDocumentInputAsync(
+                doc._source.bodyLayoutInput,
+                services,
+                currentOptions,
+                { ...scheduler, signal: abort.signal },
+              );
+              checkAbort();
+              if (viewChanged) continue;
+              retained.layoutVariants.prime(currentOptions, layout);
+              break;
+            } catch (error) {
+              if (error instanceof PaginationAbortError && viewChanged && !signal?.aborted) continue;
+              throw error;
+            } finally {
+              unsubscribe?.();
+              doc._layoutAbort = null;
+            }
+          }
         } else {
           // Build the variant that will be rendered, not the default one.
           retained.layoutVariants.layoutFor(layoutOptions);
@@ -771,6 +936,7 @@ export class DocxDocument {
       // after the parse response. Telemetry is strictly best-effort: a worker
       // failure or a silent worker may omit the newest counters, but must not
       // turn an otherwise successful load into a rejection or an endless wait.
+      checkAbort();
       await doc._resourceUsage(
         opts.workerTimeoutMs ?? OOXML_RESOURCE_METRICS_PROBE_TIMEOUT_MS,
       ).then(
@@ -778,12 +944,14 @@ export class DocxDocument {
         () => undefined,
       );
       metrics.checkpoint('model and layout ready');
+      checkAbort();
       metrics.succeed({ pages: doc.pageCount });
       return doc;
     } catch (error) {
-      const rejectedDocument = doc;
-      disposeRejectedLoad(worker, rejectedDocument ? () => rejectedDocument.destroy() : undefined);
+      disposeRejectedLoad(worker, doc ? abortDocument : undefined);
       throw error;
+    } finally {
+      signal?.removeEventListener('abort', abortDocument);
     }
     } catch (error) {
       metrics.fail(error);
@@ -813,13 +981,16 @@ export class DocxDocument {
       return;
     }
     const res = await this._bridge.request(
-      (id) =>
-        this._mode === 'worker'
-          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
-          : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest),
+      (id) => {
+        this._parseRequestId = id;
+        return this._mode === 'worker'
+          ? ({ type: 'parse', id, data: buffer, resourcePolicy, useGoogleFonts, allowFootnoteContinuation: this._allowFootnoteContinuation, cjkFallback: this._cjkFallback, defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs, ...this._parseViewFields(), renderers } satisfies RenderWorkerRequest)
+          : ({ type: 'parse', id, data: buffer, resourcePolicy } satisfies WorkerRequest);
+      },
       [buffer],
       { timeoutMs },
     );
+    this._parseRequestId = null;
     if ('protocol' in res) {
       throw new Error('DOCX parse open returned a pull-protocol response');
     }
@@ -835,6 +1006,7 @@ export class DocxDocument {
         this._document = adapted.document;
         this._meta = null;
         this._mode = 'main';
+        this._mainThreadFallbackReason = res.reason ?? 'vertical';
       } else {
         this._meta = (res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>).meta;
       }
@@ -872,6 +1044,23 @@ export class DocxDocument {
     // Any push proves the worker is alive and working, which is the only thing
     // the watchdog is asking about.
     this._rearmParseWatchdog();
+    if (res.type === 'measureHostFontLines') {
+      void measureHostFontLines(res.routes).catch(() => []).then(measurements => {
+        if (res.forId !== this._parseRequestId) return;
+        this._worker.postMessage({ type: 'hostFontLinesMeasured', forId: res.forId, measurements } satisfies RenderWorkerRequest);
+      });
+      return;
+    }
+    if (res.type === 'measureNativeRouteLines') {
+      // Measured and released here: this realm does not lay out in worker mode.
+      void measureDocxNativeRouteLines(res.requests, false)
+        .then(measured => measured.lines, () => res.requests.map(() => null))
+        .then(lines => {
+          if (res.forId !== this._parseRequestId) return;
+          this._worker.postMessage({ type: 'nativeRouteLinesMeasured', forId: res.forId, lines } satisfies RenderWorkerRequest);
+        });
+      return;
+    }
     const progressive = this._progressive;
     if (progressive?.settled) return;
     if (res.type === 'layoutProgress') {
@@ -893,6 +1082,7 @@ export class DocxDocument {
         pageCount: res.partial.pageCount,
         exact: res.partial.exact,
         complete: false,
+        ...(res.partial.unchangedPages === undefined ? {} : { unchangedPages: res.partial.unchangedPages }),
       });
       this._layoutObservers.notify('onLayoutPartial', progressive.onPartial, {
         availableUnits: res.partial.pageCount,
@@ -933,6 +1123,8 @@ export class DocxDocument {
       comments: review?.comments ?? [],
       footnotes: review?.footnotes ?? [],
       endnotes: review?.endnotes ?? [],
+      diagnostics: partial.diagnostics,
+      resourceDiagnostics: partial.review?.resourceDiagnostics ?? this._meta?.resourceDiagnostics,
       commentAnchorRanges: partial.commentAnchorRanges,
       revisionAnchorRanges: partial.revisionAnchorRanges,
     };
@@ -943,10 +1135,14 @@ export class DocxDocument {
   }
 
   /** Install the authoritative metadata and close the progressive window. */
-  private _onAuthoritativeMeta(meta: DocumentMeta): void {
+  private _onAuthoritativeMeta(meta: DocumentMeta, unchangedPages?: number): void {
     this._clearParseWatchdog();
     const progressive = this._progressive;
     if (progressive?.settled) return;
+    // The worker compares against its own last publication, which is what
+    // the host shows only while the load's view is still the active one.
+    const viewedPublication = progressive !== null && this._meta !== null
+      && this._isLayoutViewActive(progressive.layoutOptions);
     if (!progressive || this._isLayoutViewActive(progressive.layoutOptions) || !this._meta) {
       this._meta = meta;
     } else {
@@ -956,6 +1152,7 @@ export class DocxDocument {
       const selected = this._meta;
       this._meta = {
         ...meta,
+        diagnostics: selected.diagnostics,
         pageCount: selected.pageCount,
         pageSizes: selected.pageSizes,
         bookmarkPages: selected.bookmarkPages,
@@ -972,6 +1169,7 @@ export class DocxDocument {
       pageCount: this.pageCount,
       exact: true,
       complete: true,
+      ...(viewedPublication && unchangedPages !== undefined ? { unchangedPages } : {}),
     });
     // A load whose worker published nothing resolves here instead — there was
     // never anything to show early, so `load()` waited for the real document.
@@ -1117,6 +1315,7 @@ export class DocxDocument {
           data: buffer,
           resourcePolicy,
           useGoogleFonts,
+          allowFootnoteContinuation: this._allowFootnoteContinuation,
           cjkFallback: this._cjkFallback,
           defaultCurrentDateMs: documentLayoutRuntimeOf(this).defaultCurrentDateMs,
           ...this._parseViewFields(),
@@ -1155,6 +1354,7 @@ export class DocxDocument {
           this._document = adapted.document;
           this._meta = null;
           this._mode = 'main';
+          this._mainThreadFallbackReason = res.reason ?? 'vertical';
           this._review = snapshotReviewData(
             adapted.document.comments ?? [],
             adapted.document.revisions ?? [],
@@ -1162,9 +1362,8 @@ export class DocxDocument {
           progressive.firstPublication.resolve();
           return;
         }
-        this._onAuthoritativeMeta(
-          (res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>).meta,
-        );
+        const parsed = res as Extract<RenderWorkerResponse, { type: 'parsedMeta' }>;
+        this._onAuthoritativeMeta(parsed.meta, parsed.unchangedPages);
       },
       (error: unknown) => {
         this._parseRequestId = null;
@@ -1219,6 +1418,15 @@ export class DocxDocument {
       unregisterEmbeddedFonts(this._embeddedFontFaces);
       this._embeddedFontFaces = [];
     }
+    if (this._officeFontFaces.length > 0) {
+      unloadOfficeFontFallbacks(this._officeFontFaces);
+      this._officeFontFaces = [];
+    }
+    this._nativeRouteFacesReleased = true;
+    if (this._nativeRouteFaces?.length > 0) {
+      unloadOfficeFontFallbacks(this._nativeRouteFaces);
+      this._nativeRouteFaces = [];
+    }
     // Release the Google-Fonts substitutes this document preloaded into the
     // shared FontFaceSet (main mode). Same refcount contract as the embedded
     // fonts: a web font also used by another open document stays until that one
@@ -1271,7 +1479,7 @@ export class DocxDocument {
 
   private async _resourceUsage(
     timeoutMs: number,
-  ): Promise<import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot> {
+  ): Promise<import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot | undefined> {
     const res = await this._bridge.request(
       (id) => ({ type: 'resourceUsage', id }) satisfies WorkerRequest,
       undefined,
@@ -1660,6 +1868,15 @@ export class DocxDocument {
     pageIndex: number,
     opts: RenderPageOptions = {},
   ): Promise<void> {
+    return this._renderPageWithTargetOwnership(target, pageIndex, opts, true);
+  }
+
+  private _renderPageWithTargetOwnership(
+    target: HTMLCanvasElement | OffscreenCanvas,
+    pageIndex: number,
+    opts: RenderPageOptions,
+    callerOwnedCanvasTarget: boolean,
+  ): Promise<void> {
     if (this._mode === 'worker') {
       throw new Error(
         "renderPage(canvas) is unavailable in mode: 'worker'; use renderPageToBitmap() and paint it via an ImageBitmapRenderingContext",
@@ -1668,6 +1885,8 @@ export class DocxDocument {
     if (!this._source) throw new Error('Document not loaded');
     return renderLayoutSourceToCanvas(this._source, target, pageIndex, {
       ...this._withActiveView(opts),
+      onDiagnostic: diagnostic => recordResourceDiagnostics(this, [diagnostic]),
+      callerOwnedCanvasTarget,
       // Lazy image bytes: the renderer fetches each embedded blip on demand by
       // zip path (decoded only when drawn) instead of reading inlined base64.
       fetchImage: this._fetchImage,
@@ -1707,11 +1926,18 @@ export class DocxDocument {
     if (this._mode === 'worker') {
       // The selected date variant may have a different page count than default
       // metadata, so the worker validates against the layout it actually paints.
+      // WHATWG HTML: an OffscreenCanvas constructed here snapshots this
+      // document's language and direction, while one constructed in the Worker
+      // has unknown language. Transferring it before any getContext() carries
+      // those inherited values, matching the main-mode surface below.
+      const canvas = new OffscreenCanvas(1, 1);
       const res = await this._bridge.request(
-        (id) => ({ type: 'renderPage', id, pageIndex, opts: wireOpts }) satisfies RenderWorkerRequest,
+        (id) => ({ type: 'renderPage', id, pageIndex, opts: wireOpts, canvas }) satisfies RenderWorkerRequest,
+        [canvas],
       );
       const rendered = res as Extract<RenderWorkerResponse, { type: 'pageRendered' }>;
       try {
+        recordResourceDiagnostics(this, rendered.diagnostics);
         if (onTextRun) for (const r of rendered.runs) onTextRun(r);
       } catch (error) {
         releaseOwnedBitmap(rendered.bitmap);
@@ -1720,7 +1946,7 @@ export class DocxDocument {
       return rendered.bitmap;
     }
     const off = new OffscreenCanvas(1, 1);
-    await this.renderPage(off, pageIndex, { ...wireOpts, onTextRun });
+    await this._renderPageWithTargetOwnership(off, pageIndex, { ...wireOpts, onTextRun }, false);
     return off.transferToImageBitmap();
   }
 
@@ -1802,3 +2028,4 @@ export class DocxDocument {
     });
   }
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

@@ -50,6 +50,10 @@ export type PptxWorkerRequest =
       kind: 'parse';
       id: number;
       buffer: ArrayBuffer;
+      /** Application-selected model source (LoadOptions.legacyPpt). */
+      source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
+      sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
       /** Resolved regional Han fallback. PPTX derives its font-preload set from
        *  the preflight built inside this worker, so the region Window resolved
@@ -59,6 +63,8 @@ export type PptxWorkerRequest =
        *  region, and dropping it silently preloads the `jp` default while the
        *  renderer paints the resolved one. */
       cjkFallback: import('@silurus/ooxml-core').CjkLang;
+      /** Internal opt-in only; omission preserves ordinary parse payloads. */
+      collectFontDemand?: boolean;
       progressiveLayout?: boolean;
     }
   | ({
@@ -80,7 +86,8 @@ export type PptxWorkerResponse =
   | { kind: 'mediaExtracted'; id: number; bytes: ArrayBuffer }
   | { kind: 'imageExtracted'; id: number; bytes: ArrayBuffer }
   | { kind: 'fontExtracted'; id: number; bytes: ArrayBuffer }
-  | { kind: 'resourceUsage'; id: number; usage: OoxmlResourceUsageSnapshot }
+  // `usage` is absent when the loaded model source has no ZIP accounting.
+  | { kind: 'resourceUsage'; id: number; usage?: OoxmlResourceUsageSnapshot }
   | { kind: 'markdownRendered'; id: number; markdown: string }
   | ({ kind: 'error'; id: number } & WorkerErrorPayload);
 
@@ -94,6 +101,10 @@ export type RenderWorkerRequest =
       kind: 'parse';
       id: number;
       buffer: ArrayBuffer;
+      /** Application-selected model source (LoadOptions.legacyPpt). */
+      source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
+      sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
       useGoogleFonts?: boolean;
       cjkFallback?: import('@silurus/ooxml-core').CjkLang;
@@ -114,8 +125,12 @@ export type RenderWorkerRequest =
       imageResources?: import('@silurus/ooxml-core').ImageResourceOptions;
       skipMediaControls?: boolean;
       dim?: DimOptions;
+      /** Contextless caller-realm surface, transferred so worker text uses the
+       *  caller's inherited canvas language. Absent: the worker creates one. */
+      canvas?: OffscreenCanvas;
     }
-  | { kind: 'collectRuns'; id: number; slideIndex: number; width: number }
+  // Collection paints to observe runs, so it takes the same surface.
+  | { kind: 'collectRuns'; id: number; slideIndex: number; width: number; canvas?: OffscreenCanvas }
   | {
       kind: 'hitTestElement';
       id: number;

@@ -137,8 +137,8 @@ beforeAll(() => {
   };
 });
 
-// An untabled synthetic font so the font-metrics single-line FLOOR
-// (intendedSingleLinePx) is 0 and the line box is exactly the mock's ascent +
+// An uncatalogued synthetic font has no reference single-line floor; the line
+// box is exactly the mock's ascent +
 // descent — isolating the metric non-linearity that the canonical path must avoid.
 const TEST_FONT = 'Synthetic Untabled Serif';
 
@@ -265,7 +265,7 @@ describe('cell content height matches canonical transformed Canvas metrics', () 
 
   it('vAlign=center: the inked block is centred using the PAINTED content height', async () => {
     // Three single-line paragraphs, no spacing. Exact 120 pt row → drawn height is
-    // exactly 120·scale px (resolveSingleRowHeight, ST_HeightRule exact) and is
+    // exactly 120·scale px (ST_HeightRule exact) and is
     // NOT content-measured, so this isolates the vAlign centring consumer. The
     // content (~3 lines) fits well within the row, leaving centring room.
     const t = tableOf(row(

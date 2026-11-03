@@ -18,7 +18,12 @@ import { canvasPaintFrame } from './deferred-paint-frame.js';
 import { applyCanvasTransform } from './canvas-transform.js';
 
 function validateTextSlices(placement: import('../layout/types.js').TextPlacement): void {
-  if (placement.text.length !== placement.range.end - placement.range.start) {
+  const optionalGlyph = placement.optionalHyphenGlyph === true;
+  if (optionalGlyph && (placement.text !== '-' || placement.clusters.length !== 1
+    || placement.paintOps.length !== 1 || placement.paintOps[0]?.text !== '-')) {
+    throw new Error('Invalid retained optional hyphen glyph');
+  }
+  if ((optionalGlyph ? 0 : placement.text.length) !== placement.range.end - placement.range.start) {
     throw new Error('UTF-16 text range is inconsistent');
   }
   if (placement.clusters.length === 0) {
@@ -30,7 +35,7 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
     if (
       !Number.isFinite(advancePt)
       || !Number.isFinite(offset.xPt) || !Number.isFinite(offset.yPt)
-      || range.start !== cursor || range.end <= range.start
+      || range.start !== cursor || (optionalGlyph ? range.end !== range.start : range.end <= range.start)
       || range.end > placement.range.end
     ) {
       throw new Error(
@@ -47,7 +52,7 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
   }
   let previousEnd = placement.range.start;
   for (const op of placement.paintOps) {
-    const invalidTextMapping = op.sourceMapping !== 'kashida'
+    const invalidTextMapping = !optionalGlyph && op.sourceMapping !== 'kashida'
       && op.text.length !== op.range.end - op.range.start;
     const invalidGeometry = !Number.isFinite(op.offset.xPt) || !Number.isFinite(op.offset.yPt)
       || (op.glyphOffsetPt !== undefined
@@ -59,7 +64,8 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
       || !Number.isFinite(op.letterSpacingPt)
       || !Number.isFinite(op.scaleX) || op.scaleX <= 0
       || (op.scaleY !== undefined && (!Number.isFinite(op.scaleY) || op.scaleY <= 0));
-    const invalidRange = op.range.start !== previousEnd || op.range.end <= op.range.start
+    const invalidRange = op.range.start !== previousEnd
+      || (optionalGlyph ? op.range.end !== op.range.start : op.range.end <= op.range.start)
       || op.range.end > placement.range.end;
     if (invalidTextMapping || invalidGeometry || invalidRange) {
       throw new Error(
@@ -68,7 +74,7 @@ function validateTextSlices(placement: import('../layout/types.js').TextPlacemen
     }
     previousEnd = op.range.end;
   }
-  const trailing = placement.text.slice(previousEnd - placement.range.start);
+  const trailing = optionalGlyph ? '' : placement.text.slice(previousEnd - placement.range.start);
   if (trailing !== '' && !/^\s+$/u.test(trailing)) {
     throw new Error(`Retained glyph slices are incomplete (paint end ${previousEnd}/${placement.range.end})`);
   }
@@ -103,6 +109,8 @@ function paintRetainedGlyph(
     operation.fontWeight,
     operation.fontStyle,
   );
+  const previousKerning = ctx.fontKerning;
+  if (operation.kerning) ctx.fontKerning = operation.kerning;
   if (upright) {
     ctx.save();
     ctx.translate(operation.origin.xPt, operation.origin.yPt);
@@ -112,6 +120,7 @@ function paintRetainedGlyph(
   } else {
     ctx.fillText(operation.text, operation.origin.xPt, operation.origin.yPt);
   }
+  if (operation.kerning) ctx.fontKerning = previousKerning;
 }
 
 function paintRetainedMarkPath(
@@ -188,7 +197,7 @@ export function paintDrawingWithOwnedTextBoxes(
   }
 }
 
-export function paintParagraphDrawingLayout(
+function paintParagraphDrawingLayout(
   node: ParagraphLayout,
   drawing: import('../layout/types.js').DrawingLayout,
   context: CanvasPaintContext,
@@ -219,12 +228,13 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
   }
   if (node.shading) {
     ctx.fillStyle = node.shading.color;
-    ctx.fillRect(
-      node.inkBounds.xPt,
-      node.inkBounds.yPt,
-      node.inkBounds.widthPt,
-      node.inkBounds.heightPt,
-    );
+    const boxes = node.lines.some(line => line.wrapBounds || line.wrapFragments)
+      ? node.lines.flatMap(line => line.wrapFragments ?? [line.wrapBounds ?? {
+          xPt: node.inkBounds.xPt, yPt: line.bounds.yPt,
+          widthPt: node.inkBounds.widthPt, heightPt: line.bounds.heightPt,
+        }])
+      : [node.paragraphMark?.wrapBounds ?? node.inkBounds];
+    for (const box of boxes) ctx.fillRect(box.xPt, box.yPt, box.widthPt, box.heightPt);
   }
   for (const line of node.lines) {
     for (const rule of line.barTabRules ?? []) {
@@ -286,6 +296,7 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
           `Unsupported retained typography geometry: ${placement.unsupportedGeometry.join(', ')}`,
         );
       }
+      // ECMA-376 Part 1 §17.3.2.15: run highlighting supersedes shading.
       if (placement.highlightFragments) {
         for (const fragment of placement.highlightFragments) {
           ctx.fillStyle = fragment.color;
@@ -307,6 +318,13 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
       const previousLetterSpacing = ctx.letterSpacing;
       const previousKerning = ctx.fontKerning;
       for (const op of placement.paintOps) {
+        // §17.3.3.29: an unselected optional hyphen must not affect display.
+        // Strip only the paint string, preserving all retained UTF-16 source
+        // ranges for slicing, hit testing and selection. Keep one contextual
+        // draw even for cs runs containing literal U+00AD (Firefox otherwise
+        // gives it native letterSpacing). Selected breaks already contain '-'.
+        const text = op.text.replace(/\u00AD/gu, '');
+        if (text.length === 0) continue;
         ctx.direction = op.direction;
         ctx.fontKerning = op.kerning;
         const originXPt = placement.origin.xPt + op.offset.xPt;
@@ -327,7 +345,7 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.letterSpacing = `${op.letterSpacingPt}px`;
-          const draw = (): void => ctx.fillText(op.text, glyphOffsetXPt, glyphOffsetYPt);
+          const draw = (): void => ctx.fillText(text, glyphOffsetXPt, glyphOffsetYPt);
           if (op.verticalFeature) {
             withVertFeature(ctx as CanvasRenderingContext2D, draw);
           }
@@ -340,18 +358,18 @@ function paintParagraphContents(node: ParagraphLayout, context: CanvasPaintConte
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.letterSpacing = `${op.letterSpacingPt / op.scaleX}px`;
-          ctx.fillText(op.text, glyphOffsetXPt, glyphOffsetYPt);
+          ctx.fillText(text, glyphOffsetXPt, glyphOffsetYPt);
           ctx.restore();
         } else if (op.scaleX !== 1) {
           ctx.save();
           ctx.translate(originXPt + glyphOffsetXPt, originYPt + glyphOffsetYPt);
           ctx.scale(op.scaleX, 1);
           ctx.letterSpacing = `${op.letterSpacingPt / op.scaleX}px`;
-          ctx.fillText(op.text, 0, 0);
+          ctx.fillText(text, 0, 0);
           ctx.restore();
         } else {
           ctx.letterSpacing = `${op.letterSpacingPt}px`;
-          ctx.fillText(op.text, originXPt + glyphOffsetXPt, originYPt + glyphOffsetYPt);
+          ctx.fillText(text, originXPt + glyphOffsetXPt, originYPt + glyphOffsetYPt);
         }
       }
       ctx.letterSpacing = previousLetterSpacing;
@@ -445,37 +463,32 @@ export function paintTextBoxLayout(node: TextBoxLayout, context: CanvasPaintCont
     || node.transform.f !== 0;
   const transformFrame = canvasPaintFrame(context.ctx, () => {
     if (hasTransform) {
-      if (node.verticalMode) {
-        context.ctx.translate(node.transform.e, node.transform.f);
-        context.ctx.rotate(node.verticalMode === 'vert270' ? -Math.PI / 2 : Math.PI / 2);
-      } else {
-        context.ctx.transform(
-          node.transform.a,
-          node.transform.b,
-          node.transform.c,
-          node.transform.d,
-          node.transform.e,
-          node.transform.f,
-        );
-      }
+      context.ctx.transform(
+        node.transform.a,
+        node.transform.b,
+        node.transform.c,
+        node.transform.d,
+        node.transform.e,
+        node.transform.f,
+      );
     }
   });
-  const clipFrame = node.clipBounds ? canvasPaintFrame(context.ctx, () => {
+  const clipFrame = node.clipBounds || node.clipRects ? canvasPaintFrame(context.ctx, () => {
     context.ctx.beginPath();
-    context.ctx.rect(
-      node.clipBounds!.xPt,
-      node.clipBounds!.yPt,
-      node.clipBounds!.widthPt,
-      node.clipBounds!.heightPt,
-    );
+    for (const rect of node.clipRects ?? [node.clipBounds!]) {
+      context.ctx.rect(rect.xPt, rect.yPt, rect.widthPt, rect.heightPt);
+    }
     context.ctx.clip();
   }) : null;
   const documentDefaultTextColor = context.documentDefaultTextColor
     ?? context.defaultTextColor
     ?? '#000000';
+  // The story is its own coordinate root (layout/text-index.ts visitTextBox):
+  // translations that placed the box's paragraph are not undone inside it.
   const storyContext: CanvasPaintContext = {
     ...context,
     pointToCss,
+    layoutTranslationPt: { xPt: 0, yPt: 0 },
     documentDefaultTextColor,
     defaultTextColor: node.defaultTextColor ?? documentDefaultTextColor,
     ...(node.verticalMode ? { textBoxVerticalMode: node.verticalMode } : {}),

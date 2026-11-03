@@ -1,0 +1,69 @@
+import type { ReferenceFontMetricProfile } from './reference-font-metrics.js';
+
+/**
+ * Published OFL font metadata, separate from the generated Office/macOS bundle
+ * catalogs. These are metadata references, not installed-font detection: Canvas
+ * may still select a different face for the authored family. Add a face only
+ * from a pinned public font source after verifying the exact TTF hash, hhea,
+ * unitsPerEm, OS/2 usWin metrics, and code-page bits. Keep the original font
+ * bytes out of the runtime bundle.
+ *
+ * BIZ UDMincho: googlefonts/morisawa-biz-ud-mincho at
+ * c30a6221b1f3d09afae9137ffe73c7cbec649947, fonts/ttf/.
+ * Regular SHA-256: 468ee6d9b149ca144809e03841bf18740ecf014e055a00da6ecaf1aaf4165af2
+ * Bold SHA-256: 1f077f8f84c1e09d5c4acdd6828048180c2f733ae5ae13271f48cf01bee4ae83
+ * Both have OS/2 ulCodePageRange1=0x20020009 (Far East bit 17 set),
+ * unitsPerEm=2048, hhea=(1802, -246, 0), and OS/2 usWin=(1802, 246).
+ * The checked data covers only regular and bold normal styles; italic tuples deliberately remain absent.
+ * The pinned Bold SHA-256 and usWin tuple were reverified on 2026-10-16;
+ * installed macOS BIZ_UDMincho-regular.ttf confirms the Regular tuple.
+ *
+ * BIZ UDGothic: googlefonts/morisawa-biz-ud-gothic at
+ * 18934af56b9c003ca58c54bffbf226848cb11032, fonts/ttf/.
+ * Regular SHA-256: 7d2b48d84ef4e65c9f85bcf65fb1fb41c92b134be641fab6a7141d597c9a92b0
+ * Bold SHA-256: c686d1b05b36d98473d98f67e74e96048a5ad6695de143111b8328b78900006e
+ * Both have OS/2 ulCodePageRange1=0x20020009 (Far East bit 17 set),
+ * unitsPerEm=2048, hhea=(1802, -246, 0), OS/2 usWin=(1802, 246),
+ * and xAvgCharWidth=1718.
+ * The same hhea/usWin and code-page metrics were confirmed in the installed
+ * macOS BIZ_UDGothic.ttc regular/bold faces. These static metadata references
+ * do not bundle font bytes or establish which face Canvas selected.
+ *
+ * Name identity (font metadata, not an Office layout rule): the pinned regular
+ * and bold TTFs of both families record the Japanese (language 0x0411) name
+ * ID 1 "BIZ UDゴシック" / "BIZ UD明朝" beside the English "BIZ UDGothic" /
+ * "BIZ UDMincho", in the same files and therefore with the same hhea values.
+ * Office documents can record either spelling as the requested family (for
+ * example w:rFonts and the ECMA-376 §17.8.3.10 w:font@w:name), so both are
+ * aliases of one profile. The localized name is a family
+ * name shared by regular and bold; it never identifies a styled face by itself.
+ * The installed macOS asset faces carry only the English names, so a local()
+ * probe still needs the English/PostScript aliases listed first. The
+ * proportional BIZ UDP* families are distinct fonts and are not aliased here.
+ */
+export const OPEN_FONT_REFERENCE_PROFILES: readonly ReferenceFontMetricProfile[] = [
+  {
+    source: 'published-open-font', family: 'BIZ UDGothic',
+    aliases: ['BIZ UDGothic', 'BIZUDGothic-Regular', 'BIZ UDゴシック'],
+    weight: 400, style: 'normal', unitsPerEm: 2048,
+    hhea: [1802, -246, 0], win: [1802, 246], farEastCodePage: true, xAvgCharWidth: 1718,
+  },
+  {
+    source: 'published-open-font', family: 'BIZ UDGothic',
+    aliases: ['BIZ UDGothic', 'BIZUDGothic-Bold', 'BIZ UDゴシック'],
+    weight: 700, style: 'normal', unitsPerEm: 2048,
+    hhea: [1802, -246, 0], win: [1802, 246], farEastCodePage: true, xAvgCharWidth: 1718,
+  },
+  {
+    source: 'published-open-font', family: 'BIZ UDMincho',
+    aliases: ['BIZ UDMincho', 'BIZUDMincho-Regular', 'BIZ UD明朝'],
+    weight: 400, style: 'normal', unitsPerEm: 2048,
+    hhea: [1802, -246, 0], win: [1802, 246], farEastCodePage: true, xAvgCharWidth: 1959,
+  },
+  {
+    source: 'published-open-font', family: 'BIZ UDMincho',
+    aliases: ['BIZ UDMincho', 'BIZUDMincho-Bold', 'BIZ UD明朝'],
+    weight: 700, style: 'normal', unitsPerEm: 2048,
+    hhea: [1802, -246, 0], win: [1802, 246], farEastCodePage: true, xAvgCharWidth: 1963,
+  },
+];

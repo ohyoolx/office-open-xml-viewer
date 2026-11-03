@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { createBodyLayoutInput } from './body-layout-input.js';
 import { bodyLayoutAcquisitionInput } from './parser-model.js';
+import { projectBodyLayoutInput } from './layout/body-layout-input.js';
 import type { BodyElement, DocxDocumentModel, SectionProps } from './types.js';
 
 const paragraph = (text: string, spaceBefore = 0, spaceAfter = 0): BodyElement => ({
@@ -37,7 +37,36 @@ const finalSection = (overrides: Partial<SectionProps> = {}): SectionProps => ({
   ...overrides,
 });
 
+const createBodyLayoutInput = (document: DocxDocumentModel) =>
+  projectBodyLayoutInput(bodyLayoutAcquisitionInput(document));
+
 describe('canonical body layout input', () => {
+  it('distinguishes textual paragraphs and empty marks from inline objects', () => {
+    const image = { type: 'image', src: 'word/media/picture.png' };
+    const withRuns = (runs: readonly unknown[]): BodyElement => ({
+      ...paragraph(''), runs,
+    }) as unknown as BodyElement;
+    const document = {
+      body: [
+        paragraph('body text'),
+        withRuns([image]),
+        withRuns([{ type: 'text', text: 'caption' }, image]),
+        paragraph(''),
+        withRuns([{ type: 'break', breakType: 'line' }]),
+      ],
+      section: finalSection(),
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+      fontFamilyClasses: {},
+    } as DocxDocumentModel;
+
+    expect(bodyLayoutAcquisitionInput(document).sequence.map((entry) =>
+      entry.kind === 'body-block' && entry.block.kind === 'paragraph'
+        ? entry.block.onlyTextualContent
+        : undefined,
+    )).toEqual([true, false, false, true, true]);
+  });
+
   it('acquires clone-safe parser facts before resolving layout section owners', () => {
     const document = {
       body: [
@@ -74,6 +103,13 @@ describe('canonical body layout input', () => {
     expect(acquired.noteLayoutSettings).toEqual({
       footnotePosition: 'pageBottom',
       endnotePosition: 'docEnd',
+      // §17.11.17/.18/.20 defaults for both note kinds.
+      footnoteNumbering: { format: 'decimal', start: 1 },
+      endnoteNumbering: { format: 'decimal', start: 1 },
+      footnoteSeparator: 'default',
+      endnoteSeparator: 'default',
+      endnoteContinuationSeparator: 'default',
+      footnoteContinuationSeparator: 'default',
     });
   });
 
@@ -87,13 +123,90 @@ describe('canonical body layout input', () => {
       __noteLayoutSettings: {
         footnotePosition: 'beneathText',
         endnotePosition: 'sectEnd',
+        footnoteNumberFormat: 'upperLetter',
+        footnoteNumberStart: 4,
+        endnoteNumberFormat: 'lowerRoman',
+        footnoteSeparator: 'none',
+        footnoteContinuationSeparator: 'short',
       },
     } as unknown as DocxDocumentModel;
 
     expect(createBodyLayoutInput(document).noteLayoutSettings).toEqual({
       footnotePosition: 'beneathText',
       endnotePosition: 'sectEnd',
+      footnoteNumbering: { format: 'upperLetter', start: 4 },
+      endnoteNumbering: { format: 'lowerRoman', start: 1 },
+      footnoteSeparator: 'none',
+      endnoteSeparator: 'default',
+      endnoteContinuationSeparator: 'default',
+      footnoteContinuationSeparator: 'short',
     });
+  });
+
+  it('preserves an authored short rule in both note roles across serialization', () => {
+    const document = {
+      body: [paragraph('body')], section: finalSection(),
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null }, fontFamilyClasses: {},
+      __noteLayoutSettings: { footnoteSeparator: 'short', footnoteContinuationSeparator: 'short' },
+    } as unknown as DocxDocumentModel;
+    const input = createBodyLayoutInput(structuredClone(document));
+    expect(input.noteLayoutSettings).toMatchObject({
+      footnoteSeparator: 'short', footnoteContinuationSeparator: 'short',
+    });
+    expect(structuredClone(input)).toEqual(input);
+    const invalid = { ...document, __noteLayoutSettings: { footnoteContinuationSeparator: 'custom' } };
+    expect(() => createBodyLayoutInput(invalid as DocxDocumentModel)).toThrow('Unsupported note separator');
+  });
+
+  it('retains reserved separator formatting once as an independent frozen snapshot', () => {
+    const rule = (mark: string, probe: number) => ({
+      rule: {
+        mark,
+        control: { run: { text: '', fontSize: 14, __typographyAcquisition: { probe } } },
+      },
+      paragraph: {
+        paragraph: { runs: [], defaultFontSize: 14 },
+        contentMark: { run: { text: '', fontSize: 9 } },
+      },
+    });
+    const reservedSeparators = {
+      footnote: {
+        separator: rule('short', 0),
+        continuationSeparator: rule('full', 3),
+        continuationNotice: {},
+      },
+    };
+    const document = {
+      body: [paragraph('body')], section: finalSection(),
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null }, fontFamilyClasses: {},
+      __noteLayoutSettings: {
+        footnoteSeparator: 'short', footnoteContinuationSeparator: 'full', reservedSeparators,
+      },
+    } as unknown as DocxDocumentModel;
+    const acquired = bodyLayoutAcquisitionInput(document);
+    const settings = projectBodyLayoutInput(acquired).noteLayoutSettings;
+    // Normalized once: projection reuses the frozen acquisition snapshot.
+    expect(settings).toBe(acquired.noteLayoutSettings);
+    expect(settings).toMatchObject({ footnoteSeparator: 'short', footnoteContinuationSeparator: 'full' });
+    const retained = settings?.reservedSeparators?.footnote;
+    const authoredControl = reservedSeparators.footnote.separator.rule.control.run;
+    expect(retained?.separator.rule?.control.run).toEqual(authoredControl);
+    // The content paragraph mark keeps its own character properties.
+    expect(retained?.separator.paragraph?.contentMark?.run?.fontSize).toBe(9);
+    expect(retained?.continuationNotice).toEqual({});
+    authoredControl.fontSize = 99;
+    expect(retained?.separator.rule?.control.run?.fontSize).toBe(14);
+    expect(Object.isFrozen(retained?.separator.rule?.control.run)).toBe(true);
+
+    const withSettings = (value: unknown) =>
+      ({ ...document, __noteLayoutSettings: value }) as DocxDocumentModel;
+    expect(createBodyLayoutInput(withSettings({ footnoteSeparator: 'short' })).noteLayoutSettings)
+      .not.toHaveProperty('reservedSeparators');
+    const footnote = { ...reservedSeparators.footnote, continuationNotice: { rule: { mark: 'dotted', control: {} } } };
+    expect(() => createBodyLayoutInput(withSettings({ reservedSeparators: { footnote } })))
+      .toThrow('Unsupported reserved note separator story');
   });
 
   it('projects section ownership and authored transitions without parser handles', () => {
@@ -178,11 +291,12 @@ describe('canonical body layout input', () => {
     expect(JSON.stringify(input)).not.toContain('__sectionPlacement');
   });
 
-  it('retains parity only on authored page breaks during acquisition', () => {
+  it('retains page-break parity and authored versus synthetic provenance during acquisition', () => {
     const document = {
       body: [
-        { type: 'pageBreak', parity: 'odd' },
-        { type: 'pageBreak' },
+        { type: 'pageBreak', parity: 'odd', origin: 'authored' },
+        { type: 'pageBreak', origin: 'coverPageSynthetic' },
+        { type: 'pageBreak', origin: 'authored' },
         { type: 'columnBreak', parity: 'even' },
       ] as unknown as BodyElement[],
       section: finalSection(),
@@ -192,12 +306,13 @@ describe('canonical body layout input', () => {
     } as DocxDocumentModel;
 
     expect(bodyLayoutAcquisitionInput(document).sequence).toMatchObject([
-      { kind: 'authored-break', break: 'page', parity: 'odd' },
-      { kind: 'authored-break', break: 'page' },
+      { kind: 'authored-break', break: 'page', parity: 'odd', origin: 'authored' },
+      { kind: 'authored-break', break: 'page', origin: 'coverPageSynthetic' },
+      { kind: 'authored-break', break: 'page', origin: 'authored' },
       { kind: 'authored-break', break: 'column' },
     ]);
     expect(bodyLayoutAcquisitionInput(document).sequence[1]).not.toHaveProperty('parity');
-    expect(bodyLayoutAcquisitionInput(document).sequence[2]).not.toHaveProperty('parity');
+    expect(bodyLayoutAcquisitionInput(document).sequence[3]).not.toHaveProperty('parity');
   });
 
   it('consumes a vanished empty paragraph without admitting a body block', () => {

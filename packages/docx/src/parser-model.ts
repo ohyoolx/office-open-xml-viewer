@@ -1,3 +1,14 @@
+import type { VmlShapeAcquisitionFacts } from './layout/types.js';
+import { resolveAutomaticParagraphMarginsPt } from './layout/paragraph-spacing.js';
+import type {
+  ReservedNoteSeparatorsInput,
+  ReservedNoteSeparatorStoriesInput,
+  ReservedNoteSeparatorStoryInput,
+  NoteSeparatorMark,
+  NoteSeparatorInput,
+  SelectedNoteSeparatorParagraphsInput,
+} from './layout/body-layout-input.js';
+import { wordKerningApplies } from './layout/line-compatibility.js';
 import type {
   BodyElement,
   DocParagraph,
@@ -6,16 +17,16 @@ import type {
   DocxTextRun,
   FieldRun,
   HeadersFooters,
-  ImageRun,
   NumberingInfo,
   LineNumbering,
-  ChartRun,
   ShapeRun,
   DocTable,
   TextPath,
   TblpPr,
 } from './types.js';
 import type {
+  DeepReadonly,
+  SectionFlow,
   NumberingMarkerShapeInput,
   FloatingTablePositionInput,
   SourceRef,
@@ -42,6 +53,7 @@ import {
   type InternalRunTypographyWire,
 } from './layout/typography-input.js';
 import { deepFreezePlainData, snapshotPlainData } from './layout/plain-data.js';
+import type { NoteSeparatorParticipant } from './layout/reserved-note-separators.js';
 import {
   normalizeTextBoxInput,
   type TextBoxAcquisitionInput,
@@ -49,9 +61,9 @@ import {
 import {
   effectiveTableWidthKind,
   projectTableColumnLayoutInput,
+  projectEffectiveTablePreferredWidthPt,
   tableDxaPtFromLexical,
   tableWidthConstraintFromLexical,
-  type CellIntrinsicWidths,
   type TableAcquisitionInput,
   type TableCellLayoutAcquisitionWire,
   type TableLayoutAcquisitionWire,
@@ -69,7 +81,7 @@ import {
   type BodySectionIndexInput,
   type BodySectionOccurrence,
 } from './layout/context.js';
-import { normalizeAdjacentTables } from './layout/adjacent-tables.js';
+import { normalizeAdjacentTables, type AdjacentTableSequenceInput } from './layout/adjacent-tables.js';
 import { isWrapFloat } from './float-layout.js';
 import type {
   BodyLayoutAcquisitionInput,
@@ -81,6 +93,7 @@ import type { BodyAcquisitionInputProjections } from './layout/acquisition-input
 import type { DocumentTypographySettingsInput } from './layout-context.js';
 import { isInklessParagraph } from './layout/paragraph-visibility.js';
 import {
+  cellOwnedGridFramePosition,
   wordTableCellSpacingValuePt,
   wordTableMarginValuePt,
   wordTableRowHeightRule,
@@ -129,6 +142,7 @@ export interface InternalRunSlotMetadata {
 }
 
 interface InternalNoBreakHyphenWire {
+  readonly __optionalHyphen?: boolean;
   readonly __noBreakBefore?: boolean;
   readonly __noBreakAfter?: boolean;
   /** UTF-16 offsets immediately after the injected U+002D glyph. */
@@ -246,6 +260,23 @@ export interface InternalDocxDocumentModel extends DocxDocumentModel {
   readonly __noteLayoutSettings?: Readonly<{
     footnotePosition?: string;
     endnotePosition?: string;
+    footnoteNumberFormat?: string;
+    footnoteNumberStart?: number;
+    endnoteNumberFormat?: string;
+    endnoteNumberStart?: number;
+    footnoteSeparator?: NoteSeparatorMark;
+    endnoteSeparator?: NoteSeparatorMark;
+    endnoteContinuationSeparator?: NoteSeparatorMark;
+    footnoteContinuationSeparator?: NoteSeparatorMark;
+    /** Ordinary DOCX producer only: effective paragraphs of listed separator
+     * stories; see SelectedNoteSeparatorParagraphsInput. */
+    footnoteSeparatorParagraph?: DocParagraph;
+    footnoteContinuationSeparatorParagraph?: DocParagraph;
+    endnoteSeparatorParagraph?: DocParagraph;
+    endnoteContinuationSeparatorParagraph?: DocParagraph;
+    /** Producer extension only (not WordprocessingML); see
+     * ReservedNoteSeparatorsInput. */
+    reservedSeparators?: ReservedNoteSeparatorsInput;
   }>;
   readonly __documentTypographySettings?: Readonly<{
     normalStyleFontSizePt?: number;
@@ -273,7 +304,7 @@ export interface DocumentPageLayoutSettingsInput {
   readonly printTwoOnOne: boolean;
 }
 
-export function documentPageLayoutSettingsInput(
+function documentPageLayoutSettingsInput(
   doc: DocxDocumentModel,
 ): DocumentPageLayoutSettingsInput {
   const settings = (doc as InternalDocxDocumentModel).__pageLayoutSettings;
@@ -289,9 +320,132 @@ export function documentPageLayoutSettingsInput(
 export interface DocumentNoteLayoutSettingsInput {
   readonly footnotePosition: string;
   readonly endnotePosition: string;
+  readonly footnoteNumbering: Readonly<{ format: string; start: number }>;
+  readonly endnoteNumbering: Readonly<{ format: string; start: number }>;
+  readonly footnoteSeparator: NoteSeparatorInput;
+  readonly endnoteSeparator: NoteSeparatorInput;
+  readonly endnoteContinuationSeparator: NoteSeparatorInput;
+  readonly footnoteContinuationSeparator: NoteSeparatorInput;
+  readonly footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+  readonly endnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+  readonly reservedSeparators?: ReservedNoteSeparatorsInput;
 }
 
-export function documentNoteLayoutSettingsInput(
+function noteSeparatorInput(value: unknown): NoteSeparatorInput {
+  if (value === undefined) return 'default';
+  if (value === 'short' || value === 'full' || value === 'none') return value;
+  // A producer cannot silently admit an unsupported authored story by
+  // emitting a misspelled/custom mode that is then replaced with a default.
+  throw new Error('Unsupported note separator');
+}
+
+/** Check only the closed tags of retained reserved separator facts. The
+ * paragraph/run payloads keep the producer's shared schema and are copied,
+ * private keys included, by the single snapshot of the settings input; full
+ * validation happens once at normalization (layout/reserved-note-separators). */
+function isWireRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function reservedNoteSeparatorStoryInput(story: ReservedNoteSeparatorStoryInput): void {
+  // Only records reach the spacing pass; the closed record shape is
+  // validated at normalization.
+  if (!isWireRecord(story) || (story.rule !== undefined && !isWireRecord(story.rule))) {
+    throw new Error('Unsupported reserved note separator story');
+  }
+  const mark = story.rule?.mark;
+  if (mark !== undefined && mark !== 'short' && mark !== 'full') {
+    throw new Error('Unsupported reserved note separator story');
+  }
+}
+
+function reservedNoteSeparatorsInput(
+  value: ReservedNoteSeparatorsInput | undefined,
+  fixedParagraphAutoSpacing: boolean,
+): Readonly<{ reservedSeparators?: ReservedNoteSeparatorsInput }> {
+  if (value === undefined) return {};
+  if (!isWireRecord(value as unknown)) throw new Error('Unsupported reserved note separator story');
+  // Reserved stories are not ordinary numbered-note bodies and do not enter
+  // normalizeBody. Resolve their effective automatic spacing flags here with
+  // the same document setting and paragraph-base em as other stories,
+  // before canonical acquisition. At most two kinds × three roles are visited;
+  // clone only changed ancestry, then use the enclosing single frozen snapshot.
+  const normalizeStory = (story: ReservedNoteSeparatorStoryInput): ReservedNoteSeparatorStoryInput => {
+    reservedNoteSeparatorStoryInput(story);
+    const authored = story.paragraph;
+    if (!isWireRecord(authored) || !isWireRecord(authored.paragraph)) return story;
+    const paragraph = authored.paragraph;
+    if (paragraph.beforeAutospacing !== true && paragraph.afterAutospacing !== true) return story;
+    const spacing = resolveAutomaticParagraphMarginsPt(
+      paragraph, paragraph.defaultFontSize ?? 10, fixedParagraphAutoSpacing,
+    );
+    if (spacing.spaceBefore === paragraph.spaceBefore && spacing.spaceAfter === paragraph.spaceAfter) return story;
+    return { ...story, paragraph: { ...authored, paragraph: { ...paragraph, ...spacing } } };
+  };
+  const normalizeKind = (kind: ReservedNoteSeparatorStoriesInput | undefined): ReservedNoteSeparatorStoriesInput | undefined => {
+    if (kind === undefined) return kind;
+    if (!isWireRecord(kind)) throw new Error('Unsupported reserved note separator story');
+    const separator = normalizeStory(kind.separator);
+    const continuationSeparator = normalizeStory(kind.continuationSeparator);
+    const continuationNotice = normalizeStory(kind.continuationNotice);
+    return separator === kind.separator && continuationSeparator === kind.continuationSeparator && continuationNotice === kind.continuationNotice
+      ? kind : { ...kind, separator, continuationSeparator, continuationNotice };
+  };
+  const footnote = normalizeKind(value.footnote);
+  const endnote = normalizeKind(value.endnote);
+  return { reservedSeparators: footnote === value.footnote && endnote === value.endnote
+    ? value : { ...value, footnote, endnote } };
+}
+
+/** Ordinary DOCX effective separator paragraphs (both note kinds). Each enters
+ * only beside its own Short/Full/None mark; the closed shape is validated once at
+ * normalization (layout/selected-note-separators). Automatic paragraph spacing
+ * resolves here with the same document setting as every other story. */
+function selectedNoteSeparatorParagraphsInput(
+  settings: InternalDocxDocumentModel['__noteLayoutSettings'],
+  fixedParagraphAutoSpacing: boolean,
+): Readonly<{ footnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput;
+  endnoteSeparatorParagraphs?: SelectedNoteSeparatorParagraphsInput }> {
+  const resolve = (paragraph: DocParagraph | undefined, mark: unknown): DocParagraph | undefined => {
+    if (paragraph === undefined) return undefined;
+    if (mark !== 'short' && mark !== 'full' && mark !== 'none') throw new Error('Unsupported note separator story paragraph');
+    if (paragraph.beforeAutospacing !== true && paragraph.afterAutospacing !== true) return paragraph;
+    return {
+      ...paragraph,
+      ...resolveAutomaticParagraphMarginsPt(paragraph, paragraph.defaultFontSize ?? 10, fixedParagraphAutoSpacing),
+    };
+  };
+  const separator = resolve(settings?.footnoteSeparatorParagraph, settings?.footnoteSeparator);
+  const continuationSeparator = resolve(
+    settings?.footnoteContinuationSeparatorParagraph, settings?.footnoteContinuationSeparator,
+  );
+  const endnoteSeparator = resolve(settings?.endnoteSeparatorParagraph, settings?.endnoteSeparator);
+  const endnoteContinuationSeparator = resolve(settings?.endnoteContinuationSeparatorParagraph, settings?.endnoteContinuationSeparator);
+  return {
+    ...(endnoteSeparator || endnoteContinuationSeparator ? { endnoteSeparatorParagraphs: {
+      ...(endnoteSeparator ? { separator: endnoteSeparator } : {}),
+      ...(endnoteContinuationSeparator ? { continuationSeparator: endnoteContinuationSeparator } : {}),
+    } } : {}),
+    ...(separator || continuationSeparator ? { footnoteSeparatorParagraphs: {
+      ...(separator ? { separator } : {}),
+      ...(continuationSeparator ? { continuationSeparator } : {}),
+    } } : {}),
+  };
+}
+
+/** §17.11.17/.18 numFmt defaults to decimal and §17.11.20 numStart to 1 for
+ * both note kinds when the document-wide element is absent. */
+function noteNumberingInput(
+  format: string | undefined,
+  start: number | undefined,
+): Readonly<{ format: string; start: number }> {
+  return {
+    format: typeof format === 'string' && format.length > 0 ? format : 'decimal',
+    start: typeof start === 'number' && Number.isSafeInteger(start) ? start : 1,
+  };
+}
+
+function documentNoteLayoutSettingsInput(
   doc: DocxDocumentModel,
 ): DocumentNoteLayoutSettingsInput {
   const settings = (doc as InternalDocxDocumentModel).__noteLayoutSettings;
@@ -299,6 +453,22 @@ export function documentNoteLayoutSettingsInput(
     // §17.11.21/.22 defaults when document-wide w:pos is absent.
     footnotePosition: settings?.footnotePosition ?? 'pageBottom',
     endnotePosition: settings?.endnotePosition ?? 'docEnd',
+    footnoteNumbering: noteNumberingInput(
+      settings?.footnoteNumberFormat,
+      settings?.footnoteNumberStart,
+    ),
+    endnoteNumbering: noteNumberingInput(
+      settings?.endnoteNumberFormat,
+      settings?.endnoteNumberStart,
+    ),
+    footnoteSeparator: noteSeparatorInput(settings?.footnoteSeparator),
+    endnoteSeparator: noteSeparatorInput(settings?.endnoteSeparator),
+    endnoteContinuationSeparator: noteSeparatorInput(settings?.endnoteContinuationSeparator),
+    footnoteContinuationSeparator: noteSeparatorInput(settings?.footnoteContinuationSeparator),
+    ...selectedNoteSeparatorParagraphsInput(settings, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true),
+    // Closed tags only here; the source-model adapter validates the complete
+    // shape and normalizes these facts into canonical reserved stories.
+    ...reservedNoteSeparatorsInput(settings?.reservedSeparators, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true),
   }, 'DOCX note layout settings input');
 }
 
@@ -312,6 +482,9 @@ interface InternalSectionPlacementWire {
   readonly docGridCharSpace?: number | null;
   readonly gutterPt?: number | null;
   readonly rtlGutter?: boolean | null;
+  /** Producer extension only (never WordprocessingML): the canonical
+   * counter-clockwise page frame no Transitional token selects. */
+  readonly sectionFlow?: SectionFlow | null;
   readonly pageBordersAuthored?: boolean;
   readonly pageBorders?: import('./types.js').PageBorders | null;
   readonly pageGeometry?: Readonly<{
@@ -349,6 +522,25 @@ export interface SectionPlacementInput {
   readonly pageBordersAuthored: boolean;
   readonly pageBorders: Readonly<import('./types.js').PageBorders> | null;
   readonly pageGeometry: InternalSectionPlacementWire['pageGeometry'];
+  /** Canonical counter-clockwise page frame; absent for OOXML sections. */
+  readonly sectionFlow?: SectionFlow;
+}
+
+/** Admit a producer's section frame once, before any layout input exists.
+ * It refines only the nominal `btLr` token, so it must agree with it. */
+function sectionFlowFacts(
+  wire: InternalSectionPlacementWire | undefined,
+  textDirection: string | null | undefined,
+): Readonly<{ sectionFlow?: SectionFlow }> {
+  const flow = wire?.sectionFlow;
+  if (flow === undefined || flow === null) return {};
+  if (flow !== 'bottomToTop') throw new TypeError(`Invalid section flow ${String(flow)}`);
+  if (textDirection !== 'btLr') {
+    throw new TypeError(
+      `Section flow ${flow} contradicts text direction ${JSON.stringify(textDirection ?? null)}`,
+    );
+  }
+  return { sectionFlow: flow };
 }
 
 interface DocumentSectionPlacementInputs {
@@ -448,6 +640,7 @@ function tableColumnSemanticInput(
         colSpan: finiteOrNull(cell.colSpan) ?? 1,
         widthPt: finiteOrNull(cell.widthPt),
         widthPct: finiteOrNull(cell.widthPct),
+        ...(cell.noWrap === true ? { noWrap: true } : {}),
       })),
     })),
   }, 'DOCX table column semantic input') as TableSourceSemanticInput;
@@ -532,8 +725,11 @@ function privateTableRowHeight(height: TableRowHeightAcquisitionWire): TableRowH
 
 function publicTableRowHeight(row: TableLayoutSource['rows'][number]): TableRowHeightInput | null {
   if (row.rowHeight === null || !Number.isFinite(row.rowHeight)) return null;
-  // The stable public model predates authored-presence retention. Keep its
-  // compatibility fallback at the model boundary, never in the layout solver.
+  // The public model writes an omitted hRule as its "auto" default and keeps
+  // no authored-presence fact, so a public-only "auto" row with a height is
+  // the omitted case (`word-omitted-row-height-rule-at-least`). Documents
+  // parsed here carry the acquisition wire, where an explicit auto has no
+  // minimum (ECMA-376 §17.4.80).
   const normalized = normalizedTableHeightRule(row.rowHeightRule);
   return {
     rule: normalized === 'auto' ? 'atLeast' : normalized,
@@ -566,6 +762,7 @@ function wordTableMarginPt(
 ): number | null {
   if (!width) return null;
   const kind = effectiveTableWidthKind(width);
+  // `word-table-margin-scope-shadow`
   return wordTableMarginValuePt({
     kind,
     dxaValuePt: kind === 'dxa' ? tableTwipsValuePt(width.value ?? '0') : null,
@@ -582,31 +779,35 @@ function effectiveTableCellMargins(
   exceptionMargins: TableMarginAcquisitionWire | null | undefined,
   tableMargins: TableMarginAcquisitionWire | null | undefined,
   styleMargins: TableMarginAcquisitionWire | null | undefined,
-): TableFormatInput['rows'][number]['cells'][number]['marginsPt'] {
+): TableFormatInput['rows'][number]['cells'][number] {
   const bidi = table.bidiVisual === true;
   const physical = (
     margins: TableMarginAcquisitionWire | null | undefined,
     edge: 'left' | 'right',
-  ): Readonly<{ width: TableWidthAcquisitionWire | null | undefined; edge: 'start' | 'end' }> => {
+  ): Readonly<{ width: TableWidthAcquisitionWire | null | undefined; edge: 'start' | 'end'; physicalLeftAuthored: boolean }> => {
     const logicalEdge = edge === 'left'
       ? (bidi ? 'end' : 'start')
       : (bidi ? 'start' : 'end');
-    return { width: margins?.[edge] ?? margins?.[logicalEdge], edge: logicalEdge };
+    return { width: margins?.[edge] ?? margins?.[logicalEdge], edge: logicalEdge,
+      physicalLeftAuthored: edge === 'left' && margins?.left != null };
   };
-  const firstMargin = (
+  const selectMargin = (
     edge: TableMarginEdge,
     ...candidates: readonly Readonly<{
       width: TableWidthAcquisitionWire | null | undefined;
       scope: TableMarginScope;
       edge?: TableMarginEdge;
+      physicalLeftAuthored?: boolean;
     }>[]
-  ): number | null => {
+  ): { value: number; originLeftMarginPt: number | null } | null => {
     for (const candidate of candidates) {
       const value = wordTableMarginPt(candidate.width, candidate.scope, candidate.edge ?? edge);
-      if (value !== null) return value;
+      if (value !== null) return { value, originLeftMarginPt: candidate.physicalLeftAuthored ? value : null };
     }
     return null;
   };
+  const firstMargin = (...args: Parameters<typeof selectMargin>): number | null =>
+    selectMargin(...args)?.value ?? null;
   const cellLeft = physical(cellMargins, 'left');
   const exceptionLeft = physical(exceptionMargins, 'left');
   const tableLeft = physical(tableMargins, 'left');
@@ -618,35 +819,43 @@ function effectiveTableCellMargins(
   const publicCellMargin = (value: number | null | undefined): number | null => (
     !hasPrivateCellWire && value != null && Number.isFinite(value) ? value : null
   );
-  return {
-    top: firstMargin('top',
-      { width: cellMargins?.top, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginTop) ?? firstMargin('top',
-      { width: exceptionMargins?.top, scope: 'exception' },
-      { width: tableMargins?.top, scope: 'table' },
-      { width: styleMargins?.top, scope: 'style' },
-    ) ?? table.cellMarginTop,
-    bottom: firstMargin('bottom',
-      { width: cellMargins?.bottom, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginBottom) ?? firstMargin('bottom',
-      { width: exceptionMargins?.bottom, scope: 'exception' },
-      { width: tableMargins?.bottom, scope: 'table' },
-      { width: styleMargins?.bottom, scope: 'style' },
-    ) ?? table.cellMarginBottom,
-    left: firstMargin(cellLeft.edge,
-      { ...cellLeft, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginLeft) ?? firstMargin(exceptionLeft.edge,
+  const publicLeft = publicCellMargin(cell.marginLeft);
+  // Preserve provenance at the same cascade decision as the value. A logical
+  // cell override above a legacy table margin is outside the observed origin
+  // rule, even though a lower layer still contains a legacy left element.
+  const left = selectMargin(cellLeft.edge, { ...cellLeft, scope: 'cell' })
+    ?? (publicLeft === null ? null : { value: publicLeft, originLeftMarginPt: null })
+    ?? selectMargin(exceptionLeft.edge,
       { ...exceptionLeft, scope: 'exception' },
       { ...tableLeft, scope: 'table' },
       { ...styleLeft, scope: 'style' },
-    ) ?? table.cellMarginLeft,
-    right: firstMargin(cellRight.edge,
-      { ...cellRight, scope: 'cell' },
-    ) ?? publicCellMargin(cell.marginRight) ?? firstMargin(exceptionRight.edge,
-      { ...exceptionRight, scope: 'exception' },
-      { ...tableRight, scope: 'table' },
-      { ...styleRight, scope: 'style' },
-    ) ?? table.cellMarginRight,
+    );
+  return {
+    originLeftMarginPt: left?.originLeftMarginPt ?? null,
+    marginsPt: {
+      top: firstMargin('top',
+        { width: cellMargins?.top, scope: 'cell' },
+      ) ?? publicCellMargin(cell.marginTop) ?? firstMargin('top',
+        { width: exceptionMargins?.top, scope: 'exception' },
+        { width: tableMargins?.top, scope: 'table' },
+        { width: styleMargins?.top, scope: 'style' },
+      ) ?? table.cellMarginTop,
+      bottom: firstMargin('bottom',
+        { width: cellMargins?.bottom, scope: 'cell' },
+      ) ?? publicCellMargin(cell.marginBottom) ?? firstMargin('bottom',
+        { width: exceptionMargins?.bottom, scope: 'exception' },
+        { width: tableMargins?.bottom, scope: 'table' },
+        { width: styleMargins?.bottom, scope: 'style' },
+      ) ?? table.cellMarginBottom,
+      left: left?.value ?? table.cellMarginLeft,
+      right: firstMargin(cellRight.edge,
+        { ...cellRight, scope: 'cell' },
+      ) ?? publicCellMargin(cell.marginRight) ?? firstMargin(exceptionRight.edge,
+        { ...exceptionRight, scope: 'exception' },
+        { ...tableRight, scope: 'table' },
+        { ...styleRight, scope: 'style' },
+      ) ?? table.cellMarginRight,
+    },
   };
 }
 
@@ -676,6 +885,7 @@ export function tableFormatInput(table: TableLayoutSource): TableFormatInput {
   if (cached) return cached;
   const acquisition = tableAcquisitionInput(table);
   const ordinaryFlow = acquisition.table?.ordinaryFlow ?? table.tblpPr == null;
+  const cellFrame = acquisition.table?.cellFrame;
   const rows = table.rows.map((row, rowIndex) => {
     const rowWire = acquisition.rows[rowIndex]?.row ?? null;
     const exception = rowWire?.exception ?? null;
@@ -691,30 +901,29 @@ export function tableFormatInput(table: TableLayoutSource): TableFormatInput {
       ) ?? 0,
       justification: rowWire?.justification ?? exception?.justification ?? null,
       exception: normalizedTableRowException(exception),
-      cells: row.cells.map((cell, cellIndex) => ({
-        marginsPt: effectiveTableCellMargins(
-          table,
-          cell,
-          acquisition.rows[rowIndex]?.cells[cellIndex] !== null
-            && acquisition.rows[rowIndex]?.cells[cellIndex] !== undefined,
-          acquisition.rows[rowIndex]?.cells[cellIndex]?.margins,
-          exception?.cellMargins,
-          acquisition.table?.cellMargins,
-          rowWire?.styleCellMargins,
-        ),
-      })),
+      cells: row.cells.map((cell, cellIndex) => {
+        const wire = acquisition.rows[rowIndex]?.cells[cellIndex];
+        return effectiveTableCellMargins(
+          table, cell, wire != null, wire?.margins,
+          exception?.cellMargins, acquisition.table?.cellMargins, rowWire?.styleCellMargins,
+        );
+      }),
     };
   });
   const input = snapshotPlainData({
     effectiveStyleId: acquisition.table?.effectiveStyleId ?? null,
     ordinaryFlow,
+    ...(acquisition.table?.outerEdgeIndent === true ? { outerEdgeIndent: true } : {}),
     // §17.4.37 membership is decided by the parser; carry its facts verbatim.
     logicalSequenceId: acquisition.table?.logicalSequenceId ?? null,
     logicalRowOffset: acquisition.table?.logicalRowOffset ?? 0,
     logicalTotalRows: acquisition.table?.logicalTotalRows ?? 0,
-    positioning: ordinaryFlow || table.tblpPr == null
-      ? null
-      : floatingTablePositionInput(table.tblpPr),
+    // Only the producer elects a grid owner; individual paragraph frame facts
+    // never elect a nested OOXML table. Preserve authored TAP presence and
+    // acquire bounded grid-frame policy at the table compatibility boundary.
+    // `word-cell-owned-grid-frame`: a cell-owned TAP frame positions the table.
+    positioning: ordinaryFlow ? null : cellFrame ? cellOwnedGridFramePosition(cellFrame)
+      : table.tblpPr == null ? null : floatingTablePositionInput(table.tblpPr),
     rows,
     // `word-first-row-table-exception-scope` applies these selected facts
     // table-wide.
@@ -727,13 +936,27 @@ export function tableFormatInput(table: TableLayoutSource): TableFormatInput {
 export function adjacentTableSequenceInput(
   body: readonly BodyElement[],
 ): readonly import('./layout/adjacent-tables.js').AdjacentTableSequenceInput[] {
-  return Object.freeze(body.map((element) => {
-    if (element.type !== 'table') return Object.freeze({ element, table: null });
+  return Object.freeze([...adjacentTableSequenceEntries(body)]);
+}
+
+/** Yield one source fact at a time so body acquisition never retains a second
+ * body-sized array of these transient grouping inputs. */
+function* adjacentTableSequenceEntries(
+  body: readonly BodyElement[],
+): Generator<AdjacentTableSequenceInput> {
+  for (const element of body) {
+    if (element.type !== 'table') {
+      yield Object.freeze({ element, table: null });
+      continue;
+    }
     const format = tableFormatInput(element);
     // A hand-built public table has no acquisition wire and therefore no
     // parser-owned logical identity; it can never join a logical sequence.
-    if (format.logicalSequenceId == null) return Object.freeze({ element, table: null });
-    return Object.freeze({
+    if (format.logicalSequenceId == null) {
+      yield Object.freeze({ element, table: null });
+      continue;
+    }
+    yield Object.freeze({
       element,
       table: Object.freeze({
         logicalSequenceId: format.logicalSequenceId,
@@ -742,7 +965,7 @@ export function adjacentTableSequenceInput(
         rowCount: element.rows.length,
       }),
     });
-  }));
+  }
 }
 
 type AcquiredBodySectionReference = Readonly<{
@@ -825,19 +1048,28 @@ function acquiredBodyParagraph(paragraph: DocParagraph, source: SourceRef) {
     keepLines: paragraph.keepLines === true,
     keepNext: paragraph.keepNext === true,
     widowControl: paragraph.widowControl !== false,
+    ...(paragraph.framePr?.vAnchor === 'text' && paragraph.framePr.dropCap === 'none'
+      ? { textFrameMember: true as const } : {}),
     spaceBeforePt: paragraph.spaceBefore ?? 0,
     spaceAfterPt: paragraph.spaceAfter ?? 0,
     contextualSpacing: paragraph.contextualSpacing === true,
     styleId: paragraph.styleId ?? null,
     inkless: !paragraphHasUnavailableDrawing(paragraph) && isInklessParagraph(paragraph),
+    onlyTextualContent: !paragraphHasUnavailableDrawing(paragraph)
+      && paragraph.runs.every((run) => run.type === 'text'
+        || (run.type === 'break' && run.breakType === 'line')),
     ...(pageOwnedAnchorOccurrenceIds.length === 0 ? {} : { pageOwnedAnchorOccurrenceIds }),
   });
 }
 
-function acquiredBodyTable(source: SourceRef) {
+function acquiredBodyTable(source: SourceRef, table: TableLayoutSource) {
+  const positioning = effectiveTablePositioning(table);
   return Object.freeze({
     kind: 'table' as const,
     source,
+    ...(positioning?.vertAnchor === 'page' || positioning?.vertAnchor === 'margin'
+      ? { pageOwnedFloatingTable: true }
+      : {}),
   });
 }
 
@@ -846,7 +1078,7 @@ function bodyLayoutSequenceInput(
   sectionAtMarker: (bodyIndex: number) => AcquiredBodySectionReference,
 ): readonly BodyLayoutSequenceEntryFor<AcquiredBodySectionReference>[] {
   let bodyIndex = 0;
-  return Object.freeze(normalizeAdjacentTables(adjacentTableSequenceInput(body)).map((entry) => {
+  return Object.freeze(Array.from(normalizeAdjacentTables(adjacentTableSequenceEntries(body)), (entry) => {
     if (entry.kind === 'adjacent-table-group') {
       const firstIndex = bodyIndex;
       bodyIndex += entry.tables.length;
@@ -855,7 +1087,7 @@ function bodyLayoutSequenceInput(
         logicalSequenceId: entry.logicalSequenceId,
         source: bodySourceAt(firstIndex),
         tables: Object.freeze(entry.tables.map((table, tableIndex) => Object.freeze({
-          ...acquiredBodyTable(bodySourceAt(firstIndex + tableIndex)),
+          ...acquiredBodyTable(bodySourceAt(firstIndex + tableIndex), table),
           rowCount: table.rows.length,
         }))),
       });
@@ -874,7 +1106,7 @@ function bodyLayoutSequenceInput(
     if (element.type === 'table') {
       return Object.freeze({
         kind: 'body-block' as const,
-        block: acquiredBodyTable(source),
+        block: acquiredBodyTable(source, element),
       });
     }
     if (element.type === 'pageBreak' || element.type === 'columnBreak') {
@@ -882,6 +1114,9 @@ function bodyLayoutSequenceInput(
         kind: 'authored-break' as const,
         source,
         break: element.type === 'pageBreak' ? 'page' as const : 'column' as const,
+        ...(element.type === 'pageBreak' && element.origin !== undefined
+          ? { origin: element.origin }
+          : {}),
         ...(element.type === 'pageBreak' && element.parity !== undefined
           ? { parity: element.parity }
           : {}),
@@ -901,18 +1136,26 @@ function bodyLayoutSequenceInput(
   }));
 }
 
+/** Resolve the shared whole-table preference without acquiring cell contents. */
+export function effectiveTablePreferredWidthPt(
+  table: TableLayoutSource,
+  availableWidthPt: number,
+): number | null {
+  return projectEffectiveTablePreferredWidthPt(tableSourceAcquisitionInput(table), availableWidthPt);
+}
+
 /** Project normalized parser/model facts into the pure §17.18.87 solver contract. */
 export function tableColumnLayoutInput(
   table: TableLayoutSource,
   availableWidthPt: number,
-  intrinsicWidths: (cell: TableLayoutSource['rows'][number]['cells'][number]) => CellIntrinsicWidths,
+  intrinsicWidths: Parameters<BodyAcquisitionInputProjections['tableColumnLayoutInput']>[2],
   maximumWidthPt: number | null = availableWidthPt,
 ): import('./layout/types.js').TableColumnLayoutInput {
   const source = tableSourceAcquisitionInput(table);
   return projectTableColumnLayoutInput(
     source,
     availableWidthPt,
-    (rowIndex, cellIndex) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!),
+    (rowIndex, cellIndex, preferredWidth) => intrinsicWidths(table.rows[rowIndex]!.cells[cellIndex]!, preferredWidth),
     maximumWidthPt,
   );
 }
@@ -950,6 +1193,7 @@ function projectSectionPlacementInputs(doc: InternalDocxDocumentModel): Document
       pageBordersAuthored: wire?.pageBordersAuthored ?? false,
       pageBorders: wire?.pageBorders ?? null,
       pageGeometry: wire?.pageGeometry ?? element.geom ?? {},
+      ...sectionFlowFacts(wire, element.textDirection),
     }, 'DOCX ending-section placement input'));
     ordinal += 1;
   });
@@ -973,6 +1217,7 @@ function projectSectionPlacementInputs(doc: InternalDocxDocumentModel): Document
       pageBorders: finalWire?.pageBorders ?? doc.section?.pageBorders ?? null,
       pageGeometry: finalWire?.pageGeometry
         ?? (doc.section ? sectionPageBox(doc.section) : {}),
+      ...sectionFlowFacts(finalWire, doc.section?.textDirection),
     }, 'DOCX final-section placement input'),
   });
 }
@@ -1051,6 +1296,7 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
       columns: element.columns ?? null,
       authoredGeometry: normalizeSectionGeometryWire(placement.pageGeometry),
       textDirection: element.textDirection ?? null,
+      ...(placement.sectionFlow ? { sectionFlow: placement.sectionFlow } : {}),
       pageNumType: element.pageNumType ?? null,
       headers: element.headers ?? EMPTY_SECTION_HEADERS_FOOTERS,
       footers: element.footers ?? EMPTY_SECTION_HEADERS_FOOTERS,
@@ -1084,6 +1330,7 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
       ? sectionPageBox(doc.section)
       : normalizeSectionGeometryWire(placement.pageGeometry),
     textDirection: doc.section.textDirection ?? null,
+    ...(placement.sectionFlow ? { sectionFlow: placement.sectionFlow } : {}),
     pageNumType: doc.section.pageNumType ?? null,
     headers: doc.headers ?? EMPTY_SECTION_HEADERS_FOOTERS,
     footers: doc.footers ?? EMPTY_SECTION_HEADERS_FOOTERS,
@@ -1140,14 +1387,16 @@ export function bodySectionIndexInput(doc: DocxDocumentModel): BodySectionIndexI
     followingGutterPt = gutterPt;
   }
 
+  // Section placement is also consumed independently by public-model callers.
+  // Keep this immutable boundary; body acquisition reuses it by reference.
   return snapshotPlainData({
     bodyLength: doc.body.length,
     occurrences,
   }, 'DOCX body section index input') as BodySectionIndexInput;
 }
 
-/** Consume parser-owned document nodes and private settings into one clone-safe
- * structural value before layout resolves section contexts. */
+/** Acquire parser facts into a transient value. The following layout projection
+ * validates and snapshots its retained fields once, after section resolution. */
 export function bodyLayoutAcquisitionInput(doc: DocxDocumentModel): BodyLayoutAcquisitionInput {
   const sectionIndex = bodySectionIndexInput(doc);
   const incomingByMarker = new Map<number, BodySectionOccurrence>();
@@ -1163,8 +1412,10 @@ export function bodyLayoutAcquisitionInput(doc: DocxDocumentModel): BodyLayoutAc
       startType: occurrence.startType,
     });
   });
-  return snapshotPlainData({
+  return {
     sectionIndex,
+    compatibilityMode: doc.settings?.compatibilityMode,
+    footnoteLayoutLikeWW8: doc.settings?.footnoteLayoutLikeWW8,
     evenAndOddHeaders: doc.section.evenAndOddHeaders,
     endnoteIds: (doc.endnotes ?? []).map((note) => note.id),
     noteLayoutSettings: documentNoteLayoutSettingsInput(doc),
@@ -1174,7 +1425,7 @@ export function bodyLayoutAcquisitionInput(doc: DocxDocumentModel): BodyLayoutAc
       doc.body.length,
     ),
     sequence,
-  }, 'DOCX body layout acquisition input') as BodyLayoutAcquisitionInput;
+  };
 }
 
 /** Resolved transitional VML facts emitted by the parser in addition to the
@@ -1201,7 +1452,7 @@ export type InternalTextBoxBlock =
   | Extract<BodyElement, { type: 'paragraph' | 'table' }>
   | InternalUnsupportedTextBoxBlock;
 
-export interface InternalShapeRun extends ShapeRun {
+export interface InternalShapeRun extends ShapeRun, VmlShapeAcquisitionFacts {
   textPath?: InternalVmlTextPath | null;
   textBoxContent?: InternalTextBoxBlock[];
 }
@@ -1302,7 +1553,10 @@ export function numberingMarkerShapeInput(
     complexScript,
     fontHint: facts?.fontHint,
     eastAsiaLanguage: facts?.langEastAsia,
-    kerning: facts?.kerning == null ? undefined : fontSizePt >= facts.kerning,
+    // Marker-specific zero-threshold observations are absent. Preserve its
+    // previous size comparison; the mode-15 content-run extension is not
+    // evidence for generated numbering glyphs.
+    kerning: wordKerningApplies(fontSizePt, facts?.kerning),
   });
 }
 
@@ -1360,7 +1614,8 @@ export function paragraphMarkShapeInput(
     complexScript,
     fontHint: facts.fontHint,
     eastAsiaLanguage: facts.langEastAsia,
-    kerning: facts.kerning == null ? undefined : fontSizePt >= facts.kerning,
+    // Paragraph marks likewise have no measured zero-threshold evidence.
+    kerning: wordKerningApplies(fontSizePt, facts.kerning),
   });
 }
 
@@ -1406,7 +1661,7 @@ export function paragraphAcquisitionInput(
       ? {}
       : { hyperlinkAnchor: boundary.hyperlinkAnchor }),
   }));
-  const numbering = semanticParagraph.numbering as (NumberingInfo & { fontFacts?: InternalRunFontFacts }) | null;
+  const numbering = semanticParagraph.numbering as (InternalNumberingInfo) | null;
   const canonicalNumbering = numbering == null ? null : (({
     fontFacts: _privateNumberingFontFacts,
     ...retainedNumbering
@@ -1464,6 +1719,9 @@ export function paragraphAcquisitionInput(
       const internal = run as Partial<InternalMathRun>;
       return Object.freeze({
         type: 'math',
+        // §17.13.5 revision containers also wrap OMML. Resource acquisition
+        // must preserve omission/markup ownership independently of math content.
+        ...(run.revision ? { revision: Object.freeze({ ...run.revision }) } : {}),
         display: run.display,
         fontSize: run.fontSize,
         ...(run.jc === undefined ? {} : { jc: run.jc }),
@@ -1538,6 +1796,7 @@ export function paragraphAcquisitionInput(
         __noBreakBefore: noBreakBefore,
         __noBreakAfter: noBreakAfter,
         __noBreakHyphenOffsets: noBreakHyphenOffsets,
+        __optionalHyphen: optionalHyphen,
         ...publicRun
       } = run as typeof run & InternalNoBreakHyphenWire & {
         __typographyAcquisition?: InternalRunTypographyWire;
@@ -1549,6 +1808,7 @@ export function paragraphAcquisitionInput(
         : undefined;
       return Object.freeze({
         ...structuredClone(publicRun),
+        ...(optionalHyphen === true && run.type === 'text' ? { optionalHyphen: true } : {}),
         ...(noBreakBefore === true ? { noBreakBefore: true } : {}),
         ...(noBreakAfter === true ? { noBreakAfter: true } : {}),
         ...(noBreakRanges?.length ? { noBreakRanges: Object.freeze(noBreakRanges) } : {}),
@@ -1575,6 +1835,49 @@ export function paragraphAcquisitionInput(
     paragraphMarkShapeInput: paragraphMarkShapeInput(paragraph),
     ...(typographyInput === undefined ? {} : { typographyInput }),
   }) as unknown as ParagraphAcquisitionInput;
+}
+
+/** Immutable acquisition input of a reserved separator paragraph. Each
+ * participant enters as a text-free run with its own effective character
+ * properties, projected by the same text-run boundary as any other run
+ * (private typography sidecars included), then tagged with its separator
+ * role. The paragraph keeps its own paragraph and paragraph-mark facts. */
+export function reservedNoteSeparatorParagraphAcquisitionInput(
+  paragraph: DeepReadonly<DocParagraph>,
+  participants: readonly NoteSeparatorParticipant[],
+  source: SourceRef,
+): ParagraphAcquisitionInput {
+  const parserParagraph = {
+    ...(paragraph as unknown as DocParagraph),
+    type: 'paragraph',
+    runs: participants.map(({ run }) => ({ ...(run as unknown as DocxTextRun), type: 'text', text: '' })),
+  } as unknown as ParagraphLayoutSource;
+  const input = paragraphAcquisitionInput(parserParagraph, source);
+  if (input.runs.length !== participants.length) {
+    throw new Error('Reserved note separator participants were not projected one-to-one');
+  }
+  return deepFreezePlainData({
+    ...input,
+    runs: input.runs.map((run, index) => ({
+      ...run,
+      noteSeparatorCharacter: participants[index]!.role,
+    })),
+  }) as unknown as ParagraphAcquisitionInput;
+}
+
+/** Immutable acquisition input of an ordinary DOCX formatted separator
+ * paragraph. Its single mark run carries the paragraph mark's own rPr (the
+ * parser admits nothing else), so the run-free paragraph reserves exactly the
+ * shared paragraph-mark line box with the paragraph's spacing and line rule. */
+export function selectedNoteSeparatorParagraphAcquisitionInput(
+  paragraph: DeepReadonly<DocParagraph>,
+  source: SourceRef,
+): ParagraphAcquisitionInput {
+  return paragraphAcquisitionInput({
+    ...(paragraph as unknown as DocParagraph),
+    type: 'paragraph',
+    runs: [],
+  } as unknown as ParagraphLayoutSource, source);
 }
 
 /** Pure structural normalization for stable math addressing and parser-only
@@ -1651,10 +1954,23 @@ function normalizeInternalDocumentModelWithOwnership(
           runs.push(run);
           return;
         }
-        const shape = run as InternalShapeRun;
+        let shape = run as Extract<DocRun, { type: 'shape' }> & InternalShapeRun;
+        if (shape.textBlocks?.some(block => block.beforeAutospacing === true || block.afterAutospacing === true)) {
+          const textBlocks = shape.textBlocks.map(block => {
+            const spacing = resolveAutomaticParagraphMarginsPt(
+              block, block.defaultFontSize ?? block.fontSizePt, doc.settings?.doNotUseHtmlParagraphAutoSpacing === true,
+            );
+            return spacing.spaceBefore === block.spaceBefore && spacing.spaceAfter === block.spaceAfter
+              ? block : { ...block, ...spacing };
+          });
+          if (textBlocks.some((block, index) => block !== shape.textBlocks?.[index])) {
+            shape = { ...shape, textBlocks };
+            runsChanged = true;
+          }
+        }
         const content = shape.textBoxContent;
         if (content === undefined) {
-          runs.push(run);
+          runs.push(shape as DocRun);
           return;
         }
         const shapeSource: SourceRef = {
@@ -1680,25 +1996,32 @@ function normalizeInternalDocumentModelWithOwnership(
           textBoxContent[blockIndex] = normalized;
         });
         if (!contentChanged) {
-          runs.push(run);
+          runs.push(shape as DocRun);
           return;
         }
         runsChanged = true;
         if (consumeOwned) {
           shape.textBoxContent = textBoxContent;
-          runs.push(run as DocRun);
+          runs.push(shape as DocRun);
         } else {
-          runs.push({ ...run, textBoxContent } as DocRun);
+          runs.push({ ...shape, textBoxContent } as DocRun);
         }
       });
+      const spacing = resolveAutomaticParagraphMarginsPt(
+        element, element.defaultFontSize ?? 10,
+        doc.settings?.doNotUseHtmlParagraphAutoSpacing === true,
+      );
+      const spacingChanged = spacing.spaceBefore !== element.spaceBefore
+        || spacing.spaceAfter !== element.spaceAfter;
       let paragraph: Extract<BodyElement, { type: 'paragraph' }>;
       if (consumeOwned) {
         if (runsChanged) Object.assign(element, { runs });
+        if (spacingChanged) Object.assign(element, spacing);
         delete (element as InternalDocParagraph).__runRevisions;
         paragraph = element;
-      } else if (runsChanged) {
+      } else if (runsChanged || spacingChanged) {
         const { __runRevisions: _privateRunRevisions, ...publicParagraph } = internalParagraph;
-        paragraph = { ...publicParagraph, runs } as Extract<BodyElement, { type: 'paragraph' }>;
+        paragraph = { ...publicParagraph, ...spacing, runs } as Extract<BodyElement, { type: 'paragraph' }>;
       } else {
         paragraph = element;
       }
@@ -1867,23 +2190,15 @@ export function normalizeDocxDocumentModel(doc: DocxDocumentModel): DocxDocument
   return normalizeInternalDocumentModel(doc).document;
 }
 
-export function internalFieldRun(run: FieldRun): InternalFieldRun {
-  return run as InternalFieldRun;
-}
-
-export function internalTextRun(run: DocxTextRun): InternalTextRun {
-  return run as InternalTextRun;
-}
-
-export function internalNumberingInfo(numbering: NumberingInfo): InternalNumberingInfo {
+function internalNumberingInfo(numbering: NumberingInfo): InternalNumberingInfo {
   return numbering as InternalNumberingInfo;
 }
 
-export function internalParagraph(paragraph: ParagraphLayoutSource): InternalDocParagraph {
+function internalParagraph(paragraph: ParagraphLayoutSource): InternalDocParagraph {
   return paragraph as unknown as InternalDocParagraph;
 }
 
-export function internalDocumentModel(doc: DocxDocumentModel): InternalDocxDocumentModel {
+function internalDocumentModel(doc: DocxDocumentModel): InternalDocxDocumentModel {
   return doc as InternalDocxDocumentModel;
 }
 
@@ -1894,6 +2209,8 @@ export const bodyAcquisitionInputProjections = Object.freeze({
   numberingMarkerShapeInput,
   paragraphMarkShapeInput,
   tableFormatInput,
+  tableSourceAcquisitionInput,
+  effectiveTablePreferredWidthPt,
   tableColumnLayoutInput,
   tableParticipatesInOrdinaryFlow,
   paragraphAcquisitionInput,

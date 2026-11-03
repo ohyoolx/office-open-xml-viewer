@@ -1,3 +1,4 @@
+import { sourceOwnedTextPlacements, type SourceOwnedTextGeometry } from './text-source-ownership.js';
 import {
   composeAffine,
   quarterTurnAffine,
@@ -20,11 +21,11 @@ import type {
   SourceRef,
   TableLayout,
   TextBoxLayout,
-  TextPlacement,
+  UprightResourceOrientation,
 } from './types.js';
 
 export interface TextRunGeometry {
-  readonly placement: TextPlacement;
+  readonly placement: SourceOwnedTextGeometry;
   readonly pointToPage: Matrix2DData;
   /** Canonical structural source of the owning paragraph. */
   readonly source: ParagraphLayout['source'];
@@ -113,7 +114,7 @@ function appendRasterPaintOccurrence(
   bounds: LayoutRect,
   pointToPage: Matrix2DData,
   options: Readonly<{
-    orientation?: 'upright-physical';
+    orientation?: UprightResourceOrientation;
     textBoxVerticalMode?: NonNullable<TextBoxLayout['verticalMode']>;
   }> = {},
 ): void {
@@ -130,8 +131,14 @@ function appendRasterPaintOccurrence(
     );
     [localWidthPt, localHeightPt] = [localHeightPt, localWidthPt];
   }
-  if (options.orientation === 'upright-physical') {
-    matrix = composeAffine(matrix, COUNTER_CLOCKWISE_QUARTER_TURN);
+  if (options.orientation !== undefined) {
+    // The retained local turn inverts the owner section's quarter turn.
+    matrix = composeAffine(
+      matrix,
+      options.orientation === 'upright-physical'
+        ? COUNTER_CLOCKWISE_QUARTER_TURN
+        : CLOCKWISE_QUARTER_TURN,
+    );
     [localWidthPt, localHeightPt] = [localHeightPt, localWidthPt];
   }
   const widthPt = localWidthPt * Math.hypot(matrix.a, matrix.b);
@@ -168,7 +175,17 @@ function collectDrawingRasterPaintOccurrences(
       );
       continue;
     }
+    if (command.kind === 'watermark-text' && command.imageResourceKey) {
+      appendRasterPaintOccurrence(context, command.imageResourceKey, 'image', command.maskBounds ?? command.rect, projection.pointToPage);
+    }
     if (command.kind !== 'drawingml-image-fill') continue;
+    // Part 4 §§19.1.2.12/.21: a physical textured pen has ink even on
+    // a zero-height/width line. Decode against its acquired mask extent;
+    // allocation-only demand would silently classify this visible pen as empty.
+    if (command.strokeMask && command.maskBounds) {
+      appendRasterPaintOccurrence(context, command.resourceKey, 'image', command.maskBounds, projection.pointToPage);
+      continue;
+    }
     const { x, y, w, h } = command.plan.rect;
     const fillRect = command.fillRect ?? { l: 0, t: 0, r: 0, b: 0 };
     appendRasterPaintOccurrence(context, command.resourceKey, 'image', {
@@ -292,9 +309,15 @@ function visitTextBox(
 ): void {
   if (context.emittedTextBoxes.has(textBox.id)) return;
   context.emittedTextBoxes.add(textBox.id);
+  // A text box story is its own coordinate root: its resolved floating-table
+  // placements and the page-owned axes of drawings anchored in it are stated
+  // in story coordinates (story-page-frames.ts), which `pointToPage` already
+  // maps. Only translations taken inside the story are undone for them, never
+  // those that placed the box's own paragraph (a table cell's).
   const transformedProjection: NodeProjection = {
     ...projection,
     pointToPage: composeAffine(projection.pointToPage, textBox.transform),
+    layoutTranslationPt: { xPt: 0, yPt: 0 },
     textBoxVerticalMode: textBox.verticalMode ?? projection.textBoxVerticalMode,
   };
   const textBoxProjection = withClip(transformedProjection, textBox.clipBounds);
@@ -373,6 +396,9 @@ function visitParagraph(
   context: ProjectionContext,
 ): void {
   const paragraphProjection = withClip(projection, paragraph.clipBounds);
+  const textBoxesById = new Map(
+    paragraph.textBoxes.map((textBox) => [textBox.id, textBox]),
+  );
   if (
     context.collectCompletedParagraphSources
     && paragraph.continuation?.continuesOnNext !== true
@@ -380,9 +406,19 @@ function visitParagraph(
     context.completedParagraphSources.add(sourceKey(paragraph.source));
   }
   if (context.collectTextRuns || context.collectTextRunSources) {
+    const inlineTextDrawings = new Map(paragraph.drawings
+      .filter((drawing) => !drawing.anchorLayer && (drawing.textBoxIds?.length ?? 0) > 0)
+      .map((drawing) => [drawing.id, drawing]));
     for (const line of paragraph.lines) {
-      for (const placement of line.placements) {
-        if (placement.kind === 'text') {
+      for (const retained of line.placements) {
+        // ECMA-376 §20.4.2.8: an inline drawing occupies its run's place in
+        // paragraph flow. Library selection policy includes nested text there
+        // for copy; floating stories keep their separate reading-order policy.
+        if (retained.kind === 'drawing') {
+          const drawing = inlineTextDrawings.get(retained.drawingId);
+          if (drawing) visitDrawing(textBoxesById, drawing, paragraphProjection, context);
+        }
+        if (retained.kind === 'text') for (const placement of sourceOwnedTextPlacements(retained)) {
           if (context.collectTextRuns) {
             context.runs.push(Object.freeze({
               placement,
@@ -426,9 +462,6 @@ function visitParagraph(
     }
   }
 
-  const textBoxesById = new Map(
-    paragraph.textBoxes.map((textBox) => [textBox.id, textBox]),
-  );
   const ownedTextBoxIds = new Set<string>();
   const drawingsInSourceOrder = paragraph.drawings
     .map((drawing, index) => {
@@ -495,10 +528,24 @@ function visitTable(
   const tableProjection = withClip(projection, table.clipBounds);
   for (const row of table.rows) {
     for (const cell of row.cells) {
-      const ownsContinuationPaint = 'visualMergeOwnership' in cell
-        && cell.visualMergeOwnership === 'continuation';
+      const ownsContinuationPaint = cell.visualMergeOwnership === 'continuation';
       if (cell.verticalMerge === 'continue' && !ownsContinuationPaint) continue;
       const cellProjection = withClip(tableProjection, cell.clipBounds);
+      if (cell.verticalText) {
+        // ECMA-376 §17.4.72: map the rotated local frame into the table.
+        const rotatedProjection: NodeProjection = {
+          ...cellProjection,
+          pointToPage: composeAffine(cellProjection.pointToPage, cell.verticalText.transform),
+          textBoxVerticalMode: cell.verticalText.mode,
+        };
+        for (const block of cell.blocks) {
+          visitNode(block.layout, placedChildProjection(block.layout, {
+            xPt: cell.contentBounds.xPt,
+            yPt: block.offsetPt,
+          }, rotatedProjection), context);
+        }
+        continue;
+      }
       for (const block of cell.blocks) {
         const child = block.layout;
         visitNode(child, placedChildProjection(child, {
@@ -530,11 +577,16 @@ function visitNode(
     case 'table':
       visitTable(node, projection, context);
       return;
-    case 'note':
+    case 'note': {
+      // Separator/notice paragraphs carry only zero-advance participants, so
+      // they add source ownership but no selectable text.
+      if (node.leading?.paragraph) visitNode(node.leading.paragraph, projection, context);
       for (const block of node.story.blocks) {
         visitNode(block, withClip(projection, node.story.clipBounds), context);
       }
+      if (node.trailing?.paragraph) visitNode(node.trailing.paragraph, projection, context);
       return;
+    }
     case 'textbox':
       visitTextBox(node, projection, context);
       return;
@@ -686,44 +738,6 @@ export function reviewProjectionIndexForDocument(
     for (const key of page.completedParagraphSources) completedSourceKeys.add(key);
   }
   return Object.freeze({ renderedRunIndex, completedSourceKeys });
-}
-
-/** Canonical paragraph sources that have an occurrence in the supplied layout.
- * Unlike the rendered-run index this includes empty and final-state-hidden
- * paragraphs, so a provisional review projection can distinguish content that
- * is already paginated from content that belongs to a future prefix. */
-export function completedParagraphSourceKeysForDocument(
-  layout: DocumentLayout,
-): ReadonlySet<string> {
-  const result = new Set<string>();
-  for (let pageIndex = 0; pageIndex < layout.pages.length; pageIndex += 1) {
-    const pageSources = pageGeometryIndex(layout, pageIndex, {
-      collectTextRuns: false,
-      collectTextRunSources: false,
-      collectCompletedParagraphSources: true,
-      collectDrawings: false,
-    }).completedParagraphSources;
-    for (const key of pageSources) result.add(key);
-  }
-  return result;
-}
-
-/**
- * Index retained drawings in page paint order. The projection is shared with
- * text-box painting, including vertical-page and page-owned anchor transforms.
- */
-export function drawingGeometryForPage(
-  layout: DocumentLayout,
-  pageIndex: number,
-): readonly DrawingGeometry[] {
-  const drawings = pageGeometryIndex(layout, pageIndex, {
-    collectTextRuns: false,
-    collectTextRunSources: false,
-    collectDrawings: true,
-  }).drawings;
-  drawings.sort((left, right) => left.paintOrderIndex - right.paintOrderIndex ||
-    left.sourceOrder - right.sourceOrder);
-  return Object.freeze(drawings);
 }
 
 /** Index selectable drawings and inline image/chart placements in page paint order. */

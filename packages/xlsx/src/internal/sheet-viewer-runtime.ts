@@ -1,4 +1,8 @@
+import { inheritCellFontLanguage } from './cell-font-language.js';
 import type { Worksheet } from '../types.js';
+import { inheritWorksheetPreviewBounds } from './worksheet-content-bounds.js';
+import { inheritWorksheetPolicy } from '../worksheet-policy-context.js';
+import { inheritWorksheetSizeContext } from './worksheet-size-context.js';
 import type { XlsxWorkbook } from '../workbook.js';
 import type { CellAddress, XlsxSelectionArea, XlsxSelectionState } from '../selection.js';
 import { areaContainsCell, MAX_SELECTION_AREAS, normalizeSelectionState } from '../selection.js';
@@ -37,13 +41,18 @@ export class SheetAcquisition {
  * Cell/content graphs remain shared and read-only; only the maps and row flags
  * changed by view-only resize/outline interactions are copied. */
 export function createSheetViewModel(source: Worksheet): Worksheet {
-  return {
+  const view: Worksheet = {
     ...source,
     rows: source.rows.map((row) => ({ ...row })),
     rowHeights: { ...source.rowHeights },
     colWidths: { ...source.colWidths },
-    colCollapsed: source.colCollapsed ? { ...source.colCollapsed } : undefined,
   };
+  if (source.colCollapsed) view.colCollapsed = { ...source.colCollapsed };
+  inheritCellFontLanguage(source, view);
+  inheritWorksheetPreviewBounds(source, view);
+  inheritWorksheetPolicy(source, view);
+  inheritWorksheetSizeContext(source, view);
+  return view;
 }
 
 /** Logical viewport independent of native browser scrolling. */
@@ -167,17 +176,15 @@ export class SheetRenderDispatcher {
     });
   }
 
-  schedule(render: () => void | Promise<void>): void {
+  /** Scroll-only requests may finish the active frame before starting the
+   * latest queued viewport. Invalidating every completed frame under continuous
+   * input would starve presentation whenever a worker takes longer than one
+   * input interval. Other changes still supersede the active generation. */
+  schedule(render: () => void | Promise<void>, viewportOnly = false): void {
     if (this.destroyed) return;
     this.pendingRender = render;
     if (this.activeRender) {
-      // A queued viewport supersedes the frame currently awaiting a worker
-      // bitmap immediately, not only when the queued callback eventually gets
-      // its backpressure slot. Otherwise the old bitmap can still commit after
-      // scroll/resize state has changed and briefly disagree with the live
-      // gutters/overlays. The queued callback calls begin() again when it starts
-      // and becomes the sole current generation.
-      this.begin();
+      if (!viewportOnly) this.begin();
       return;
     }
     if (this.animationFrame !== null) return;

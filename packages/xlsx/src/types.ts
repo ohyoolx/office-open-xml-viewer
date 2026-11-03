@@ -8,6 +8,7 @@ import type {
   ChartThreeDRenderer,
   ChartRegionMapRenderer,
   ChartExRenderer,
+  BlipEffect,
 } from '@silurus/ooxml-core';
 
 export type ShapeFill = Exclude<Fill, { fillType: 'image' } | { fillType: 'none' }>;
@@ -31,8 +32,8 @@ export interface Workbook {
    *  break it can't be attributed to one placeholder sheet. Tagged with the
    *  offending part (e.g. `"xl/sharedStrings.xml: <detail>"`) so the loss is
    *  surfaced instead of silent, while every sheet still renders its non-string
-   *  content. Absent (`undefined`) when every shared part read cleanly. Also set
-   *  (`"(zip container): <detail>"`) for a whole-container degradation (#774). */
+   *  content. Absent (`undefined`) when every shared part read cleanly. Input that
+   *  is not a SpreadsheetML package is rejected with `OoxmlError('not-ooxml')`. */
   parseError?: string;
 }
 
@@ -91,6 +92,13 @@ export interface Worksheet {
    *  `colWidths[c] === 0`. Only `true` entries. */
   colHidden?: Record<number, boolean>;
   defaultColWidth: number;
+  /** `<sheetFormatPr baseColWidth>` (§18.3.1.81), when no explicit
+   *  `defaultColWidth` is authored. */
+  baseColWidth?: number;
+  /** True only when `<sheetFormatPr>` is absent: `defaultColWidth` then holds
+   *  the library's 8.43 UI-character fallback (padding excluded, ECMA-376
+   *  §18.3.1.13) rather than a stored width. Omitted when false. */
+  defaultColWidthIsUi?: boolean;
   defaultRowHeight: number;
   /** `<sheetFormatPr customHeight>` (ECMA-376 §18.3.1.81). When true, rows
    *  without their own `ht` use the manually authored sheet default instead of
@@ -159,14 +167,29 @@ export interface Worksheet {
    *  Cross-sheet `<xm:f>` data references are resolved to numeric values at
    *  parse time, and theme + tint colors are flattened to `#RRGGBB`. */
   sparklineGroups?: SparklineGroup[];
-  /** Family name of the workbook's Normal-style font, resolved by the parser
-   *  from `<cellStyleXfs>[0].fontId` → `<fonts>[fontId].name.val`. The
-   *  renderer uses this together with `defaultFontSize` to compute the Max
-   *  Digit Width for column-width pixel conversion (ECMA-376 §18.3.1.13).
+  /** Family name of the workbook's default font, `<fonts>[0]`. The renderer
+   *  uses this together with `defaultFontSize` to compute the Max Digit Width
+   *  for column-width pixel conversion (ECMA-376 §18.3.1.13); measured in
+   *  Excel, columns follow `<fonts>[0]` rather than the Normal cell style.
    *  Workbook-wide value, denormalized onto every worksheet. */
   defaultFontFamily?: string;
-  /** Point size of the workbook's Normal-style font (`<fonts>[N].sz.val`). */
+  /** Point size of the workbook's default font (`<fonts>[0]`). */
   defaultFontSize?: number;
+  /** Bold/italic bits of the default font (`<fonts>[0]`).
+   * Omitted means false; MDW must use the same face tuple as Excel. */
+  defaultFontBold?: boolean;
+  defaultFontItalic?: boolean;
+  /** Point size of the Normal cell style's font (`builtinId="0"`, else
+   *  `<cellStyleXfs>[0]`): the automatic row-height baseline. Falls back to
+   *  `defaultFontSize` when absent. */
+  normalFontSize?: number;
+  /** Workbook theme major Jpan face (`<a:majorFont><a:font script="Jpan">`).
+   *  Used for scheme-marked cells when the workbook's load-time viewer language
+   *  starts with 'ja', a proxy for Excel's unencoded UI/editing language on any
+   *  OS. Re-open the workbook to apply a viewer language change. */
+  themeJapaneseMajorFont?: string;
+  /** Workbook theme minor Jpan face; see `themeJapaneseMajorFont`. */
+  themeJapaneseMinorFont?: string;
   /** Workbook date system (`<workbookPr date1904>`, ECMA-376 §18.2.28),
    *  denormalized onto every worksheet by the parser so the cell formatter can
    *  resolve serial dates (§18.17.4.1) without a workbook back-reference.
@@ -198,6 +221,37 @@ export interface PivotTableMetadata {
   cacheSource?: PivotCacheSource;
   status: PivotMetadataStatus;
   extensionUris?: string[];
+  /** ECMA-376 §18.10.1.97 applied PivotTable style, elements resolved. */
+  style?: PivotTableStyle;
+  /** ECMA-376 §18.10.1.84 row items, one per body row. */
+  rowItems?: PivotAxisItem[];
+  /** ECMA-376 §18.10.1.19 column items, one per data column. */
+  columnItems?: PivotAxisItem[];
+}
+
+export interface PivotTableStyle {
+  name: string;
+  showRowHeaders: boolean;
+  showColumnHeaders: boolean;
+  showRowStripes: boolean;
+  showColumnStripes: boolean;
+  showLastColumn: boolean;
+  elements: PivotTableStyleElement[];
+}
+
+export interface PivotTableStyleElement {
+  /** ECMA-376 §18.18.77 ST_TableStyleType. */
+  kind: string;
+  /** Stripe band size (§18.8.41). */
+  size: number;
+  dxf: Dxf;
+}
+
+export interface PivotAxisItem {
+  /** ECMA-376 §18.18.43 ST_ItemType (`data`, `default`, …, `grand`, `blank`). */
+  kind: string;
+  /** Zero-based field level of the item. */
+  depth: number;
 }
 
 export interface PivotLocation extends WorksheetCellRange {
@@ -342,32 +396,37 @@ export interface TableInfo {
   showColumnStripes: boolean;
   showFirstColumn: boolean;
   showLastColumn: boolean;
-  /** Accent color resolved by the parser from the built-in style name against
-   *  the file's theme accents (e.g. `TableStyleLight18` → accent3). */
+  /** Accent color of a built-in style name under the file's theme
+   *  (e.g. `TableStyleLight18` → accent3). Informational: rendering uses
+   *  `styleElements`. */
   accentColor: string;
   /** `true` when `styleName` is defined in the file's `<tableStyles>` block,
-   *  i.e. a *custom* style (ECMA-376 §18.5.1.2). The renderer draws such tables
-   *  strictly from their declared element dxfs and must NOT apply the accent
-   *  approximation (banding / synthesized rules / header) reserved for built-in
-   *  style names whose definitions are absent from the file. */
+   *  i.e. a *custom* style (ECMA-376 §18.5.1.2). Informational. */
   isCustom?: boolean;
-  /** Dxf index for the `wholeTable` element of a custom `<tableStyle>`
-   *  (ECMA-376 §18.8.83). When set, its border/fill apply to every cell of
-   *  the table as a base layer. Undefined for built-in style names. */
+  /** Workbook dxf index of the custom style's `wholeTable` element. The
+   *  `*Dxf` indices below are informational: `styleElements` carries every
+   *  element with its format inline. */
   wholeTableDxf?: number;
-  /** Dxf index for the `headerRow` element of a custom `<tableStyle>` —
-   *  provides header background, font color/weight, and vertical separators. */
+  /** Workbook dxf index of the custom style's `headerRow` element. */
   headerRowDxf?: number;
-  /** Dxf index for the `totalRow` element (ECMA-376 §18.18.93). */
+  /** Workbook dxf index of the `totalRow` element. */
   totalRowDxf?: number;
-  /** Dxf index for the `firstColumn` element. */
+  /** Workbook dxf index of the `firstColumn` element. */
   firstColumnDxf?: number;
-  /** Dxf index for the `lastColumn` element. */
+  /** Workbook dxf index of the `lastColumn` element. */
   lastColumnDxf?: number;
-  /** Dxf index for `firstRowStripe` (band1 horizontal) — odd banded-row stripe. */
+  /** Workbook dxf index of `firstRowStripe`. */
   band1HorizontalDxf?: number;
-  /** Dxf index for `secondRowStripe` (band2 horizontal) — even banded-row stripe. */
+  /** Workbook dxf index of `secondRowStripe`. */
   band2HorizontalDxf?: number;
+  /** The table style's elements (ECMA-376 §18.8.41) with their formats
+   *  inline: a workbook `<tableStyle>` (§18.8.40), else the built-in Annex G
+   *  style of that name. Absent when the table has no style, names no known
+   *  style, or its style cannot be applied as authored (`styleError`). */
+  styleElements?: PivotTableStyleElement[];
+  /** The field that kept a workbook table style from being applied as
+   *  authored; the table is then drawn without its style. */
+  styleError?: string;
   /** Per-column DXF references (ECMA-376 §18.5.1.3 `tableColumn`). Index by
    *  `cellCol - range.left`. The renderer can use these to apply column-level
    *  overlays for named-style tables; for files where Excel pre-bakes the
@@ -476,6 +535,7 @@ export type {
   ChartErrBars,
   ChartManualLayout,
   LegendManualLayout,
+  BlipEffect,
 } from '@silurus/ooxml-core';
 export interface ChartAnchor {
   /** DrawingML document order; higher values paint above lower values. */
@@ -491,20 +551,34 @@ export interface ChartAnchor {
   chart: ChartModel;
 }
 
+/** Which DrawingML anchor element (ECMA-376 Part 1 §20.5.2) carried the
+ *  object. This is a normative fact recorded from the actual XML element name
+ *  and is never inferred from geometry. Absent means "not recorded" (older
+ *  models, VML/OLE previews, producers without DrawingML anchors). */
+export type DrawingAnchorTag = 'oneCellAnchor' | 'twoCellAnchor';
+
 export interface ShapeAnchor {
   fromCol: number; fromColOff: number;
   fromRow: number; fromRowOff: number;
   toCol: number;   toColOff: number;
   toRow: number;   toRowOff: number;
-  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). With `"oneCell"` the
-   *  renderer uses `nativeExtCx`/`nativeExtCy` as the on-sheet size, since
-   *  Excel preserves the group's saved EMU extent regardless of cell
-   *  resizing ("Move but don't size with cells"). Absent ⇒ default `"twoCell"`. */
+  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). It governs
+   *  how band edits move/resize the object (§20.5.3.2). Library policy:
+   *  only untagged models with `"oneCell"` size from `nativeExtCx/Cy`.
+   *  Absent ⇒ default `"twoCell"`. */
   editAs?: string;
-  /** Saved EMU extent of the top-level grpSp (or the stand-alone sp/pic).
-   *  Authoritative when `editAs === "oneCell"`. 0 = unavailable. */
+  /** Raw EMU xfrm ext of the top-level grpSp (or the stand-alone sp/pic).
+   *  Used for sizing only by the untagged compatibility policy.
+   *  0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
+  /** XML anchor element kind (normative fact). Absent = not recorded. */
+  anchorTag?: DrawingAnchorTag;
+  /** `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (§20.5.2.24): the
+   *  anchor-level display size. It is distinct from `nativeExtCx/Cy`. Absent
+   *  for twoCellAnchor and for a missing or unparsable attribute. */
+  anchorExtCx?: number;
+  anchorExtCy?: number;
   shapes: ShapeInfo[];
 }
 
@@ -542,6 +616,12 @@ export interface ShapeInfo {
 }
 
 export interface ShapeText {
+  /** DrawingML vertical text mode (ECMA-376 §20.1.10.83). */
+  vert?: string;
+  /** Center the longest column along its axis (§21.1.2.1.1). */
+  anchorCtr?: boolean;
+  /** Include spacing at the first/last paragraph edges (§21.1.2.1.1). */
+  spcFirstLastPara?: boolean;
   /** `<a:bodyPr@anchor>` — vertical alignment of the text block within the
    *  shape rect. `t` (top, default), `ctr` (middle), `b` (bottom). */
   anchor: string;
@@ -587,9 +667,19 @@ export interface ShapeParagraph {
   /** `<a:pPr@indent>` — first-line indent in EMU (negative = hanging),
    *  ECMA-376 §21.1.2.2.7. Omitted (undefined) when unset. */
   indent?: number;
+  /** `<a:pPr@defTabSz>` — default tab interval in EMU; omitted when unset. */
+  defTabSz?: number;
+  /** Authored `<a:pPr>/<a:tabLst>/<a:tab>` stops, in EMU. */
+  tabStops?: { pos: number; algn: string }[];
   /** `<a:pPr>/<a:lnSpc>` line spacing (ECMA-376 §21.1.2.2.5). Direct-only;
    *  omitted when unset. */
   spaceLine?: SpaceLine | null;
+  /** `<a:pPr>/<a:spcBef>` space before the paragraph (ECMA-376 §21.1.2.2.10).
+   *  Direct-only; omitted when unset. */
+  spaceBefore?: SpaceLine | null;
+  /** `<a:pPr>/<a:spcAft>` space after the paragraph (ECMA-376 §21.1.2.2.9).
+   *  Direct-only; omitted when unset. */
+  spaceAfter?: SpaceLine | null;
   runs: ShapeTextRun[];
 }
 
@@ -606,19 +696,17 @@ export type ShapeTextRun =
       /** Font size in points (already converted from `<a:rPr@sz>` 100ths-of-a-pt).
        *  0 = inherit (renderer falls back to its default). */
       size: number;
+      /** `<a:rPr@spc>` in points (§20.1.10.74). */
+      spacing?: number;
       color?: string;
       fontFace?: string;
-      /** East-Asian typeface (`<a:ea@typeface>`, ECMA-376 §21.1.2.3.1). The
-       *  common Japanese encoding sets Meiryo here while leaving `<a:latin>`
-       *  default; the renderer floors the line box by this face's design line
-       *  too (see `drawShapeText`). Undefined when the run declares no `<a:ea>`. */
+      /** East-Asian typeface (`<a:ea@typeface>`, ECMA-376 §21.1.2.3.1).
+       *  A distinct face is retained for future script-run routing; the
+       *  single-resource Office line projection declines mixed face slots. */
       fontFaceEa?: string;
       /** Complex-script typeface (`<a:cs@typeface>`, ECMA-376 §21.1.2.3.1).
-       *  Parsed/modeled but NOT used in the line-box floor: the cs face renders
-       *  only complex-script glyphs (Arabic/Hebrew/Thai), so flooring the whole
-       *  line box by it would over-grow Latin/CJK runs (deferred to per-glyph
-       *  handling — see `drawShapeText`). Undefined when the run declares no
-       *  `<a:cs>`. */
+       *  A distinct face is not applied to a whole-line metric until script
+       *  runs can be resolved independently. */
       fontFaceCs?: string;
     }
   | { type: 'break' }
@@ -665,12 +753,17 @@ export type ShapeGeom =
        *  1-b]`). Absent ⇒ the whole blip fills the leaf rect. Honored identically
        *  to the top-level {@link ImageAnchor.srcRect} (raster only). */
       srcRect?: { l: number; t: number; r: number; b: number };
-      /** ECMA-376 §20.1.8.6 `<a:alphaModFix@amt>` opacity fraction (0..1) on the
-       *  leaf pic. Absent ⇒ opaque. Applied via `globalAlpha`. */
+      /** Legacy whole-leaf opacity (0..1) for model-source callers, applied
+       *  via `globalAlpha`. Parsed leaves carry `<a:alphaModFix>` in
+       *  {@link blipEffects} instead, so it is never applied twice. */
       alpha?: number;
       /** ECMA-376 §20.1.8.23 `<a:duotone>` recolour on the leaf pic. Absent ⇒
        *  no effect. */
       duotone?: Duotone;
+      /** Ordered CT_Blip effects (§20.1.8.13) on the leaf pic, applied to the
+       *  decoded pixels in authored order. Absent for a plain picture or a
+       *  lone duotone (see {@link duotone}). */
+      blipEffects?: BlipEffect[];
     };
 
 /** ECMA-376 §20.1.8.23 `<a:duotone>` image effect, resolved to its two endpoint
@@ -686,6 +779,11 @@ export interface Duotone {
 export interface PathInfo {
   w: number;
   h: number;
+  /** ECMA-376 §20.1.9.15 `a:path@fill` when not `norm` (ST_PathFillMode
+   *  §20.1.10.37). `none` leaves the path unfilled. */
+  fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+  /** ECMA-376 §20.1.9.15 `a:path@stroke`; present only when `false`. */
+  stroke?: false;
   commands: PathCmd[];
 }
 
@@ -714,16 +812,26 @@ export interface ImageAnchor {
   toColOff: number;
   toRow: number;
   toRowOff: number;
-  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33). `"oneCell"` instructs the
-   *  renderer to use `nativeExtCx`/`nativeExtCy` as the size and ignore the
-   *  `to` anchor (Excel's "Move but don't size with cells"). Absent ⇒ default
-   *  `"twoCell"`. Also set to `"oneCell"` for one-cell pictures. */
+  /** `twoCellAnchor@editAs` (ECMA-376 §20.5.2.33; normative fact). It governs
+   *  how band edits move/resize the picture (§20.5.3.2). For a tagged
+   *  `twoCellAnchor`, the initial display rect is always `from`/`to`.
+   *  Library compatibility policy: only untagged `"oneCell"` models size from
+   *  `nativeExtCx/Cy`. Absent ⇒ default `"twoCell"`. */
   editAs?: string;
-  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU, or anchor-level
-   *  `<xdr:ext>` for a one-cell picture without child xfrm. The saved size
-   *  is authoritative when `editAs === "oneCell"`. 0 = unavailable. */
+  /** XML anchor element kind (normative fact). Absent = not recorded. */
+  anchorTag?: DrawingAnchorTag;
+  /** `<xdr:oneCellAnchor><xdr:ext cx cy>` in EMU (§20.5.2.24): the
+   *  anchor-level display size. Absent for twoCellAnchor. */
+  anchorExtCx?: number;
+  anchorExtCy?: number;
+  /** `<xdr:pic><xdr:spPr><a:xfrm><a:ext cx cy>` in EMU: the raw child
+   *  transform extent. 0 = unavailable. */
   nativeExtCx: number;
   nativeExtCy: number;
+  /** Non-identity `<a:xfrm>` transform. Rotation is clockwise degrees. */
+  rotation?: number;
+  flipH?: boolean;
+  flipV?: boolean;
   /** Zip path of the blip inside the package (e.g. `xl/media/image1.png`). The
    *  blip's own `r:embed` raster fallback when an svgBlip extension is present;
    *  otherwise the only source. Falls back to the SVG part itself when the
@@ -745,15 +853,19 @@ export interface ImageAnchor {
    *  cropped sub-rectangle (raster only — a metafile is rasterized to the
    *  display box, so its crop can't be honored faithfully and is skipped). */
   srcRect?: { l: number; t: number; r: number; b: number };
-  /** ECMA-376 §20.1.8.6 `<a:alphaModFix@amt>` — the blip's overall opacity as a
-   *  fraction (0..1). Absent ⇒ opaque. The renderer sets `ctx.globalAlpha` so the
-   *  picture composites over the cells beneath it (e.g. a pink translucent photo
-   *  over a matching cell fill). */
+  /** Legacy whole-picture opacity (0..1) for model-source callers. The
+   *  renderer sets `ctx.globalAlpha` so the picture composites over the cells
+   *  beneath it. Parsed pictures carry `<a:alphaModFix>` (§20.1.8.6) in
+   *  {@link blipEffects} instead, so the modulation is applied exactly once. */
   alpha?: number;
   /** ECMA-376 §20.1.8.23 `<a:duotone>` recolour effect. Absent (the common case)
    *  ⇒ no effect. When present, the renderer remaps the image along the
    *  `clr1`→`clr2` luminance ramp before drawing. */
   duotone?: Duotone;
+  /** Ordered CT_Blip effects (§20.1.8.13), shared with DOCX and PPTX: each
+   *  duotone carries its own palette and alpha effects apply at their
+   *  authored position. Absent for a plain picture or a lone duotone. */
+  blipEffects?: BlipEffect[];
 }
 
 /** Rectangular worksheet-model range; distinct from Viewer selection state. */
@@ -783,15 +895,30 @@ export interface ConditionalFormat {
   rules: CfRule[];
 }
 
+/**
+ * One `<cfRule>` (ECMA-376 §18.3.1.10). `stopIfTrue`: once this rule matches
+ * a cell, no lower-priority rule applies to that cell. Every rule type carries
+ * it (`expression` always; the others only when set, so an absent value means
+ * false), including `colorScale` / `dataBar` / `iconSet`, which match every
+ * numeric cell they format while their optional `activeFormula` (the rule's
+ * own formula, [MS-XLSX] 2.6.27) is nonzero. Formulas are not evaluated: an
+ * activity formula or `cellIs` operand is used only when it is a literal or
+ * a single-cell reference to a cached value, and otherwise the rule does not
+ * match. A rule the evaluator cannot evaluate neither formats nor stops lower
+ * rules (#1547). `extThresholdFormula` marks an effective linked x14
+ * threshold that cannot be admitted. Ambiguous extension IDs use an `other`
+ * marker. Its provenance uses fixed bits expression=1, cellIs=2, activity=4,
+ * threshold=8; unknown bits have no meaning.
+ */
 export type CfRule =
-  | { type: 'cellIs'; operator: string; formulas: string[]; dxfId: number | null; priority: number }
+  | { type: 'cellIs'; operator: string; formulas: string[]; dxfId: number | null; priority: number; stopIfTrue?: boolean }
   | { type: 'expression'; formula: string; dxfId: number | null; priority: number; stopIfTrue: boolean }
-  | { type: 'colorScale'; stops: CfStop[]; priority: number }
-  | { type: 'dataBar'; color: string; min: CfValue; max: CfValue; priority: number; gradient: boolean }
-  | { type: 'top10'; top: boolean; percent: boolean; rank: number; dxfId: number | null; priority: number }
-  | { type: 'aboveAverage'; aboveAverage: boolean; equalAverage?: boolean; stdDev?: number; dxfId: number | null; priority: number }
-  | { type: 'iconSet'; iconSet: string; cfvos: CfValue[]; reverse: boolean; priority: number; customIcons?: CfIcon[] }
-  | { type: 'other'; kind: string; priority: number };
+  | { type: 'colorScale'; stops: CfStop[]; priority: number; activeFormula?: string; stopIfTrue?: boolean }
+  | { type: 'dataBar'; color: string; min: CfValue; max: CfValue; priority: number; gradient: boolean; activeFormula?: string; extThresholdFormula?: boolean; stopIfTrue?: boolean }
+  | { type: 'top10'; top: boolean; percent: boolean; rank: number; dxfId: number | null; priority: number; stopIfTrue?: boolean }
+  | { type: 'aboveAverage'; aboveAverage: boolean; equalAverage?: boolean; stdDev?: number; dxfId: number | null; priority: number; stopIfTrue?: boolean }
+  | { type: 'iconSet'; iconSet: string; cfvos: CfValue[]; reverse: boolean; priority: number; customIcons?: CfIcon[]; activeFormula?: string; stopIfTrue?: boolean }
+  | { type: 'other'; kind: string; priority: number; unsupportedFormulaPhases?: number; stopIfTrue?: boolean };
 
 export interface CfIcon {
   iconSet: string;
@@ -846,10 +973,9 @@ export interface Cell {
    *  its column's `<col style>` in the parser; absent here means Normal (0).
    *  Explicit `c/@s="0"` remains distinct while inheritance is resolved. */
   styleIndex?: number;
-  /** Raw `<f>` formula text (ECMA-376 §18.3.1.40), when present. The renderer
-   *  uses this to recompute volatile functions (TODAY, NOW) at display time
-   *  so the cached `<v>` — frozen when the file was last saved — doesn't
-   *  show a stale date. */
+  /** Raw `<f>` formula text (ECMA-376 §18.3.1.40), when present. It is
+   *  informational only (for example selection context): formulas are never
+   *  calculated, and the cell always renders its cached `value`. */
   formula?: string;
   /** Whether this cell displays its phonetic hint (furigana). The parser
    *  resolves it as `cell/@ph ?? row/@ph ?? false` — the per-cell `<c ph>`
@@ -946,6 +1072,10 @@ export interface RunFont {
    * Absent leaves the run on the baseline.
    */
   vertAlign?: 'superscript' | 'subscript';
+  /** The run's `<rPr>` color is confirmed to be authored exactly like the
+   *  Normal style font's color. Excel then draws a table style's font color
+   *  over it; any other run keeps its own color. Omitted = false. */
+  normalColor?: boolean;
 }
 
 export interface SharedString {
@@ -982,6 +1112,28 @@ export interface Dxf {
    *  style numFmt for rendering — e.g. switching a calendar cell from `d` to
    *  `m"月"d"日"` on the first day of each month. */
   numFmt?: NumFmt | null;
+  /** The dxf `<font>` toggles as authored, present when the dxf has a
+   *  `<font>`: `font.bold` etc. cannot tell an absent element from an
+   *  explicit off, which a differential format needs (see DxfFontToggles). */
+  fontToggles?: DxfFontToggles;
+}
+
+/**
+ * A differential font's toggles (ECMA-376 §18.8.14-15 dxf, §18.8.2 b
+ * CT_BooleanProperty `val` default true): a key is absent when the dxf's
+ * `<font>` omits the element (no change) and `false` for an explicit off
+ * (`val="0"`, or `<u val="none"/>`), which turns off what an earlier format
+ * turned on.
+ */
+export interface DxfFontToggles {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strike?: boolean;
+  /** `true` when the differential font names the automatic color
+   *  (`<color auto="1"/>`), which a later layered format applies over an
+   *  earlier color. */
+  automaticColor?: boolean;
 }
 
 export interface CellFont {
@@ -992,6 +1144,10 @@ export interface CellFont {
   size: number;
   color: string | null;
   name: string | null;
+  /** ECMA-376 §18.8.33: authored major/minor theme reference, distinct from name. */
+  scheme?: 'major' | 'minor';
+  /** Authored SpreadsheetML charset metadata; it does not select a face alone. */
+  charset?: number;
   /** ECMA-376 §18.4.13 ST_UnderlineValues — see RunFont.underlineStyle. */
   underlineStyle?: string;
   /** ECMA-376 §18.4.6 ST_VerticalAlignRun on a cell-level <font>. */
@@ -1055,12 +1211,23 @@ export interface CellXf {
   /** `<alignment readingOrder>` (ECMA-376 §18.8.1) — 0 = context (default),
    *  1 = LTR, 2 = RTL. Drives canvas `direction`. */
   readingOrder?: number;
+  /** The font color is the cell's own formatting: the cell font's `<color>`,
+   *  or its cell style's, is authored differently from the Normal style font's.
+   *  Excel draws it over a table style's element font color. Omitted = false. */
+  ownFontColor?: boolean;
 }
 
 export interface ParsedWorkbook {
   workbook: Workbook;
   styles: Styles;
   sharedStrings: SharedString[];
+  /**
+   * Host layout settled before parsing for a model-source workbook whose
+   * archive asked the host to measure its Normal font (ECMA-376 §18.3.1.13
+   * maximum digit width, in CSS pixels). Absent for OOXML packages, whose grid
+   * measures the Normal font when it binds a worksheet.
+   */
+  layoutMetrics?: { maximumDigitWidth: number };
 }
 
 export interface ViewportRange {
@@ -1131,6 +1298,13 @@ export interface XlsxChromeColors {
  * frame-local decoded image map, so these fields are not part of its public
  * method contract. */
 export interface RenderViewportOptions extends XlsxRenderViewportOptions {
+  /** @internal Viewer/main-realm MDW for identical hit testing and worker paint.
+   * Reapply after every font bind, including render-local row-height clones. */
+  authoritativeMdw?: number;
+  /** @internal Exact local resources retained in this canvas's FontFaceSet. */
+  officeFontRoutes?: Readonly<Record<string, import('@silurus/ooxml-core').OfficeFontFallbackRoute>>;
+  /** @internal Preserve the caller's explicit Google Fonts substitution opt-in. */
+  googleSubstitutes?: boolean;
   /** @internal Viewer chrome only; never applied to authored worksheet content. */
   chromeColors?: XlsxChromeColors;
   loadedImages?: Map<string, CanvasImageSource | null>;
@@ -1150,6 +1324,12 @@ export type WorkerRequest =
       id: number;
       data: ArrayBuffer;
       resourcePolicy: NormalizedOoxmlResourcePolicy;
+      /** Normalized worksheet admission policy. Optional for older internal requests. */
+      readonly worksheetPolicy?: import('./internal/worksheet-policy.js').NormalizedXlsxWorksheetPolicy;
+      /** Application-selected model source (LoadOptions.legacyXls). */
+      source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
+      sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
     }
   | ({ type: 'openSheetSession'; id: number; sheetIndex: number; sheetName: string } &
       PullSessionIdentity<number>)
@@ -1174,9 +1354,12 @@ export type WorkerResponse =
       id: number;
       workbookJson: ArrayBuffer;
       usage?: OoxmlResourceUsageSnapshot;
+      /** Host layout settled for a model source (see ParsedWorkbook.layoutMetrics). */
+      layoutMetrics?: { maximumDigitWidth: number };
     }
   | ({ type: 'sheetSessionOpened'; id: number } & PullSessionIdentity<number>)
   | { type: 'imageExtracted'; id: number; bytes: ArrayBuffer }
-  | { type: 'resourceUsage'; id: number; usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
+  // `usage` is absent when the loaded model source has no ZIP accounting.
+  | { type: 'resourceUsage'; id: number; usage?: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
   | { type: 'markdownRendered'; id: number; markdown: string }
   | ({ type: 'error'; id: number } & WorkerErrorPayload);

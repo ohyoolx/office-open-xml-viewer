@@ -149,6 +149,32 @@ function options(
 }
 
 describe('paragraph acquisition cache', () => {
+  it('remeasures zero-threshold text when a vertical move also changes compatibility mode', () => {
+    const ctx = measureContext();
+    ctx.measureText = function (text) {
+      return {
+        width: [...text].length * 5 - (this.fontKerning === 'normal' && text.includes('AV') ? 2 : 0),
+        actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2,
+        fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2,
+      } as TextMetrics;
+    };
+    const services = createParagraphAcquisitionCacheServicesView(
+      createLayoutServices(model(), { measureContext: ctx }),
+    );
+    const paragraph = textParagraph('AV');
+    (paragraph.runs[0] as Extract<DocRun, { type: 'text' }>).kerning = 0;
+    const input = paragraphAcquisitionInput(paragraph, source);
+    const base = options(services, { measurer: { context: ctx, fontFamilyClasses: {} } });
+    const at = (compatibilityMode: number, startYPt: number) => acquireParagraphResult(input, {
+      ...base,
+      environment: { ...base.environment, compatibilityMode },
+      placement: { ...base.placement, startYPt },
+    }).layout.lines[0]!.placements.find((placement) => placement.kind === 'text')?.kerning;
+    expect(at(14, 72)).toBe(true);
+    expect(at(15, 73)).toBe(false);
+    expect(at(14, 74)).toBe(true);
+  });
+
   it('reuses the immutable result across initial and field service views', () => {
     const services = scopedServices();
     const fieldView = createFieldAcquisitionServicesView(services, { totalPages: 1 });
@@ -203,6 +229,61 @@ describe('paragraph acquisition cache', () => {
     expect(afterSecond).not.toBe(afterFirst);
   });
 
+  it('separates nominal carrier references in cache without moving paragraph flow', () => {
+    const services = scopedServices();
+    const missingEdges = {
+      topPt: null, topStatus: 'missing', rightPt: null, rightStatus: 'missing',
+      bottomPt: null, bottomStatus: 'missing', leftPt: null, leftStatus: 'missing',
+    };
+    const input = paragraphAcquisitionInput({ ...textParagraph(), runs: [
+      { type: 'anchorHost', fontSize: 10, __anchorOccurrenceId: 'box' },
+      { type: 'shape', widthPt: 20, heightPt: 8, presetGeometry: 'rect', subpaths: [],
+        fill: { fillType: 'solid', color: 'FFFFFF' }, stroke: null,
+        __anchorAcquisition: {
+          occurrenceId: 'box',
+          simplePosition: { enabled: false, status: 'valid', xPt: 0, xStatus: 'valid', yPt: 0, yStatus: 'valid' },
+          horizontal: { relativeFrom: 'column', relativeFromStatus: 'valid', choice: { kind: 'offset', valuePt: 60 } },
+          vertical: { relativeFrom: 'paragraph', relativeFromStatus: 'valid', choice: { kind: 'offset', valuePt: 4 } },
+          extent: { widthPt: 20, widthStatus: 'valid', heightPt: 8, heightStatus: 'valid' },
+          parentEffectExtent: missingEdges, anchorDistances: missingEdges,
+          relativeSize: { horizontal: null, vertical: null },
+          wrap: { kind: 'none', authoredKinds: ['wrapNone'], side: 'bothSides', distances: missingEdges, effectExtent: null, polygon: null },
+          behavior: { behindDoc: false, behindDocStatus: 'valid', relativeHeight: 0, relativeHeightStatus: 'valid',
+            locked: false, lockedStatus: 'valid', allowOverlap: true, allowOverlapStatus: 'valid',
+            layoutInCell: true, layoutInCellStatus: 'valid' },
+          group: null,
+        },
+      },
+    ] } as unknown as DocParagraph, source);
+    const anchorFrames = {
+      page: { xPt: 0, yPt: 0, widthPt: 612, heightPt: 792 },
+      margin: { xPt: 72, yPt: 72, widthPt: 468, heightPt: 648 },
+      column: { xPt: 72, yPt: 72, widthPt: 468, heightPt: 648 },
+      pageParity: 'odd' as const,
+    };
+    const plain = options(services, { anchorFrames,
+      anchorCellBounds: { xPt: 0, yPt: 0, widthPt: 468, heightPt: 648 },
+    });
+    const nominal = { ...plain, paragraphAnchorReferenceDeltaPt: -35 };
+    const first = acquireParagraphResult(input, nominal);
+    const second = acquireParagraphResult(input, plain);
+    const third = acquireParagraphResult(input, nominal);
+    expect(first.layout.drawings[0]!.inkBounds.yPt).toBe(41);
+    expect(second.layout.drawings[0]!.inkBounds.yPt).toBe(76);
+    const flowLines = (layout: typeof first.layout) => layout.lines.map((line) => ({
+      ...line, placements: line.placements.filter((placement) => placement.kind !== 'drawing'),
+    }));
+    expect(flowLines(first.layout)).toEqual(flowLines(second.layout));
+    expect(first.layout.flowBounds).toEqual(second.layout.flowBounds);
+    expect(second).not.toBe(first);
+    expect(third).toBe(first);
+    const frame = first.layout.anchorFrames![0]!;
+    if (frame.status !== 'resolved') throw new Error('expected resolved nominal frame');
+    expect(frame.geometry.objectFrame.yPt).toBe(41);
+    if (frame.axes.vertical.status !== 'resolved') throw new Error('expected paragraph reference');
+    expect(frame.axes.vertical.baseStartPt).toBe(37);
+  });
+
   it('does not reuse public anchored drawings across distinct supplied frames', () => {
     const services = scopedServices();
     const input = paragraphAcquisitionInput({
@@ -253,6 +334,149 @@ describe('paragraph acquisition cache', () => {
 
     expect(at(72)).toBe(first);
     expect(at(73)).not.toBe(second);
+  });
+
+  it('reuses line breaking after a vertical move but remeasures position-sensitive lines', () => {
+    const services = scopedServices();
+    const input = paragraphAcquisitionInput(textParagraph('a paragraph long enough to wrap across lines'), source);
+    const base = options(services, {
+      context: { ...context, spaceBeforePt: 6 },
+      placement: { ...options(services).placement, availableWidthPt: 80 },
+    });
+    const at = (startYPt: number, overrides: Partial<ParagraphAcquisitionOptions> = {}) =>
+      acquireParagraphResult(input, {
+        ...base,
+        placement: { ...base.placement, startYPt },
+        ...overrides,
+      });
+
+    const first = at(72);
+    const moved = at(92);
+    expect(moved.measured.lines[0]!.layout).toBe(first.measured.lines[0]!.layout);
+    expect(moved.measured.lines.map((line) => line.layout))
+      .toEqual(first.measured.lines.map((line) => line.layout));
+    expect(moved.layout.flowBounds.yPt).toBe(92);
+    const withoutCache = acquireParagraphResult(
+      paragraphAcquisitionInput(textParagraph('a paragraph long enough to wrap across lines'), source),
+      { ...base, placement: { ...base.placement, startYPt: 92 } },
+    );
+    expect(moved.measured).toEqual(withoutCache.measured);
+    expect(moved.layout).toEqual(withoutCache.layout);
+
+    const suppressed = at(112, {
+      placement: {
+        ...base.placement, startYPt: 112, maximumYPt: 300, suppressSpaceBefore: true,
+      },
+    });
+    const suppressedFresh = acquireParagraphResult(
+      paragraphAcquisitionInput(textParagraph('a paragraph long enough to wrap across lines'), source),
+      {
+        ...base,
+        placement: {
+          ...base.placement, startYPt: 112, maximumYPt: 300, suppressSpaceBefore: true,
+        },
+      },
+    );
+    expect(suppressed.measured.lines[0]!.layout).toBe(first.measured.lines[0]!.layout);
+    expect(suppressed.measured).toEqual(suppressedFresh.measured);
+    expect(suppressed.layout).toEqual(suppressedFresh.layout);
+
+    const nextPage = at(92, {
+      flowDomainId: 'body:page:1:column:0',
+      environment: { ...base.environment, pageIndex: 1, displayPageNumber: 2 },
+    });
+    expect(nextPage.measured.lines[0]!.layout).toBe(first.measured.lines[0]!.layout);
+    expect(nextPage.layout.flowDomainId).toBe('body:page:1:column:0');
+
+    const wrap = {
+      skipTopAndBottomBands: ({ yPt }: { yPt: number }) => yPt,
+      lineWindow: ({ topYPt, maximumWidthPt }: { topYPt: number; maximumWidthPt: number }) => ({
+        topYPt,
+        xOffsetPt: 0,
+        maximumWidthPt: topYPt < 80 ? 30 : maximumWidthPt,
+      }),
+    };
+    const wrapped = (startYPt: number) => at(startYPt, {
+      placement: { ...base.placement, startYPt, wrap },
+    });
+    const high = wrapped(72);
+    const low = wrapped(92);
+    expect(high.measured.lines.length).toBeGreaterThan(low.measured.lines.length);
+    expect(low.measured.lines[0]!.layout).not.toBe(high.measured.lines[0]!.layout);
+  });
+
+  it('keeps page-field text in the line-breaking identity', () => {
+    const services = scopedServices();
+    const field = {
+      ...textParagraph().runs[0],
+      type: 'field', fieldType: 'page', instruction: 'PAGE', fallbackText: '1',
+    } as DocRun;
+    const input = paragraphAcquisitionInput({
+      ...textParagraph(), runs: [field],
+    } as DocParagraph, source);
+    const base = options(services);
+    const atPage = (pageIndex: number) => acquireParagraphResult(input, {
+      ...base,
+      environment: {
+        ...base.environment,
+        pageIndex,
+        displayPageNumber: pageIndex + 1,
+      },
+    });
+    const first = atPage(0);
+    const second = atPage(1);
+    const text = (result: typeof first) => result.measured.lines.flatMap((line) =>
+      line.layout.segments.flatMap((segment) => 'text' in segment ? [segment.text] : [])).join('');
+
+    expect(text(first)).toBe('1');
+    expect(text(second)).toBe('2');
+    expect(second.measured.lines[0]!.layout).not.toBe(first.measured.lines[0]!.layout);
+  });
+
+  it('reuses a placed paragraph across pagination passes that change only values it cannot read', () => {
+    const services = scopedServices();
+    const input = paragraphAcquisitionInput(textParagraph(), source);
+    const base = options(services);
+    const first = acquireParagraphResult(input, base);
+    // A later field-convergence pass knows the document's real page count and
+    // page numbering, and every pass carries the whole document's note
+    // numbers. A text-only paragraph at the same placement reads none of them.
+    const laterPass = acquireParagraphResult(input, {
+      ...base,
+      environment: {
+        ...base.environment,
+        totalPages: 700,
+        displayPageNumber: 9,
+        pageNumberFormat: 'upperRoman',
+        currentDateMs: 101,
+        noteNumbers: new Map([['footnote:1', 1], ['footnote:2', 2]]),
+      },
+    });
+
+    expect(laterPass).toBe(first);
+  });
+
+  it('keys page-field and note values for paragraphs that read them', () => {
+    const services = scopedServices();
+    const cache = paragraphAcquisitionCacheOf(services)!;
+    const base = options(services);
+    const run = textParagraph().runs[0]!;
+    const withRun = (extra: object) =>
+      paragraphAcquisitionInput({ ...textParagraph(), runs: [{ ...run, ...extra } as DocRun] }, source);
+    const numPages = withRun({
+      type: 'field', fieldType: 'numPages', instruction: 'NUMPAGES', fallbackText: '1',
+    });
+    const noteReference = withRun({ noteRef: { kind: 'footnote', id: '1' } });
+    const key = (
+      input: ParagraphAcquisitionInput,
+      environment: Partial<ParagraphAcquisitionOptions['environment']>,
+    ) => paragraphAcquisitionCacheKey(cache, input, {
+      ...base, environment: { ...base.environment, ...environment },
+    });
+
+    expect(key(numPages, { totalPages: 2 })).not.toBe(key(numPages, {}));
+    expect(key(noteReference, { noteNumbers: new Map([['footnote:1', 2]]) }))
+      .not.toBe(key(noteReference, { noteNumbers: new Map([['footnote:1', 1]]) }));
   });
 
   it('keys every value that can change acquisition output', () => {
@@ -312,11 +536,19 @@ describe('paragraph acquisition cache', () => {
       key({ environment: { ...base.environment, currentDateMs: 101 } }),
       key({ environment: { ...base.environment, noteNumbers: new Map([['footnote:1', 1]]) } }),
       key({ environment: { ...base.environment, noteReferenceNumber: 1 } }),
+      key({ environment: {
+        ...base.environment,
+        noteNumbering: {
+          footnote: { format: 'decimal', start: 1 },
+          endnote: { format: 'lowerRoman', start: 1 },
+        },
+      } }),
       key({ environment: { ...base.environment, pageWritingMode: 'vertical-lr' } }),
       key({ environment: { ...base.environment, verticalCJK: true } }),
       key({ environment: { ...base.environment, verticalPageFrame: true } }),
       key({ environment: { ...base.environment, documentHasEastAsianText: true } }),
       key({ environment: { ...base.environment, useFeLayout: true } }),
+      key({ environment: { ...base.environment, lineWrapLikeWord6: true } }),
       key({ environment: {
         ...base.environment,
         balanceSingleByteDoubleByteWidth: true,
@@ -370,5 +602,38 @@ describe('paragraph acquisition cache', () => {
     ];
 
     expect(new Set(keys)).toHaveLength(keys.length);
+  });
+
+  it('keys service identities and kinsoku sets by exact session ordinals', () => {
+    const services = scopedServices();
+    const cache = paragraphAcquisitionCacheOf(services)!;
+    const input = paragraphAcquisitionInput(textParagraph(), source);
+    const base = options(services);
+    const key = (overrides: Partial<ParagraphAcquisitionOptions>) =>
+      paragraphAcquisitionCacheKey(cache, input, { ...base, ...overrides });
+    // A production text-service fingerprint spells out the document's whole
+    // font-metric snapshot; every retained key used to repeat it.
+    const withText = (fingerprint: string) => ({
+      environment: {
+        ...base.environment,
+        layoutServices: { ...services, text: { ...services.text, fingerprint } },
+      },
+    });
+    const large = `text:${'m'.repeat(60_000)}`;
+    const largeKey = key(withText(large));
+    expect(largeKey.length).toBeLessThan(4_096);
+    expect(key(withText(`${large.slice(0, -1)}n`))).not.toBe(largeKey);
+    expect(key(withText(large.slice()))).toBe(largeKey);
+
+    // A value-equal rule set from another object must still hit, or the
+    // session miss budget would be spent on a spurious re-acquisition.
+    const kinsoku = {
+      enabled: DEFAULT_KINSOKU_RULES.enabled,
+      lineStartForbidden: new Set([...DEFAULT_KINSOKU_RULES.lineStartForbidden].reverse()),
+      lineEndForbidden: new Set(DEFAULT_KINSOKU_RULES.lineEndForbidden),
+    };
+    expect(key({ context: { ...base.context, kinsoku } })).toBe(key({}));
+    expect(key({ context: { ...base.context, kinsoku: { ...kinsoku, enabled: !kinsoku.enabled } } }))
+      .not.toBe(key({}));
   });
 });

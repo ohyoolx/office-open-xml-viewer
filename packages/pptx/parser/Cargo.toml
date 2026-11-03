@@ -6,6 +6,13 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# The WASM JS entry points (`parse_pptx`, `PptxArchive`, ...). Rust callers
+# that link the parser as a library can disable them so the linked module does
+# not export the presentation API.
+[features]
+default = ["wasm-entry"]
+wasm-entry = []
+
 [dependencies]
 wasm-bindgen = { workspace = true }
 serde = { workspace = true }
@@ -14,11 +21,19 @@ zip = { workspace = true }
 roxmltree = { workspace = true }
 console_error_panic_hook = { workspace = true }
 ooxml-common = { workspace = true }
+pptx-model = { workspace = true }
+
+[dev-dependencies]
+# Test-only GFM parser used to prove projected document text forms no Markdown
+# structure; never linked into the WASM build.
+ooxml-common = { workspace = true, features = ["gfm-check"] }
 
 # `-Oz` optimizes the wasm binary for size (over the default `-O`), shrinking
 # the artifact browsers download. wasm-pack runs this pass after wasm-bindgen.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-Oz"]
+# Repeat the same size pass until it stops shrinking; keep LLVM opt-level="s"
+# to avoid the parse-time cost of compiling all Rust code with opt-level="z".
+wasm-opt = ["-Oz", "--converge"]
 
 [package.metadata.wasm-pack.profile.release.wasm-bindgen]
 omit-default-module-path = true

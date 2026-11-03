@@ -163,8 +163,7 @@ function paintTableContents(
 ): void {
   for (const row of node.rows) {
     for (const cell of row.cells) {
-      const ownsContinuationPaint = 'visualMergeOwnership' in cell
-        && cell.visualMergeOwnership === 'continuation';
+      const ownsContinuationPaint = cell.visualMergeOwnership === 'continuation';
       if (cell.verticalMerge === 'continue' && !ownsContinuationPaint) continue;
       if (cell.background) {
         context.ctx.fillStyle = cell.background.color;
@@ -192,6 +191,36 @@ function paintTableContents(
           }, blockContext, block.layout.kind !== 'table' || paintDirectNestedTableBorders);
         }
       };
+      if (cell.verticalText) {
+        // ECMA-376 §17.4.72: blocks are in the rotated local frame. Clip to
+        // the physical cell, then map the local frame into the table.
+        const verticalText = cell.verticalText;
+        const clip = cell.clipBounds ?? cell.flowBounds;
+        const rotatedFrame = canvasPaintFrame(context.ctx, () => {
+          context.ctx.beginPath();
+          context.ctx.rect(clip.xPt, clip.yPt, clip.widthPt, clip.heightPt);
+          context.ctx.clip();
+          const m = verticalText.transform;
+          context.ctx.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+        });
+        const rotatedContext: CanvasPaintContext = {
+          ...context,
+          pointToCss: composeAffine(
+            context.pointToCss ?? scaleAffine(context.scale),
+            verticalText.transform,
+          ),
+          textBoxVerticalMode: verticalText.mode,
+        };
+        rotatedFrame(() => {
+          for (const block of cell.blocks) {
+            paintPlacedChild(block.layout, {
+              xPt: cell.contentBounds.xPt,
+              yPt: block.offsetPt,
+            }, rotatedContext, true);
+          }
+        })();
+        continue;
+      }
       if (!cell.clipBounds) {
         paintBlocks(context);
         continue;
@@ -282,7 +311,7 @@ export function paintTableLayout(
 }
 
 /** Paint only point-space placements already resolved by the layout adapter. */
-export function paintResolvedFloatingTablePlacements(
+function paintResolvedFloatingTablePlacements(
   placements: readonly ResolvedFloatingTablePlacementLayout[],
   context: CanvasPaintContext,
 ): void {

@@ -1,3 +1,4 @@
+import { withDocxParserErrors } from './internal/parser-errors.js';
 import {
   decodeOoxmlResourceUsage,
   exactTransferableArrayBuffer,
@@ -25,7 +26,8 @@ export interface DocxDocumentCursorArchive {
     byteCredit: number,
   ): Uint8Array;
   document_chunk_done(): boolean;
-  document_cursor_resource_usage?(): Uint8Array;
+  /** `undefined` when the package has no document-cursor checkpoint. */
+  document_cursor_resource_usage?(): Uint8Array | undefined;
   acknowledge_document_chunk(
     sequence: number,
     operationId: number,
@@ -39,20 +41,16 @@ export type DocxDocumentArchiveExecutor = <T>(
   operation: (archive: DocxDocumentCursorArchive) => T,
 ) => T;
 
-/** Decode the cursor checkpoint while preserving the degraded-container path. */
+/** Decode the cursor checkpoint. The archive admits only OPC packages, so every
+ * opened cursor owns a PackageOperation ledger; the archive reports a typed
+ * absence (`undefined`) only when no cursor operation has run yet. Malformed
+ * checkpoints and every thrown parser/resource failure escape, whatever their
+ * text. */
 export function readDocxDocumentCursorUsage(
   execute: DocxDocumentArchiveExecutor,
 ): ReturnType<typeof decodeOoxmlResourceUsage> | undefined {
-  try {
-    const bytes = execute((archive) => archive.document_cursor_resource_usage?.());
-    return bytes ? decodeOoxmlResourceUsage(bytes) : undefined;
-  } catch (error) {
-    // A corrupt container is represented by a degraded terminal document and
-    // has no PackageOperation ledger. Only that unavailable checkpoint is
-    // optional; malformed checkpoints and real parser/resource failures escape.
-    if (String(error).includes('document cursor usage is unavailable')) return undefined;
-    throw error;
-  }
+  const bytes = execute((archive) => archive.document_cursor_resource_usage?.());
+  return bytes ? decodeOoxmlResourceUsage(bytes) : undefined;
 }
 
 /**
@@ -174,12 +172,16 @@ export class DocumentPullWorker {
   private host: PullSessionHost<ArrayBuffer, number> | null = null;
   private identity: PullSessionIdentity<number> | null = null;
 
+  private readonly executeArchive: DocxDocumentArchiveExecutor;
+
   constructor(
     private readonly archive: () => DocxDocumentCursorArchive | null | undefined,
-    private readonly executeArchive: <T>(
-      operation: (archive: DocxDocumentCursorArchive) => T,
-    ) => T = (operation) => operation(this.requireArchive()),
-  ) {}
+    executeArchive: DocxDocumentArchiveExecutor = (operation) => operation(this.requireArchive()),
+  ) {
+    // The shared pull host serializes driver failures itself. Decode DOCX
+    // parser-private reasons before handing any archive operation to that host.
+    this.executeArchive = (operation) => withDocxParserErrors(() => executeArchive(operation));
+  }
 
   open(identity: PullSessionIdentity<number>): void {
     if (this.host) throw new Error('a DOCX document pull session is already active');

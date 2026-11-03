@@ -1,7 +1,61 @@
-import { describe, expect, it } from 'vitest';
-import { deepFreezePlainData, sealPlainData, snapshotPlainData } from './plain-data.js';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  deepFreezePlainData,
+  deepFreezePlainDataWithFrozenAliases,
+  sealPlainData,
+  snapshotPlainData,
+} from './plain-data.js';
+
+// These cases exercise the strict diagnostic boundary on deliberately invalid
+// inputs. Production snapshots receive engine-owned data and omit this pre-pass.
+vi.mock('./validation-policy.js', () => ({ documentLayoutValidationEnabled: vi.fn(() => true) }));
 
 describe('plain layout data snapshots', () => {
+  it('freezes mutable descendants of an already frozen wrapper', () => {
+    const child = { value: 1 };
+    const wrapper = Object.freeze({ child });
+    deepFreezePlainData(wrapper);
+
+    expect(Object.isFrozen(child)).toBe(true);
+  });
+
+  it('freezes new occurrence values beside a deeply frozen source alias', () => {
+    const source = deepFreezePlainData({ shared: { values: [1, 2] } });
+    const projected = deepFreezePlainDataWithFrozenAliases({
+      shared: source.shared,
+      occurrence: { id: 'second', bounds: { xPt: 10 } },
+    }, source);
+
+    expect(projected.shared).toBe(source.shared);
+    expect(Object.isFrozen(projected.occurrence)).toBe(true);
+    expect(Object.isFrozen(projected.occurrence.bounds)).toBe(true);
+    expect(structuredClone(projected)).toEqual({
+      shared: { values: [1, 2] }, occurrence: { id: 'second', bounds: { xPt: 10 } },
+    });
+  });
+
+  it('freezes an owned projection in place when its source root is deeply frozen', () => {
+    const source = deepFreezePlainData({ shared: { values: [1, 2] }, xPt: 0 });
+    const projected = { ...source, xPt: 10, occurrence: { id: 'page-2' } };
+    const snapshot = snapshotPlainData(projected, 'layout payload', source);
+
+    expect(snapshot).toBe(projected);
+    expect(snapshot.shared).toBe(source.shared);
+    expect(Object.isFrozen(snapshot.occurrence)).toBe(true);
+    expect(structuredClone(snapshot)).toEqual({
+      shared: { values: [1, 2] }, xPt: 10, occurrence: { id: 'page-2' },
+    });
+  });
+
+  it('copies an owned projection whose source root is only shallowly frozen', () => {
+    const source = Object.freeze({ shared: { values: [1, 2] } });
+    const snapshot = snapshotPlainData({ ...source, xPt: 10 }, 'layout payload', source);
+    source.shared.values[0] = 99;
+
+    expect(snapshot.shared).not.toBe(source.shared);
+    expect(snapshot.shared.values).toEqual([1, 2]);
+  });
+
   it('preserves signed unbounded finite DrawingML source-rectangle percentages exactly', () => {
     const authored = { l: -0.25, t: 1.25, r: 1.5, b: -0.75 };
     const source = { srcRect: { ...authored } };
@@ -102,10 +156,38 @@ describe('plain layout data snapshots', () => {
       .toThrow(/structured-clone-safe plain data/i);
   });
 
+  it('freezes and checks a numeric-looking non-index array property', () => {
+    const list = Object.assign([1], { '-1': { value: 1 } });
+    deepFreezePlainData(list);
+    expect(Object.isFrozen(list['-1'])).toBe(true);
+
+    const invalid = Object.assign([1], { '-1': { value: Number.NaN } });
+    expect(() => deepFreezePlainData(invalid)).toThrow(/finite/);
+  });
+
+  it('shares block layouts copied by an earlier snapshot', () => {
+    // A table cell holds a sealed paragraph layout; the first snapshot copies
+    // it (sealing alone is not verification), later snapshots share the copy.
+    const paragraph = deepFreezePlainData({ kind: 'paragraph', lines: [{ xPt: 1 }] });
+    const input = snapshotPlainData({ cells: [{ blocks: [{ layout: paragraph }] }] }, 'layout payload');
+    const copied = input.cells[0]!.blocks[0]!.layout;
+    expect(copied).not.toBe(paragraph);
+
+    const result = snapshotPlainData({ rows: [{ blocks: [{ layout: copied, offsetPt: 2 }] }] }, 'layout payload');
+    expect(result.rows[0]!.blocks[0]!.layout).toBe(copied);
+    expect(structuredClone(result)).toEqual({
+      rows: [{ blocks: [{ layout: { kind: 'paragraph', lines: [{ xPt: 1 }] }, offsetPt: 2 }] }],
+    });
+  });
+
   it('treats sealed builder-owned data as already processed', () => {
-    const sealed = sealPlainData({ nested: { value: 1 } }, 'layout payload');
+    const child = { value: 1 };
+    const sealed = sealPlainData({ first: child, second: child }, 'layout payload');
 
     expect(snapshotPlainData(sealed, 'layout payload')).toBe(sealed);
+    expect(sealed.first).toBe(sealed.second);
+    expect(Object.isFrozen(sealed.first)).toBe(true);
+    expect(structuredClone(sealed)).toEqual({ first: { value: 1 }, second: { value: 1 } });
   });
 
   it('preserves an own enumerable __proto__ data property like structuredClone', () => {

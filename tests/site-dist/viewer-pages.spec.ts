@@ -4,6 +4,183 @@ import { fileURLToPath } from 'node:url';
 const docxSample = fileURLToPath(
   new URL('../../packages/docx/public/demo/sample-1.docx', import.meta.url),
 );
+const xlsxSample = fileURLToPath(
+  new URL('../../packages/xlsx/public/demo/sample-1.xlsx', import.meta.url),
+);
+
+test('Try Yours XLSX chrome follows the site theme without recoloring cells', async ({ page }) => {
+  // Keep unrelated network font completion from changing the pixel oracle.
+  await page.route('https://fonts.googleapis.com/**', (route) => route.abort());
+  await page.route('https://fonts.gstatic.com/**', (route) => route.abort());
+  await page.addInitScript(() => localStorage.setItem('ooxml-theme', 'dark'));
+  await page.goto('/try/');
+  const canvas = page.locator('#stage canvas').first();
+  const tabs = page.locator('#stage .xlsx-tab-strip button');
+  const readCanvas = () => canvas.evaluate(async (element: HTMLCanvasElement) => {
+    // Read a copy: repeated getImageData on the production canvas can make
+    // Chromium switch its painting backend and change text antialiasing.
+    const copy = document.createElement('canvas');
+    copy.width = element.width;
+    copy.height = element.height;
+    const context = copy.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
+    context.drawImage(element, 0, 0);
+    const dpr = devicePixelRatio;
+    // Corner pixels are chrome. The lower-right crop is entirely in the cell
+    // area, away from row/column headers and selection borders.
+    return {
+      corner: Array.from(context.getImageData(4 * dpr, 4 * dpr, 1, 1).data),
+      column: Array.from(context.getImageData(200 * dpr, 4 * dpr, 1, 1).data),
+      cells: Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',
+        context.getImageData(60 * dpr, 40 * dpr, 500 * dpr, 200 * dpr).data))),
+    };
+  });
+  await page.locator('#file').setInputFiles(xlsxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  await expect.poll(async () => (await readCanvas()).corner).toEqual([8, 13, 19, 255]);
+  await expect(tabs.first()).toHaveCSS('background-color', 'rgb(8, 13, 19)');
+  await expect(tabs.first()).toHaveCSS('color', 'rgb(237, 243, 250)');
+  await expect(page.locator('#stage button[aria-label="Zoom in"]')).toHaveCSS('color', 'rgb(170, 183, 199)');
+  const dark = await readCanvas();
+
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).corner).toEqual([248, 249, 250, 255]);
+  await expect(tabs.first()).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await expect(tabs.first()).toHaveCSS('color', 'rgb(0, 0, 0)');
+  expect((await readCanvas()).cells).toEqual(dark.cells);
+
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+  expect((await readCanvas()).cells).toEqual(dark.cells);
+  await page.locator('#stage [data-xlsx-viewport-input]').click({ position: { x: 200, y: 4 } });
+  await expect.poll(async () => (await readCanvas()).column).toEqual([52, 69, 88, 255]);
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).column).toEqual([202, 221, 246, 255]);
+  await page.locator('[data-theme-toggle]').first().click();
+  await expect.poll(async () => (await readCanvas()).column).toEqual([52, 69, 88, 255]);
+  await tabs.nth(1).click();
+  await expect(tabs.nth(1)).toHaveCSS('background-color', 'rgb(8, 13, 19)');
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+
+  await page.locator('#file').setInputFiles(xlsxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+  await page.reload();
+  await page.locator('#file').setInputFiles(xlsxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  await expect.poll(async () => (await readCanvas()).corner).toEqual(dark.corner);
+});
+
+test('Try Yours XLSX scroll buttons open a native sheet list on right-click', async ({ page }) => {
+  // Font-network completion is unrelated to footer navigation.
+  await page.route('https://fonts.googleapis.com/**', (route) => route.abort());
+  await page.route('https://fonts.gstatic.com/**', (route) => route.abort());
+  const pageErrors: string[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  const status = page.locator('#status');
+  const strip = page.locator('#stage .xlsx-tab-strip');
+  const prev = page.locator('#stage [data-xlsx-tab-nav="prev"]');
+  const next = page.locator('#stage [data-xlsx-tab-nav="next"]');
+  const list = page.locator('#stage [data-xlsx-sheet-list]');
+  const items = list.getByRole('button');
+  const current = list.locator('[aria-current="true"]');
+  const tab = (name: string) => strip.getByRole('button', { name, exact: true });
+  const loadSample = async () => {
+    await page.locator('#file').setInputFiles(xlsxSample);
+    await expect(status).toContainText('rendered in', { timeout: 60_000 });
+  };
+  // A disabled scroll button (strip start/end, or no overflow) ignores pointer
+  // events, so `force` right-clicks its position as a user would.
+  const rightClick = (button: typeof prev) => button.click({ button: 'right', force: true });
+
+  await page.goto('/try/');
+  await loadSample();
+  const names = await strip.locator('button').evaluateAll((tabs) => tabs
+    .filter((element) => getComputedStyle(element).display !== 'none')
+    .map((element) => element.textContent ?? ''));
+  expect(names.length).toBeGreaterThan(1);
+  await expect(list).toHaveCount(1);
+  await expect(list).toBeHidden();
+
+  // Start of the strip: the previous button is disabled.
+  await prev.scrollIntoViewIfNeeded();
+  await expect(prev).toHaveCSS('pointer-events', 'none');
+  await rightClick(prev);
+  await expect(list).toBeVisible();
+  await expect(items).toHaveText(names);
+  await expect(current).toHaveCount(1);
+  await page.screenshot({ path: test.info().outputPath('sheet-list.png') });
+  const [box, footer] = await Promise.all([list.boundingBox(), prev.boundingBox()]);
+  const viewport = page.viewportSize() as { width: number; height: number };
+  if (!box || !footer) throw new Error('sheet list or footer has no layout box');
+  expect(box.y).toBeGreaterThanOrEqual(0);
+  expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
+  expect(box.y + box.height <= footer.y + 1 || box.y >= footer.y + footer.height - 1).toBe(true);
+
+  const choice = list.locator('button:not([aria-current])').last();
+  const chosen = (await choice.textContent()) ?? '';
+  await choice.click();
+  await expect(list).toBeHidden();
+  await expect(tab(chosen)).toHaveCSS('font-weight', '600');
+
+  // Normal clicks keep scrolling the strip and do not open the list.
+  await strip.evaluate((element: HTMLElement) => {
+    element.style.flex = '0 0 40px';
+    element.scrollLeft = 0;
+    element.dispatchEvent(new Event('scroll'));
+  });
+  await expect(next).toHaveCSS('pointer-events', 'auto');
+  await next.click();
+  await expect.poll(() => strip.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+  await expect(list).toBeHidden();
+
+  // End of the strip: the next button is disabled.
+  await strip.evaluate((element: HTMLElement) => {
+    element.scrollLeft = element.scrollWidth;
+    element.dispatchEvent(new Event('scroll'));
+  });
+  await expect(next).toHaveCSS('pointer-events', 'none');
+  await rightClick(next);
+  await expect(list).toBeVisible();
+  await expect(current).toHaveText(chosen);
+  await page.keyboard.press('Escape');
+  await expect(list).toBeHidden();
+  await expect(next).toBeFocused();
+
+  // Keyboard flow. The platform context-menu key is not portable across
+  // headless platforms, so dispatch the contextmenu event it produces.
+  await next.evaluate((button: HTMLElement) => {
+    button.focus();
+    button.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+  });
+  await expect(current).toBeFocused();
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(list).toBeHidden();
+  await expect(next).toBeFocused();
+  await expect(tab(names[(names.indexOf(chosen) + 1) % names.length])).toHaveCSS('font-weight', '600');
+
+  // Light dismissal.
+  await rightClick(prev);
+  await expect(list).toBeVisible();
+  await status.click();
+  await expect(list).toBeHidden();
+
+  // Replacing the file while the list is open tears it down with the viewer.
+  await rightClick(prev);
+  await expect(list).toBeVisible();
+  await loadSample();
+  await expect(list).toBeHidden();
+  await expect(list).toHaveCount(1);
+
+  await page.reload();
+  await loadSample();
+  await expect(list).toHaveCount(1);
+  await rightClick(prev);
+  await expect(items).toHaveText(names);
+  await page.keyboard.press('Escape');
+  await expect(list).toBeHidden();
+  expect(pageErrors).toEqual([]);
+});
 
 const dispatchPersistedPagehide = (page: Page) => page.evaluate(() => {
   window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
@@ -111,4 +288,54 @@ test('PPTX single-comment margin has no trailing scroll range', async ({ page })
   await margin.locator('.ooxml-comment-card').hover();
   await page.mouse.wheel(0, 100);
   await expect.poll(() => margin.evaluate((element) => element.scrollTop)).toBe(0);
+});
+
+// Exercise the actual published source modules and WASM URLs through the site's
+// production bundle. Mocked viewer tests cannot detect missing/rewritten sidecars.
+test('Try Yours loads only the selected experimental legacy reader', async ({ page }) => {
+  test.setTimeout(120_000);
+  const { buildDocFixture, buildXlsFixture } = await import('../../packages/legacy-office/src/test-fixtures');
+  const { buildPptShapeImageFillFixture } = await import('../../packages/legacy-office/src/ppt-shape-image-fill-fixture');
+  await page.route('https://fonts.googleapis.com/**', (route) => route.abort());
+  await page.route('https://fonts.gstatic.com/**', (route) => route.abort());
+  const requested: string[] = [];
+  const failures: string[] = [];
+  page.on('request', (request) => requested.push(request.url()));
+  page.on('pageerror', (error) => failures.push(error.message));
+  page.on('response', (response) => {
+    if (response.status() >= 400 && new URL(response.url()).origin === new URL(page.url()).origin) {
+      failures.push(`${response.status()} ${response.url()}`);
+    }
+  });
+  const legacyRequests = () => requested.filter((url) => /legacy[-_]/.test(url));
+  await page.goto('/');
+  await expect(page.locator('.caps-legacy')).toBeVisible();
+  expect(legacyRequests()).toEqual([]);
+  await page.goto('/try/');
+  await page.locator('#file').setInputFiles(docxSample);
+  await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+  expect(legacyRequests()).toEqual([]);
+
+  for (const [family, format, bytes] of [
+    ['doc', 'docx', buildDocFixture({ text: 'Experimental document\r' })],
+    ['xls', 'xlsx', buildXlsFixture()],
+    ['ppt', 'pptx', buildPptShapeImageFillFixture()],
+  ] as const) {
+    requested.length = 0;
+    await page.locator('#file').setInputFiles({
+      name: `example.${family}`,
+      mimeType: 'application/octet-stream',
+      buffer: Buffer.from(bytes),
+    });
+    await expect(page.locator('#status')).toContainText('rendered in', { timeout: 60_000 });
+    await expect(page.locator('.try-preview')).toHaveAttribute('data-format', format);
+    await expect(page.locator('#stage canvas').first()).toBeVisible();
+    const urls = legacyRequests().join('\n');
+    expect(urls).toMatch(new RegExp(`legacy-${family}-source-module.*\\.mjs`));
+    expect(urls).toMatch(new RegExp(`legacy_${family}_direct_bg.*\\.wasm`));
+    for (const other of ['doc', 'xls', 'ppt'].filter((value) => value !== family)) {
+      expect(urls).not.toMatch(new RegExp(`legacy[-_]${other}[-_]`));
+    }
+  }
+  expect(failures).toEqual([]);
 });

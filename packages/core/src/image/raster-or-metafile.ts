@@ -2,7 +2,6 @@
 // Format players remain in their format-specific modules; this module owns the
 // cross-format safety policy, decoder-side resizing, and final surface check.
 
-import { renderEmfToBitmap } from './emf.js';
 import { closeImageBitmapIfSupported } from './image-bitmap-lifecycle.js';
 import {
   MAX_RASTER_DIMENSION,
@@ -27,16 +26,113 @@ import {
 import { OptionalImageCodecUnavailableError } from './optional-image-fallback.js';
 import { isEmf, isWmf, renderWmfToBitmap, wmfRasterTarget } from './wmf.js';
 
+// The EMF/EMF+ player is loaded on the first EMF picture, not with the viewer:
+// most documents carry none, and it is a large share of the default bundle.
+// Decoding is asynchronous already, so the only change is one module load
+// before the first EMF is played. The WMF player stays static: it shares its
+// DIB, canvas and symbol-font helpers with eagerly used chart and image code,
+// so the bundler would keep it in the eager graph anyway.
+const loadEmfPlayer = () => import('./emf.js');
+
+/**
+ * What the loading path does with a metafile whose playback could not
+ * reproduce all of its content (unimplemented records, an EMF+-only stream
+ * that fails validation, damaged records; see `EmfRasterResult` in emf.ts).
+ * Resource ceilings always throw a typed limit error before this policy runs.
+ * WMF detection currently covers TEXTOUT/EXTTEXTOUT exclusions, not every skipped
+ * drawing record; a missing report is not a general fidelity guarantee.
+ *
+ * - `'draw-supported'` (default): return what playback drew, with the gap
+ *   attached to the bitmap ({@link getIncompleteMetafileReport}). This is the
+ *   OOXML renderers' deliberate compatibility policy, not an oversight: the
+ *   callers retain the available content while detected gaps stay observable.
+ *   When nothing draws, the result is null and cannot carry a bitmap report;
+ *   strict callers still receive the detected reason in the thrown error.
+ * - `'reject'`: throw {@link OoxmlIncompleteMetafileError}. For callers that
+ *   must not present a partial picture as complete, such as a conversion
+ *   whose output would otherwise silently lose content.
+ */
+export type IncompleteMetafilePolicy = 'draw-supported' | 'reject';
+
+/** The content a drawn metafile left out, attached to its bitmap. */
+export interface IncompleteMetafileReport {
+  readonly format: 'emf' | 'wmf';
+  readonly unsupported: readonly string[];
+}
+
+/** A metafile the caller required to be complete could not be fully played. */
+export class OoxmlIncompleteMetafileError extends Error {
+  readonly code = 'ooxml-incomplete-metafile' as const;
+
+  constructor(
+    readonly format: 'emf' | 'wmf',
+    readonly unsupported: readonly string[],
+  ) {
+    super(`OOXML ${format} metafile could not be fully played: ${unsupported.join(', ')}`);
+    this.name = 'OoxmlIncompleteMetafileError';
+    Object.setPrototypeOf(this, OoxmlIncompleteMetafileError.prototype);
+  }
+}
+
+export function isOoxmlIncompleteMetafileError(error: unknown): error is OoxmlIncompleteMetafileError {
+  if (!error || typeof error !== 'object') return false;
+  try {
+    const candidate = error as { readonly code?: unknown; readonly unsupported?: unknown };
+    return candidate.code === 'ooxml-incomplete-metafile' && Array.isArray(candidate.unsupported);
+  } catch {
+    return false;
+  }
+}
+
+const incompleteMetafileReports = new WeakMap<object, IncompleteMetafileReport>();
+
+/** The gap report of a metafile bitmap decoded under `'draw-supported'`, or
+ *  `undefined` for a complete picture (and for every non-metafile bitmap). */
+export function getIncompleteMetafileReport(
+  bitmap: ImageBitmap | null | undefined,
+): IncompleteMetafileReport | undefined {
+  return bitmap ? incompleteMetafileReports.get(bitmap) : undefined;
+}
+
+/** Attach the gap report of `source` to a bitmap derived from its pixels (an
+ *  effect result or a resampled copy): the derived picture lacks the same
+ *  content. Package-internal; not part of the public entry point. */
+export function carryIncompleteMetafileReport(
+  source: ImageBitmap | null | undefined,
+  derived: ImageBitmap | null | undefined,
+): void {
+  if (!source || !derived || source === derived) return;
+  const report = incompleteMetafileReports.get(source);
+  if (report) incompleteMetafileReports.set(derived, report);
+}
+
+function applyIncompleteMetafilePolicy(
+  bitmap: ImageBitmap | null,
+  unsupported: readonly string[],
+  policy: IncompleteMetafilePolicy,
+  format: 'emf' | 'wmf' = 'emf',
+): ImageBitmap | null {
+  if (unsupported.length === 0) return bitmap;
+  if (policy === 'reject') {
+    if (bitmap) closeImageBitmapIfSupported(bitmap);
+    throw new OoxmlIncompleteMetafileError(format, unsupported);
+  }
+  if (bitmap) incompleteMetafileReports.set(bitmap, { format, unsupported });
+  return bitmap;
+}
+
 export interface DecodeRasterOptions {
   widthPt?: number;
   heightPt?: number;
-  suppressBoundaryFrame?: boolean;
   tiff?: TiffRenderer;
   targetWidthPx?: number;
   targetHeightPx?: number;
   /** Retained base-surface ceiling. Effect pipelines lower this so their base
    * and derived surfaces fit the aggregate decoded-byte budget. */
   maxRetainedPixels?: number;
+  /** Policy for a metafile that cannot be fully played (default
+   *  `'draw-supported'`); see {@link IncompleteMetafilePolicy}. */
+  incompleteMetafile?: IncompleteMetafilePolicy;
 }
 
 function exceedsRetainedBudget(source: RasterDimensions, pixelLimit: number): boolean {
@@ -124,11 +220,11 @@ export async function decodeRasterOrMetafileWithInspection(
   const {
     widthPt = 0,
     heightPt = 0,
-    suppressBoundaryFrame = false,
     tiff,
     targetWidthPx,
     targetHeightPx,
     maxRetainedPixels = MAX_RASTER_PIXELS,
+    incompleteMetafile = 'draw-supported',
   } = opts;
   const retainedPixelLimit = Number.isSafeInteger(maxRetainedPixels) && maxRetainedPixels > 0
     ? Math.min(maxRetainedPixels, MAX_RASTER_PIXELS)
@@ -137,15 +233,22 @@ export async function decodeRasterOrMetafileWithInspection(
 
   if (isWmf(head)) {
     const { w, h } = wmfRasterTarget(widthPt, heightPt);
+    let unsupported: readonly string[] = [];
+    const bitmap = await renderWmfToBitmap(
+      new Uint8Array(await data.arrayBuffer()), w, h,
+      (records) => { unsupported = records; },
+    );
     return enforceDecodedBitmapBudget(
-      await renderWmfToBitmap(new Uint8Array(await data.arrayBuffer()), w, h, suppressBoundaryFrame),
+      applyIncompleteMetafilePolicy(bitmap, unsupported, incompleteMetafile, 'wmf'),
       retainedPixelLimit,
     );
   }
   if (isEmf(head)) {
     const { w, h } = wmfRasterTarget(widthPt, heightPt);
+    const { renderEmfToBitmap } = await loadEmfPlayer();
+    const played = await renderEmfToBitmap(new Uint8Array(await data.arrayBuffer()), w, h);
     return enforceDecodedBitmapBudget(
-      await renderEmfToBitmap(new Uint8Array(await data.arrayBuffer()), w, h),
+      applyIncompleteMetafilePolicy(played.bitmap, played.unsupported, incompleteMetafile),
       retainedPixelLimit,
     );
   }

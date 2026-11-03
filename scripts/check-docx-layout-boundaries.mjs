@@ -23,6 +23,7 @@ const TEXT_RUN_PROJECTION_ADAPTER = `${DOCX_SOURCE}/text-run-projection.ts`;
 const LAYOUT_RUNTIME_ADAPTER = `${DOCX_SOURCE}/layout-runtime.ts`;
 const ACQUISITION_CONTEXT = `${LAYOUT_SOURCE}/acquisition-context.ts`;
 const PRODUCTION_BODY_LAYOUT = `${LAYOUT_SOURCE}/production-body-layout.ts`;
+const BODY_TABLE_MEASUREMENT = `${LAYOUT_SOURCE}/body-table-measurement.ts`;
 const ACQUISITION_STATE = `${LAYOUT_SOURCE}/acquisition-state.ts`;
 const ACQUISITION_INPUT_PROJECTIONS = `${LAYOUT_SOURCE}/acquisition-input-projections.ts`;
 const ANCHOR_CLASSIFICATION = `${LAYOUT_SOURCE}/anchor-classification.ts`;
@@ -98,13 +99,26 @@ const SHARED_PAINT_IMPORTS = new Map([
   ['@silurus/ooxml-core', new Map([
     ['acquireBitmapCacheLease', 'value'],
     ['applyDuotone', 'value'],
+    // Pixel corrections, effect budgets and cache keys consume decoded resources without acquiring layout.
+    ['blipPixelEffectsKey', 'value'],
     ['autoContrastColor', 'value'],
+    // A retained run-shading preset is rasterized as an 8x8 paint tile;
+    // this helper cannot measure text or change the layout result.
+    ['buildPatternBitmap', 'value'],
     ['captureDecodedBitmapCacheEpoch', 'value'],
     ['canvasFontString', 'value'],
     ['clampCanvasSize', 'value'],
     // Chart picture-marker discovery and lookup warm the document-owned image
     // cache before measurement-free chart paint. They expose no layout API.
     ['chartImageFillKey', 'value'],
+    ['chartImageFillPixelTransform', 'value'],
+    // Per-rendered-size chart picture preparation: a scratch-surface chart
+    // paint records the sizes; keys/lookups address the decoded sources.
+    ['chartImageFillNeedsRenderedSize', 'value'],
+    ['chartFillRenderedSizeKey', 'value'],
+    ['chartImageFillStoreLookup', 'value'],
+    ['collectChartFillRenderedSizes', 'value'],
+    ['assertChartFillRenderedSizeCount', 'value'],
     ['chartImageFillUsageSize', 'value'],
     ['collectChartImageFillUsages', 'value'],
     ['collectChartImageFillUsagesForCharts', 'value'],
@@ -118,6 +132,9 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['deferBitmapCloseWhileLeased', 'value'],
     ['docxBorderDashArray', 'value'],
     ['drawImageCropped', 'value'],
+    // Pure geometry: the full source frame a stretched/cropped CT_Blip chain
+    // is evaluated on. It reads authored fractions only, never layout.
+    ['stretchedSourceFrame', 'value'],
     ['doubleRailGeometry', 'value'],
     ['fillDoubleBorder', 'value'],
     // Shared decoded-surface ownership is a paint resource concern. DOCX may
@@ -125,7 +142,13 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['dropCachedDerivedBitmapNamespace', 'value'],
     ['decodedBitmapTargetResizeOptions', 'value'],
     ['duotoneImageData', 'value'],
+    ['applyImageDataTransform', 'value'],
+    ['decodeSvgBlobOnMainThread', 'value'],
+    ['OoxmlDecodedImageLimitError', 'value'],
     ['getCachedBitmapByPath', 'value'],
+    // Shared CT_Blip decoding/effects own bounded image resources only; the
+    // interpreter never acquires text, layout, or parser-model geometry.
+    ['getCachedDuotoneBitmapByPath', 'value'],
     ['getCachedDerivedBitmap', 'value'],
     ['getCachedSvgImageByPath', 'value'],
     // Header inspection reuses the document-owned byte profile to decide
@@ -135,6 +158,10 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['isBrowserResizableRasterMimeType', 'value'],
     ['isDecodeTargetResizableRasterFormat', 'value'],
     ['isOoxmlDecodedImageLimitError', 'value'],
+    // Lazy archive admission errors remain terminal at paint-resource catches.
+    ['OoxmlResourceLimitError', 'value'],
+    // An invalid authored CT_Blip chain cannot be replaced by a raw fallback.
+    ['OoxmlError', 'value'],
     ['isTiffDecodeError', 'value'],
     // Missing optional image codecs are contained at paint-resource acquisition;
     // the placeholder consumes only the already-retained authored bounds.
@@ -159,6 +186,8 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['normalizeImageResourceOptions', 'value'],
     ['planDecodedImageTargets', 'value'],
     ['paintDrawingMLShape', 'value'],
+    // Bounded VML mask/concentric compositing allocates temporary paint-only surfaces.
+    ['createAuxCanvas', 'value'],
     ['withVertFeature', 'value'],
     ['preferVectorBlip', 'value'],
     ['releaseOwnedBitmap', 'value'],
@@ -171,6 +200,9 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['recolorSvg', 'value'],
     ['renderChart', 'value'],
     ['withDrawingMLShapeTransform', 'value'],
+    // This scope only adjusts a CanvasPattern's phase while painting a
+    // retained DrawingML shape; it cannot acquire or alter page layout.
+    ['withPatternCoordinateSpace', 'value'],
     // Serial admission and bitmap pinning are document-owned paint-resource
     // lifecycle concerns, not layout acquisition.
     ['withBitmapCacheLease', 'value'],
@@ -182,9 +214,12 @@ const SHARED_PAINT_IMPORTS = new Map([
     ['ChartExRenderer', 'type'],
     ['ChartImageLookup', 'type'],
     ['Duotone', 'type'],
+    ['BlipEffect', 'type'],
     ['ImageResourceOptions', 'type'],
     ['MathRenderer', 'type'],
     ['TiffRenderer', 'type'],
+    // Erased SVG decoder capability; paint forwards it to the shared image owner.
+    ['SvgBlobDecoder', 'type'],
   ])],
 ]);
 
@@ -324,6 +359,8 @@ const EXACT_ACQUISITION_SURFACE_MEMBERS = new Map([
       'numberingMarkerShapeInput',
       'paragraphMarkShapeInput',
       'tableFormatInput',
+      'tableSourceAcquisitionInput',
+      'effectiveTablePreferredWidthPt',
       'tableColumnLayoutInput',
       'tableParticipatesInOrdinaryFlow',
       'paragraphAcquisitionInput',
@@ -349,6 +386,25 @@ const ACQUISITION_CONTEXT_CONSUMERS = [
   `${DOCX_SOURCE}/float-table-geometry.ts`,
   `${DOCX_SOURCE}/frame-geometry.ts`,
   `${DOCX_SOURCE}/line-layout.ts`,
+  `${DOCX_SOURCE}/line-breaker/advance.ts`,
+  `${DOCX_SOURCE}/line-breaker/break-opportunities.ts`,
+  `${DOCX_SOURCE}/line-breaker/break-queue.ts`,
+  `${DOCX_SOURCE}/line-breaker/fit-search.ts`,
+  `${DOCX_SOURCE}/line-breaker/font-metrics.ts`,
+  `${DOCX_SOURCE}/line-breaker/font-routes.ts`,
+  `${DOCX_SOURCE}/line-breaker/justify-fit.ts`,
+  `${DOCX_SOURCE}/line-breaker/kinsoku.ts`,
+  `${DOCX_SOURCE}/line-breaker/line-finalize.ts`,
+  `${DOCX_SOURCE}/line-breaker/line-metrics.ts`,
+  `${DOCX_SOURCE}/line-breaker/model.ts`,
+  `${DOCX_SOURCE}/line-breaker/pass-driver.ts`,
+  `${DOCX_SOURCE}/line-breaker/pass-operations.ts`,
+  `${DOCX_SOURCE}/line-breaker/ruby-metrics.ts`,
+  `${DOCX_SOURCE}/line-breaker/segment-builder.ts`,
+  `${DOCX_SOURCE}/line-breaker/tabs.ts`,
+  `${DOCX_SOURCE}/line-breaker/text-runs.ts`,
+  `${DOCX_SOURCE}/line-breaker/vertical-text.ts`,
+  BODY_TABLE_MEASUREMENT,
   `${DOCX_SOURCE}/paragraph-measure.ts`,
 ];
 
@@ -539,23 +595,26 @@ function assertProductionBodyAcquisitionAuthority(root) {
       'resolveTableRowContentHeights',
     ])],
   ]);
-  for (const edge of moduleEdges(path)) {
-    if (!edge.literal || !edge.specifier.startsWith('.')) continue;
-    const resolvedTarget = resolveLocalImport(path, edge.specifier);
-    const fallbackTarget = resolve(dirname(path), edge.specifier)
-      .replace(/\.(?:[cm]?js)$/u, '.ts');
-    const target = posixPath(relative(root, resolvedTarget ?? fallbackTarget));
-    const forbidden = forbiddenImportsByTarget.get(target);
-    if (!forbidden) continue;
-    const importedNames = edge.importedNames ?? [];
-    if (edge.kind !== 'import'
-      || importedNames.includes('*')
-      || importedNames.includes('default')
-      || importedNames.some((name) => forbidden.has(name))) {
-      fail(
-        'PRODUCTION_ACQUISITION_AUTHORITY',
-        `${PRODUCTION_BODY_LAYOUT} imports fallback measurement from ${target}`,
-      );
+  for (const file of [PRODUCTION_BODY_LAYOUT, BODY_TABLE_MEASUREMENT]) {
+    const inspectedPath = resolve(root, file);
+    for (const edge of moduleEdges(inspectedPath)) {
+      if (!edge.literal || !edge.specifier.startsWith('.')) continue;
+      const resolvedTarget = resolveLocalImport(inspectedPath, edge.specifier);
+      const fallbackTarget = resolve(dirname(inspectedPath), edge.specifier)
+        .replace(/\.(?:[cm]?js)$/u, '.ts');
+      const target = posixPath(relative(root, resolvedTarget ?? fallbackTarget));
+      const forbidden = forbiddenImportsByTarget.get(target);
+      if (!forbidden) continue;
+      const importedNames = edge.importedNames ?? [];
+      if (edge.kind !== 'import'
+        || importedNames.includes('*')
+        || importedNames.includes('default')
+        || importedNames.some((name) => forbidden.has(name))) {
+        fail(
+          'PRODUCTION_ACQUISITION_AUTHORITY',
+          `${file} imports fallback measurement from ${target}`,
+        );
+      }
     }
   }
   const functions = [];
@@ -569,6 +628,10 @@ function assertProductionBodyAcquisitionAuthority(root) {
     return matches.length === 1 ? matches[0] : undefined;
   };
   const columns = uniqueFunction('resolveColumnWidths');
+  // Logical-table acquisition collects unnormalized member constraints through
+  // the same intrinsic-content owner before the sole column solver runs.
+  const columnInputs = uniqueFunction('acquireTableColumnInput');
+  const columnAuthority = columnInputs ?? columns;
   const baseContexts = [];
   const visitBaseContexts = (node) => {
     if (ts.isVariableDeclaration(node)
@@ -576,11 +639,13 @@ function assertProductionBodyAcquisitionAuthority(root) {
       && node.name.text === 'baseContext') baseContexts.push(node);
     ts.forEachChild(node, visitBaseContexts);
   };
-  if (columns?.body) visitBaseContexts(columns.body);
-  const paragraphContextCalls = columns?.body
-    ? callsNamed(columns.body, 'resolveParagraphLayoutContext')
+  if (columnAuthority?.body) visitBaseContexts(columnAuthority.body);
+  const paragraphContextCalls = columnAuthority?.body
+    ? callsNamed(columnAuthority.body, 'resolveParagraphLayoutContext')
     : [];
   if (!columns?.body
+    || !columnAuthority?.body
+    || (columnInputs && callsNamed(columns.body, 'acquireTableColumnInput').length !== 1)
     || baseContexts.length !== 1
     || paragraphContextCalls.length !== 1
     || callOf(baseContexts[0].initializer, 'resolveParagraphLayoutContext')
@@ -588,8 +653,55 @@ function assertProductionBodyAcquisitionAuthority(root) {
     fail('PRODUCTION_ACQUISITION_AUTHORITY', `${PRODUCTION_BODY_LAYOUT}#resolveColumnWidths`);
   }
 
+  // Table eligibility belongs to the sole post-merge decision boundary.
+  // Reject imports as well as calls so aliasing cannot reopen member-level gates.
+  const decisionHelpers = new Set(['tableOriginContext', 'wordMeasuredTableOriginMode',
+    'wordFixedOccupiedGridInput', 'wordTableEffectiveIndentPt', 'wordTableOriginTranslationPt']);
+  for (const name of ['production-body-layout.ts', 'table-acquisition.ts']) {
+    const path = resolve(root, DOCX_SOURCE, 'layout', name);
+    if (!existsSync(path)) continue;
+    const consumer = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
+    const visit = (node) => {
+      if (ts.isIdentifier(node) && decisionHelpers.has(node.text)) {
+        fail('TABLE_LOGICAL_DECISION_AUTHORITY', `${name}:${node.text}`);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(consumer);
+  }
+
   const table = uniqueFunction('computeTablePtLayout');
   const tableSourceIndex = table?.parameters[3];
+  // Adjacent members pass their preparation lazily, so a cross-pass memo hit
+  // (retained-table-pass-cache.ts) skips the logical-table column solve.
+  const prepared = table?.parameters[4];
+  const preparedPassKey = table?.parameters[5];
+  const preparedGetter = prepared?.type;
+  const preparedType = preparedGetter && ts.isFunctionTypeNode(preparedGetter)
+    && preparedGetter.parameters.length === 0 ? preparedGetter.type : undefined;
+  const preparationFields = preparedType && ts.isTypeReferenceNode(preparedType)
+    && ts.isIdentifier(preparedType.typeName) && preparedType.typeName.text === 'Readonly'
+    && preparedType.typeArguments?.length === 1
+    && ts.isTypeLiteralNode(preparedType.typeArguments[0])
+    ? preparedType.typeArguments[0].members : [];
+  const preparedColumns = preparationFields.find((field) => field.name?.getText(source) === 'columns')?.type;
+  const preparedDecision = preparationFields.find((field) => field.name?.getText(source) === 'decision')?.type;
+  const preparedMember = preparationFields.find((field) => field.name?.getText(source) === 'member')?.type;
+  // Permit only immutable solved columns and the acquired logical/member decision;
+  // sourceIndex remains a required number at every call, including group rows.
+  const allowsPreparation = prepared && ts.isIdentifier(prepared.name) && prepared.name.text === 'preparedColumns'
+    && prepared.questionToken && preparationFields.length === 3
+    && preparedPassKey && ts.isIdentifier(preparedPassKey.name)
+    && preparedPassKey.name.text === 'preparedPassKey' && preparedPassKey.questionToken
+    && preparedPassKey.type?.kind === ts.SyntaxKind.StringKeyword
+    && preparedColumns && ts.isTypeOperatorNode(preparedColumns)
+    && preparedColumns.operator === ts.SyntaxKind.ReadonlyKeyword
+    && ts.isArrayTypeNode(preparedColumns.type)
+    && preparedColumns.type.elementType.kind === ts.SyntaxKind.NumberKeyword
+    && preparedDecision && ts.isTypeReferenceNode(preparedDecision)
+    && preparedDecision.typeName.getText(source) === 'LogicalTableDecision'
+    && preparedMember && ts.isTypeReferenceNode(preparedMember)
+    && preparedMember.typeName.getText(source) === 'TableMemberDecision';
   const tableBodyCalls = table?.body ? callsNamed(table.body, 'acquireRetainedTable') : [];
   const tableCalls = callsNamed(source, 'computeTablePtLayout');
   const forbiddenTableCalls = [
@@ -598,13 +710,14 @@ function assertProductionBodyAcquisitionAuthority(root) {
     'measureRetainedCellContentHeightPt',
   ].flatMap((name) => table?.body ? callsNamed(table.body, name) : []);
   if (!table?.body
-    || table.parameters.length !== 4
+    || (table.parameters.length !== 4 && !(table.parameters.length === 6 && allowsPreparation))
     || !tableSourceIndex
     || tableSourceIndex.questionToken
     || tableSourceIndex.type?.kind !== ts.SyntaxKind.NumberKeyword
     || tableBodyCalls.length !== 1
     || tableCalls.length === 0
-    || tableCalls.some((call) => call.arguments.length !== 4)
+    || tableCalls.some((call) => call.arguments.length !== 4
+      && !(allowsPreparation && call.arguments.length === 6))
     || forbiddenTableCalls.length !== 0) {
     fail('PRODUCTION_ACQUISITION_AUTHORITY', `${PRODUCTION_BODY_LAYOUT}#computeTablePtLayout`);
   }
@@ -2061,6 +2174,10 @@ function assertBodyKernelServiceOwner(root) {
   }
 }
 
+// `legacyDoc` is the public opt-in key for the optional binary DOC reader
+// (an input format, like `math` or `chartEx`), not a layout migration switch.
+const INPUT_FORMAT_OPTION_IDENTIFIERS = new Set(['legacyDoc']);
+
 const MIGRATION_IDENTIFIER = /(?:legacy|(?:use|enable|prefer|require)[a-z0-9]*(?:old|previous|alternate)[a-z0-9]*(?:engine|layout|path|algorithm)|(?:reuse|paint)enabled|requireslegacy|dryrun)/i;
 
 function matchingIdentifierCounts(root, predicate) {
@@ -2167,7 +2284,7 @@ function hasExactInvariantImports(source) {
     const elements = statement.importClause.namedBindings.elements;
     return elements.length === 1
       && elements.every((element) => !element.isTypeOnly && !element.propertyName)
-      && elements[0]?.name.text === 'assertAndDeepFreezeDocumentLayout';
+      && elements[0]?.name.text === 'assertAndDeepFreezeDocumentLayoutSteps';
   });
 }
 
@@ -2555,11 +2672,15 @@ function assertCanonicalCutoverBoundaries(root) {
       fail('CANONICAL_LAYOUT_PRODUCER', producerLabel);
     }
     const returned = producer.body.statements.at(-1);
-    const frozenCall = returned && ts.isReturnStatement(returned)
-      ? callOf(returned.expression, 'assertAndDeepFreezeDocumentLayout')
+    const frozenExpression = returned && ts.isReturnStatement(returned)
+      ? unwrapStaticExpression(returned.expression)
+      : null;
+    const frozenCall = frozenExpression && ts.isYieldExpression(frozenExpression)
+      && frozenExpression.asteriskToken
+      ? callOf(frozenExpression.expression, 'assertAndDeepFreezeDocumentLayoutSteps')
       : null;
     if (!hasExactInvariantImports(source)
-      || callsNamed(source, 'assertAndDeepFreezeDocumentLayout').length !== 1
+      || callsNamed(source, 'assertAndDeepFreezeDocumentLayoutSteps').length !== 1
       || frozenCall?.arguments.length !== 1) {
       fail('RETAINED_LAYOUT_IMMUTABILITY', producerLabel);
     }
@@ -2685,7 +2806,10 @@ function currentLegacyInventory(root) {
   return {
     version: 3,
     legacySymbolCounts: identifierCounts(root),
-    migrationIdentifierCounts: matchingIdentifierCounts(root, (name) => MIGRATION_IDENTIFIER.test(name)),
+    migrationIdentifierCounts: matchingIdentifierCounts(
+      root,
+      (name) => MIGRATION_IDENTIFIER.test(name) && !INPUT_FORMAT_OPTION_IDENTIFIERS.has(name),
+    ),
     rendererImportEdges: rendererImportEdges(root),
   };
 }
@@ -2925,11 +3049,44 @@ function parseArguments(argv) {
   return options;
 }
 
+/** Retained shaping ranges carry run offsets. A spread plus a text override
+ * bypasses that authority, even when a caller hides its substring in a local
+ * variable. Use sliceTextShapeRequest, or the explicit independent/transform
+ * helpers when the new text is not a retained range. */
+function assertTextShapeRangeContext(root) {
+  for (const path of listFiles(join(root, DOCX_SOURCE))) {
+    if (!path.endsWith('.ts') || /\.(?:test|stories)\.tsx?$/u.test(path)) continue;
+    const source = sourceFile(path);
+    const visit = (node) => {
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+        && node.expression.name.text === 'shape') {
+        const argument = node.arguments[0];
+        if (argument && ts.isObjectLiteralExpression(argument)) {
+          const textProperty = argument.properties.find((property) =>
+            (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property))
+            && property.name.getText(source).replace(/['"]/gu, '') === 'text');
+          const textValue = textProperty && ts.isPropertyAssignment(textProperty)
+            ? textProperty.initializer : undefined;
+          const directSubstring = textValue && ts.isCallExpression(textValue)
+            && ts.isPropertyAccessExpression(textValue.expression)
+            && ['slice', 'substring', 'substr'].includes(textValue.expression.name.text);
+          if (textProperty && (argument.properties.some(ts.isSpreadAssignment) || directSubstring)) {
+            fail('TEXT_SHAPE_RANGE_CONTEXT', posixPath(relative(root, path)));
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(source, visit);
+  }
+}
+
 export function checkDocxLayoutBoundaries(options) {
   const root = resolve(options.root);
   const baselinePath = resolve(root, BASELINE_PATH);
   const baselineExists = existsSync(baselinePath);
   assertNoProductionTestSupportImports(root);
+  assertTextShapeRangeContext(root);
   assertAcquisitionContextBoundary(root);
   assertProductionBodyAcquisitionAuthority(root);
   assertRendererAcquisitionProjectionBoundary(root);

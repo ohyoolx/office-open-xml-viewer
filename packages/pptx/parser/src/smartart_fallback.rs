@@ -44,7 +44,7 @@
 //! `packages/pptx/src/smartart-fallback-contrast.ts`.
 
 use crate::parse_preflighted_pptx_xml;
-use crate::text::{empty_level_bullets, parse_text_body, ShapeKind};
+use crate::text::{empty_level_bullets, parse_text_body};
 use crate::types::*;
 use crate::{attr, child, read_zip_str, resolve_path, PptxZip};
 use std::collections::HashMap;
@@ -117,9 +117,9 @@ fn walk(
 }
 
 /// Entry point from the graphicFrame walker. `dm_rid` is the `<dgm:relIds r:dm>`
-/// value; `rels` are the *referencing part's* relationships and `part_dir` that
+/// value; `rels` are the *referencing part's* relationships and `source_part` that
 /// part's directory (e.g. `ppt/slides`), so `rels[dm_rid]` resolved against
-/// `part_dir` is the data part (ECMA-376 §21.4.2.22). Reads the data part,
+/// `source_part` is the data part (ECMA-376 §21.4.2.22). Reads the data part,
 /// emits the M-stage content list, or the S-stage placeholder when the data
 /// model is readable but has no displayable text. Emits nothing (returns
 /// `false`) when the relationship is missing or the data part cannot be
@@ -130,7 +130,7 @@ fn walk(
 pub(crate) fn emit_smartart_fallback(
     dm_rid: &str,
     gf_xfrm: &Transform,
-    part_dir: &str,
+    source_part: &str,
     rels: &HashMap<String, String>,
     theme: &HashMap<String, String>,
     zip: &mut PptxZip,
@@ -139,7 +139,7 @@ pub(crate) fn emit_smartart_fallback(
     let Some(data_target) = rels.get(dm_rid) else {
         return false;
     };
-    let data_path = resolve_path(part_dir, data_target);
+    let data_path = resolve_path(source_part, data_target);
     let Ok(data_xml) = read_zip_str(zip, &data_path) else {
         return false;
     };
@@ -274,6 +274,9 @@ pub(crate) fn emit_smartart_fallback(
             num_col: 1,
             spc_col: 0,
             rtl_col: false,
+            spc_first_last_para: false,
+            anchor_ctr: false,
+            compat_ln_spc: None,
             text_warp: None,
         },
     )));
@@ -306,9 +309,9 @@ fn append_point_paragraphs(
         &empty_rels,
         "",
         None,
-        None,
         Default::default(),
         std::array::from_fn(|_| None),
+        Default::default(),
         Default::default(),
         &empty_level_bullets(),
         None,
@@ -318,12 +321,11 @@ fn append_point_paragraphs(
         None,
         None,
         None,
+        &Default::default(),
         None,
-        None,
-        None,
-        None,
-        None,
-        ShapeKind::Sp,
+        None, // inherited_font_algn
+        Default::default(),
+        crate::text::DEFAULT_TEXT_STYLE_MAR_L, // inherited_spacing
         zip,
     );
     if default_font_size.is_none() {
@@ -376,6 +378,9 @@ fn emit_placeholder(gf_xfrm: &Transform, out: &mut Vec<SlideElement>) -> bool {
         num_col: 1,
         spc_col: 0,
         rtl_col: false,
+        spc_first_last_para: false,
+        anchor_ctr: false,
+        compat_ln_spc: None,
         text_warp: None,
     };
     let mut shape = text_list_shape(gf_xfrm, body);
@@ -403,6 +408,7 @@ fn emit_placeholder(gf_xfrm: &Transform, out: &mut Vec<SlideElement>) -> bool {
 /// like a plain transparent text container.
 fn text_list_shape(gf_xfrm: &Transform, body: TextBody) -> ShapeElement {
     ShapeElement {
+        math_fallback: None,
         x: gf_xfrm.x,
         y: gf_xfrm.y,
         width: gf_xfrm.cx,
@@ -416,6 +422,7 @@ fn text_list_shape(gf_xfrm: &Transform, body: TextBody) -> ShapeElement {
         text_body: Some(body),
         default_text_color: None,
         cust_geom: None,
+        cust_geom_paint: None,
         adj: None,
         adj2: None,
         adj3: None,
@@ -449,6 +456,8 @@ fn default_paragraph() -> Paragraph {
         indent: 0,
         space_before: None,
         space_after: None,
+        space_before_pct: None,
+        space_after_pct: None,
         space_line: None,
         lvl: 0,
         bullet: Bullet::None,
@@ -461,7 +470,10 @@ fn default_paragraph() -> Paragraph {
         def_tab_sz: None,
         rtl: false,
         ea_ln_brk: true,
+        font_algn: None,
         runs: Vec::new(),
+        math_fallbacks: Vec::new(),
+        end_run_properties: None,
     }
 }
 
@@ -473,23 +485,37 @@ fn default_run() -> TextRunData {
         underline: false,
         underline_style: None,
         underline_color: None,
+        underline_fill: None,
+        underline_line: None,
+        underline_line_no_fill: false,
         strikethrough: false,
         strike_double: false,
         font_size: None,
         color: None,
+        pattern_fill: None,
+        glyph_fill: None,
+        no_fill: false,
         font_family: None,
         font_family_ea: None,
+        font_family_cs: None,
         font_family_sym: None,
+        lang: None,
+        alt_lang: None,
         baseline: None,
         caps: None,
         letter_spacing: None,
         field_type: None,
         hyperlink: None,
+        hyperlink_uses_text_fill: false,
         hyperlink_action: None,
+        hyperlink_mouse_over: None,
+        hyperlink_mouse_over_action: None,
         shadow: None,
         reflection: None,
         outline: None,
         highlight: None,
+        character_attributes: Default::default(),
+        character_child_attributes: Default::default(),
     }
 }
 
@@ -642,7 +668,7 @@ mod tests {
         let produced = emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -706,7 +732,7 @@ mod tests {
         emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -758,7 +784,7 @@ mod tests {
         emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -796,7 +822,7 @@ mod tests {
         emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -837,7 +863,7 @@ mod tests {
         let produced = emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,
@@ -867,7 +893,7 @@ mod tests {
         let produced = emit_smartart_fallback(
             "rId3",
             &frame(),
-            "ppt/slides",
+            "ppt/slides/slide1.xml",
             &rels,
             &theme,
             &mut zip,

@@ -1,3 +1,4 @@
+import { lineGapModel } from '../line-breaker/line-gaps.js';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_KINSOKU_RULES } from '@silurus/ooxml-core';
 import {
@@ -13,9 +14,11 @@ import type { ParagraphLayoutContext } from '../layout-context.js';
 import type { LayoutImageSeg, LayoutMathSeg, LayoutTabSeg, LayoutTextSeg } from '../line-layout.js';
 import type { MeasuredParagraph } from '../paragraph-measure.js';
 import { measureParagraph } from '../paragraph-measure.js';
+import { buildSegments, layoutLines } from '../line-layout.js';
 import { createLayoutServices } from '../layout-runtime.js';
 import type { DocParagraph } from '../types.js';
 import type { AnchorAcquisitionInput } from './anchor-input.js';
+import type { LayoutRect } from './types.js';
 import type { VerticalGlyphMeasurementService } from './measurement-capabilities.js';
 
 const fontRoute = {
@@ -35,6 +38,18 @@ const acquisitionContext: ParagraphLayoutContext = {
   kinsoku: DEFAULT_KINSOKU_RULES, defaultTabPt: 36,
 };
 
+// Shared retained-projection fixture for the ordinary authority cases below.
+const paragraph = {
+  alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+  spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null,
+  tabStops: [],
+  runs: [{
+    type: 'text', text: 'AB', bold: false, italic: false, underline: false,
+    strikethrough: false, fontSize: 10, color: null, fontFamily: 'Test Sans',
+    background: null, vertAlign: null,
+  }],
+} as unknown as DocParagraph;
+
 function projectMeasuredSegment(
   paragraph: DocParagraph,
   segment: LayoutTextSeg | LayoutImageSeg | LayoutMathSeg | LayoutTabSeg
@@ -45,9 +60,10 @@ function projectMeasuredSegment(
   paragraphBorderEdges?: Parameters<typeof paragraphLayoutFromMeasurement>[1]['paragraphBorderEdges'],
   verticalGlyphMeasurement?: VerticalGlyphMeasurementService,
   verticalPageFrame = false,
+  precedingLines: MeasuredParagraph['lines'] = [],
 ) {
   const measured = {
-    lines: [{
+    lines: [...precedingLines, {
       layout: {
         segments: Array.isArray(segment) ? segment : [segment], height: 10, ascent: 8, descent: 2,
         visibleAscent: 8, visibleDescent: 2, intendedSingle: 10,
@@ -55,11 +71,11 @@ function projectMeasuredSegment(
       },
       topYPt: 10, advancePt: 12,
     }],
-    markOnly: false, requestedSpaceBeforePt: 0, requestedSpaceAfterPt: 0,
+    markOnly: false, requestedSpaceBeforePt: context.spaceBeforePt, requestedSpaceAfterPt: 0,
     uniformRubyAdvancePt: 0, contentStartYPt: 10, contentEndYPt: 22,
     lastLineBelowBaselinePt: 2,
     placement: {
-      startYPt: 10, paragraphXPt: 10, availableWidthPt: 100,
+      startYPt: 10 - context.spaceBeforePt, paragraphXPt: 10, availableWidthPt: 100,
       maximumYPt: 500, suppressSpaceBefore: false,
     },
   } as unknown as MeasuredParagraph;
@@ -217,6 +233,9 @@ describe('layoutParagraph', () => {
     expect(second.bookmarkStarts).toBeUndefined();
     expect(Object.isFrozen(whole)).toBe(true);
     expect(Object.isFrozen(whole.lines)).toBe(true);
+    expect(Object.isFrozen(second)).toBe(true);
+    expect(Object.isFrozen(second.lines[0])).toBe(true);
+    expect(Object.isFrozen(second.lines[0]?.placements[0])).toBe(true);
   });
 
   it('charges the initial jump and only intra-slice inter-line jumps', () => {
@@ -589,6 +608,26 @@ describe('layoutParagraph', () => {
     expect(second.borders.some((border) => border.edge === 'top')).toBe(false);
   });
 
+  it('preserves a literal backslash in a retained fallback font route', () => {
+    const family = 'Family \\31';
+    const segment = {
+      text: 'AB', sourceRunIndex: 0, measuredWidth: 10, fontSize: 10, fontFamily: family,
+      shapedClusters: [
+        { range: { start: 0, end: 1 }, offsetPt: 0, advancePt: 5 },
+        { range: { start: 1, end: 2 }, offsetPt: 5, advancePt: 5 },
+      ],
+    } as unknown as LayoutTextSeg;
+    const paragraph = {
+      type: 'paragraph', alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+      spaceBefore: 0, spaceAfter: 0, lineSpacing: null, tabStops: [],
+      runs: [{ type: 'text', text: 'AB', fontSize: 10, fontFamily: family }],
+    } as unknown as DocParagraph;
+    const placement = projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0];
+    expect(placement?.kind).toBe('text');
+    if (placement?.kind !== 'text') throw new Error('Expected retained text');
+    expect(JSON.parse(placement.fontRoute.familyList)).toBe(family);
+  });
+
   it('retains paint-ready shared dash and double treatments for paragraph borders', () => {
     const segment = {
       text: 'AB', sourceRunIndex: 0, measuredWidth: 10,
@@ -821,24 +860,90 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
     expect(node.drawings.every((drawing) => drawing.anchorLayer === undefined)).toBe(true);
   });
 
+  it('offsets a relative inline shape from its pen position without changing the advance', () => {
+    const inlineShape = (offsetXPt: number, offsetYPt: number) => ({
+      type: 'shape' as const,
+      inline: true,
+      widthPt: 20,
+      heightPt: 10,
+      inlineOffsetXPt: offsetXPt,
+      inlineOffsetYPt: offsetYPt,
+      anchorXPt: 7,
+      anchorYPt: 7,
+      anchorXFromMargin: false,
+      anchorYFromPara: false,
+      zOrder: 0,
+      subpaths: [],
+      presetGeometry: 'rect',
+      fill: { fillType: 'solid' as const, color: '009989' },
+      stroke: null,
+      textBlocks: [],
+    });
+    const offsetParagraph = {
+      ...paragraph,
+      runs: [inlineShape(0, 0), inlineShape(5, 3), inlineShape(0, 0)],
+    } as unknown as DocParagraph;
+    const placement = {
+      startYPt: 10, paragraphXPt: 10, availableWidthPt: 100, maximumYPt: 500,
+      suppressSpaceBefore: false,
+    };
+    const measurer = { context: measureContext, fontFamilyClasses: {} };
+    const environment = {
+      documentHasEastAsianText: false, pageWritingMode: 'horizontal-tb' as const,
+      pageIndex: 0, totalPages: 1,
+    };
+    const context = { ...acquisitionContext, tabStops: [] };
+    const measured = measureParagraph(offsetParagraph as never, context, placement, measurer, environment);
+    const node = paragraphLayoutFromMeasurement(offsetParagraph as never, {
+      id: 'relative-vml', source, flowDomainId: 'body', ordinaryFlow: true,
+      context, placement, measurer, environment, exclusions: [],
+    } as never, measured);
+    const placements = node.lines.flatMap((line) => line.placements)
+      .filter((item) => item.kind === 'drawing');
+    expect(placements.map((item) => item.bounds.xPt)).toEqual([10, 35, 50]);
+    expect(placements[1]!.bounds.yPt - placements[0]!.bounds.yPt).toBe(3);
+    expect(placements.map((item) => item.advancePt)).toEqual([20, 20, 20]);
+    expect(node.drawings.map((drawing) => drawing.flowBounds.xPt)).toEqual([10, 35, 50]);
+  });
+
   it('retains selected-face anchor-host metrics instead of font-size ratios', () => {
     const paragraph = {
       alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
       spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null,
       tabStops: [], runs: [],
     } as unknown as DocParagraph;
-    const segment = {
+    // A genuine service: empty text has no extent, a glyph probe does.
+    const textLayoutService = {
+      shape: (request: { text: string; fontSizePt: number }) => ({
+        advancePt: request.text ? request.fontSizePt / 2 : 0,
+        ascentPt: request.text ? request.fontSizePt * 0.7 : 0,
+        descentPt: request.text ? request.fontSizePt * 0.3 : 0,
+        spans: [], diagnostics: [], graphemeBoundaries: [0],
+      }),
+    };
+    const host = (overrides: Record<string, unknown> = {}) => ({
       text: '', metricOnly: true, measuredWidth: 0, fontSize: 10,
       textShapeRequest: {
         text: '', fontSizePt: 10, fonts: { ascii: 'Test Sans' },
         weight: 400, style: 'normal', measure: true,
       },
-      textLayoutService: {
-        shape: () => ({ advancePt: 0, ascentPt: 7, descentPt: 3, spans: [], diagnostics: [], graphemeBoundaries: [0] }),
-      },
-    } as unknown as LayoutTextSeg;
-    expect(projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0]).toMatchObject({
-      kind: 'anchor-host', sourceMetrics: { ascentPt: 7, descentPt: 3 },
+      textLayoutService,
+      ...overrides,
+    } as unknown as LayoutTextSeg);
+    const placement = (segment: LayoutTextSeg) => projectMeasuredSegment(paragraph, segment).lines[0]?.placements[0];
+    // A generic metric-only host keeps its existing empty-text authority.
+    expect(placement(host())).toMatchObject({ kind: 'anchor-host', sourceMetrics: { ascentPt: 0, descentPt: 0 } });
+    // A native separator participant retains its probe's selected-face sides
+    // at the existing effective size (super/sub scaling; small caps measured
+    // at full size), with no width and an empty source range.
+    expect(placement(host({ metricProbeText: 'x' }))).toMatchObject({
+      kind: 'anchor-host', range: { start: 0, end: 0 }, bounds: { widthPt: 0 },
+      sourceMetrics: { ascentPt: 7, descentPt: 3 },
+    });
+    const superscript = placement(host({ metricProbeText: 'x', vertAlign: 'super' }));
+    expect(superscript?.kind === 'anchor-host' && superscript.sourceMetrics?.ascentPt).toBeCloseTo(4.55);
+    expect(placement(host({ metricProbeText: 'x', smallCaps: true }))).toMatchObject({
+      sourceMetrics: { ascentPt: 7, descentPt: 3 },
     });
   });
 
@@ -865,6 +970,87 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
         inkBounds: { xMinPt: 0, xMaxPt: 7, ascentPt: 7, descentPt: 3 },
       }],
     });
+  });
+
+  it.each(['paragraph', 'line'] as const)('keeps the first %s picture origin before paragraph spacing on a grid', (relativeFrom) => {
+    const occurrenceId = 'anchor:spacing-grid';
+    const seed = retainedAnchor(occurrenceId);
+    const anchored = { ...seed, vertical: { ...seed.vertical, relativeFrom } };
+    const anchorParagraph = { ...paragraph, runs: [
+      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+      { type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+        widthPt: 20, heightPt: 10, anchor: true, anchorAcquisitionInput: anchored },
+    ] } as unknown as DocParagraph;
+    const host = { text: '', metricOnly: true, sourceRunIndex: 0, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
+    const node = projectMeasuredSegment(anchorParagraph, host, {
+      ...acquisitionContext, spaceBeforePt: 6, lineGrid: { active: true, pitchPt: 20 },
+    }, undefined, {
+      page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
+      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd',
+    });
+    // The retained text top is 10; paragraph/first-line origin is 4, and the
+    // authored picture offset is 3. Baseline leading does not move the picture.
+    expect(node.drawings[0]?.flowBounds.yPt).toBe(7);
+  });
+
+  it('keeps an aligned first-line picture in its own line on a grid', () => {
+    const occurrenceId = 'anchor:aligned-grid-line';
+    const seed = retainedAnchor(occurrenceId);
+    const anchored = { ...seed, vertical: { ...seed.vertical, relativeFrom: 'line',
+      choice: { kind: 'align', value: 'bottom' } } };
+    const anchorParagraph = { ...paragraph, runs: [
+      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+      { type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+        widthPt: 20, heightPt: 10, anchor: true, anchorAcquisitionInput: anchored },
+    ] } as unknown as DocParagraph;
+    const host = { text: '', metricOnly: true, sourceRunIndex: 0, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
+    const node = projectMeasuredSegment(anchorParagraph, host, {
+      ...acquisitionContext, spaceBeforePt: 6, lineGrid: { active: true, pitchPt: 20 },
+    }, undefined, {
+      page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
+      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd',
+    });
+    // §20.4.2.2 / §20.4.3.2: bottom alignment holds the object against the line's bottom.
+    // The grid origin observation measured posOffset only; it moves no edge.
+    const line = node.lines[0]!.bounds;
+    const drawing = node.drawings[0]!.flowBounds;
+    expect(drawing.yPt + drawing.heightPt).toBe(line.yPt + line.heightPt);
+  });
+
+  it('uses physical host identity when later picture lines have the same numeric top', () => {
+    const occurrenceId = 'anchor:later-grid-line';
+    const seed = retainedAnchor(occurrenceId);
+    const anchored = { ...seed, vertical: { ...seed.vertical, relativeFrom: 'line' } };
+    const anchorParagraph = { ...paragraph, runs: [
+      { ...(paragraph.runs[0] as object), text: 'A' },
+      { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+      { type: 'image', imagePath: 'word/media/anchor.png', mimeType: 'image/png',
+        widthPt: 20, heightPt: 10, anchor: true, anchorAcquisitionInput: anchored },
+    ] } as unknown as DocParagraph;
+    const host = { text: '', metricOnly: true, sourceRunIndex: 1, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute } as unknown as LayoutTextSeg;
+    const precedingLine = {
+      layout: { segments: [{ ...host, text: 'A', metricOnly: undefined, sourceRunIndex: 0,
+        measuredWidth: 5, shapedClusters: [{ range: { start: 0, end: 1 }, offsetPt: 0, advancePt: 5 }] }],
+        height: 10, ascent: 8, descent: 2, intendedSingle: 10, gridCountSingle: 10,
+        xOffset: 0, availWidth: 100 },
+      topYPt: 10, advancePt: 0,
+    };
+    const node = projectMeasuredSegment(anchorParagraph, host, {
+      ...acquisitionContext, spaceBeforePt: 6, lineGrid: { active: true, pitchPt: 20 },
+    }, undefined, {
+      page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+      margin: { xPt: 10, yPt: 20, widthPt: 180, heightPt: 260 },
+      column: { xPt: 10, yPt: 20, widthPt: 90, heightPt: 260 }, pageParity: 'odd',
+    }, undefined, undefined, false, [precedingLine]);
+    // Only the first physical line owns the before-spacing origin. A later
+    // line retains its own top even when numeric geometry happens to coincide.
+    expect(node.lines).toHaveLength(2);
+    expect(node.drawings[0]?.flowBounds.yPt).toBe(13);
   });
 
   it('matches one scoped host to one anchored payload and retains one drawing and exclusion', () => {
@@ -952,6 +1138,28 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
         issues: [expect.objectContaining({ path })],
       }),
     ]);
+  });
+
+  it('paints cluster-origin operations at their retained origins once (#1975)', () => {
+    // A floored cluster splits paint into cluster-origin operations; their
+    // origins already hold the leading word-boundary adjustment.
+    const segment = {
+      text: 'MiM', sourceRunIndex: 0, measuredWidth: 6.5,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute,
+      charSpacing: -6, leadingWordBoundaryPx: -1.5,
+      shapedClusters: [
+        { range: { start: 0, end: 1 }, offsetPt: 0, advancePt: 10 },
+        { range: { start: 1, end: 2 }, offsetPt: 10, advancePt: 4 },
+        { range: { start: 2, end: 3 }, offsetPt: 14, advancePt: 10 },
+      ],
+    } as unknown as LayoutTextSeg;
+    const node = projectMeasuredSegment(paragraph, segment, acquisitionContext);
+    const placement = node.lines[0]?.placements[0];
+    if (placement?.kind !== 'text') throw new Error('expected retained text placement');
+    expect(placement.clusters.map((cluster) => [cluster.offset.xPt, cluster.advancePt]))
+      .toEqual([[-1.5, 4], [2.5, 0], [2.5, 4]]);
+    expect(placement.paintOps.map((op) => [op.text, op.offset.xPt]))
+      .toEqual([['M', -1.5], ['i', 2.5], ['M', 2.5]]);
   });
 
   it('retains balanced authored-space width in LTR cluster geometry', () => {
@@ -1195,16 +1403,6 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
     });
   });
 
-  const paragraph = {
-    alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
-    spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null,
-    tabStops: [],
-    runs: [{
-      type: 'text', text: 'AB', bold: false, italic: false, underline: false,
-      strikethrough: false, fontSize: 10, color: null, fontFamily: 'Test Sans',
-      background: null, vertAlign: null,
-    }],
-  } as unknown as DocParagraph;
 
   const measureContext = {
     font: '', letterSpacing: '0px', fontKerning: 'auto',
@@ -1402,6 +1600,210 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
     }).yPt).toBe(13);
   });
 
+  it('keeps a bottom/centre aligned spAutoFit box aligned at its fitted height', () => {
+    // ECMA-376 §20.4.2.2 wp:align / §20.4.3.2 ST_AlignV + §21.1.2.1.3 spAutoFit: the aligned edge
+    // belongs to the drawn (fitted) extent, not to the authored extent.
+    const services = createLayoutServices({
+      section: {
+        pageWidth: 200, pageHeight: 300,
+        marginTop: 30, marginRight: 20, marginBottom: 30, marginLeft: 20,
+        headerDistance: 15, footerDistance: 15,
+        titlePage: false, evenAndOddHeaders: false,
+      },
+      body: [],
+      headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+    }, { measureContext });
+    const host = {
+      text: '', metricOnly: true, sourceRunIndex: 0, measuredWidth: 0,
+      fontSize: 10, fontFamily: 'Test Sans', fontRoute,
+    } as unknown as LayoutTextSeg;
+    const measured = {
+      lines: [{
+        layout: {
+          segments: [host], height: 10, ascent: 8, descent: 2,
+          visibleAscent: 8, visibleDescent: 2, intendedSingle: 10,
+          visibleIntendedSingle: 10, xOffset: 0, availWidth: 100,
+        },
+        topYPt: 40, advancePt: 12,
+      }],
+      markOnly: false, requestedSpaceBeforePt: 0, requestedSpaceAfterPt: 0,
+      uniformRubyAdvancePt: 0, contentStartYPt: 40, contentEndYPt: 52,
+      lastLineBelowBaselinePt: 2,
+      placement: {
+        startYPt: 40, paragraphXPt: 20, availableWidthPt: 160,
+        maximumYPt: 270, suppressSpaceBefore: false,
+      },
+    } as unknown as MeasuredParagraph;
+    const occurrenceId = 'aligned-autofit-anchor';
+    const layoutFor = (options: Readonly<{
+      vertical: AnchorAcquisitionInput['vertical']['choice'];
+      horizontal?: AnchorAcquisitionInput['horizontal']['choice'];
+      textAutofit?: string;
+      widthPt?: number;
+      heightPt?: number;
+      textVert?: string;
+      verticalSection?: boolean;
+    }>) => {
+      const widthPt = options.widthPt ?? 40;
+      const heightPt = options.heightPt ?? 100;
+      const input = retainedAnchor(occurrenceId, {
+        horizontal: {
+          relativeFrom: 'margin', relativeFromStatus: 'valid',
+          choice: options.horizontal ?? { kind: 'align', value: 'left' },
+        },
+        vertical: {
+          relativeFrom: 'margin', relativeFromStatus: 'valid', choice: options.vertical,
+        },
+        extent: { widthPt, widthStatus: 'valid', heightPt, heightStatus: 'valid' },
+        wrap: {
+          kind: 'none', authoredKinds: [], side: null,
+          distances: retainedAnchor(occurrenceId).wrap.distances,
+          effectExtent: null, polygon: null,
+        },
+      });
+      const anchored = {
+        ...paragraph,
+        runs: [
+          { type: 'anchorHost', fontSize: 10, anchorOccurrenceId: occurrenceId },
+          {
+            type: 'shape',
+            widthPt,
+            heightPt,
+            anchorXPt: 0,
+            anchorYPt: 0,
+            anchorXFromMargin: true,
+            anchorYFromPara: false,
+            anchorAcquisitionInput: input,
+            zOrder: 0,
+            subpaths: [],
+            presetGeometry: 'rect',
+            fill: null,
+            stroke: null,
+            textAutofit: options.textAutofit ?? 'sp',
+            textInsetL: 0, textInsetT: 0, textInsetR: 0, textInsetB: 0,
+            textAnchor: 't',
+            ...(options.textVert ? { textVert: options.textVert } : {}),
+            textBlocks: [{
+              text: 'abcdefghij', fontSizePt: 10, color: '112233', alignment: 'left',
+              runs: [{ text: 'abcdefghij', fontSizePt: 10, color: '112233' }],
+            }],
+          },
+        ],
+      } as unknown as DocParagraph;
+      const verticalSection = options.verticalSection ?? false;
+      return paragraphLayoutFromMeasurement(anchored as never, {
+        id: 'aligned-autofit', source, flowDomainId: 'body', ordinaryFlow: true,
+        context: acquisitionContext,
+        placement: measured.placement,
+        measurer: { context: measureContext, fontFamilyClasses: {} } as never,
+        environment: {
+          pageIndex: 0, totalPages: 1, documentHasEastAsianText: false,
+          layoutServices: services,
+          pageWritingMode: verticalSection ? 'vertical-rl' : 'horizontal-tb',
+          verticalPageFrame: verticalSection,
+        } as never,
+        exclusions: [],
+        anchorFrames: {
+          page: { xPt: 0, yPt: 0, widthPt: 200, heightPt: 300 },
+          margin: { xPt: 20, yPt: 30, widthPt: 160, heightPt: 240 },
+          column: { xPt: 20, yPt: 30, widthPt: 160, heightPt: 240 },
+          pageParity: 'odd',
+        },
+      }, measured);
+    };
+    const acquire = (
+      choice: AnchorAcquisitionInput['vertical']['choice'],
+      textAutofit = 'sp',
+    ) => layoutFor({ vertical: choice, textAutofit }).drawings[0]!.flowBounds;
+
+    const top = acquire({ kind: 'align', value: 'top' });
+    expect(top.yPt).toBe(30);
+    expect(top.heightPt).toBeLessThan(100);
+    const bottom = acquire({ kind: 'align', value: 'bottom' });
+    expect(bottom.heightPt).toBe(top.heightPt);
+    expect(bottom.yPt + bottom.heightPt).toBeCloseTo(270, 9);
+    const center = acquire({ kind: 'align', value: 'center' });
+    expect(center.heightPt).toBe(top.heightPt);
+    expect(center.yPt + center.heightPt / 2).toBeCloseTo(150, 9);
+    // inside/outside follow page parity: outside on an odd page is trailing.
+    const outside = acquire({ kind: 'align', value: 'outside' });
+    expect(outside.yPt + outside.heightPt).toBeCloseTo(270, 9);
+    // Offsets and percentages keep the authored top edge.
+    expect(acquire({ kind: 'offset', valuePt: 12 }).yPt).toBe(42);
+    expect(acquire({ kind: 'percent', fraction: 0.5 }).yPt).toBe(150);
+    // Without spAutoFit the authored extent is the drawn extent.
+    expect(acquire({ kind: 'align', value: 'bottom' }, 'none'))
+      .toMatchObject({ yPt: 170, heightPt: 100 });
+
+    // Invariance: an aligned spAutoFit box draws exactly like a fixed box
+    // authored at its fitted extent — drawing frame, text-box frame and text
+    // lines, all compared in section-logical points (a vertical section may
+    // choose a different upright-local origin for the same geometry). This
+    // also covers vertical text (the fitted axis is the width, so positionH
+    // carries the alignment) and vertical sections (alignment in the upright
+    // physical drawing frame).
+    type Affine = Readonly<{ a: number; b: number; c: number; d: number; e: number; f: number }>;
+    const logicalRect = (rect: LayoutRect, transforms: readonly (Affine | undefined)[]) => {
+      const corners = [
+        [rect.xPt, rect.yPt], [rect.xPt + rect.widthPt, rect.yPt],
+        [rect.xPt, rect.yPt + rect.heightPt], [rect.xPt + rect.widthPt, rect.yPt + rect.heightPt],
+      ].map(([x, y]) => transforms.reduce(([px, py], m) => m
+        ? [m.a * px! + m.c * py! + m.e, m.b * px! + m.d * py! + m.f]
+        : [px!, py!], [x!, y!]));
+      const xs = corners.map(([x]) => x!);
+      const ys = corners.map(([, y]) => y!);
+      const round = (value: number) => Math.round(value * 1e6) / 1e6;
+      return {
+        xPt: round(Math.min(...xs)), yPt: round(Math.min(...ys)),
+        widthPt: round(Math.max(...xs) - Math.min(...xs)),
+        heightPt: round(Math.max(...ys) - Math.min(...ys)),
+      };
+    };
+    const geometry = (layout: ReturnType<typeof layoutFor>) => {
+      const drawing = layout.drawings[0]!;
+      const textBox = layout.textBoxes[0]!;
+      const block = textBox.story.blocks[0]!;
+      const toLogical = [textBox.transform, drawing.transform];
+      return {
+        drawing: drawing.flowBounds,
+        textBox: logicalRect(textBox.flowBounds, [drawing.transform]),
+        line: block.kind === 'paragraph' ? logicalRect(block.lines[0]!.bounds, toLogical) : null,
+      };
+    };
+    for (const verticalSection of [false, true]) {
+      for (const choice of [
+        { kind: 'align', value: 'bottom' },
+        { kind: 'align', value: 'center' },
+      ] as const) {
+        const fitted = layoutFor({ vertical: choice, verticalSection });
+        const fittedHeightPt = fitted.textBoxes[0]!.flowBounds.heightPt;
+        expect(fittedHeightPt).toBeLessThan(100);
+        const fixed = layoutFor({
+          vertical: choice, verticalSection, textAutofit: 'none', heightPt: fittedHeightPt,
+        });
+        expect(geometry(fitted)).toEqual(geometry(fixed));
+      }
+      for (const choice of [
+        { kind: 'align', value: 'right' },
+        { kind: 'align', value: 'center' },
+      ] as const) {
+        const fitted = layoutFor({
+          vertical: { kind: 'align', value: 'top' }, horizontal: choice,
+          textVert: 'eaVert', widthPt: 100, heightPt: 40, verticalSection,
+        });
+        const fittedWidthPt = fitted.textBoxes[0]!.flowBounds.widthPt;
+        expect(fittedWidthPt).not.toBe(100);
+        const fixed = layoutFor({
+          vertical: { kind: 'align', value: 'top' }, horizontal: choice,
+          textVert: 'eaVert', widthPt: fittedWidthPt, heightPt: 40, verticalSection,
+          textAutofit: 'none',
+        });
+        expect(geometry(fitted)).toEqual(geometry(fixed));
+      }
+    }
+  });
+
   it('acquires ordinary CJK as complete service-shaped grapheme clusters', () => {
     const cjkParagraph = {
       ...paragraph,
@@ -1591,13 +1993,13 @@ describe('paragraphLayoutFromMeasurement retained authorities', () => {
     }, markerServices);
 
     expect(markerShapeRequests).toEqual([
-      expect.objectContaining({ text: '1.', kerning: undefined }),
+      expect.objectContaining({ text: '1.', kerning: false }),
     ]);
     expect(node.lines[0]?.placements).toEqual([
       expect.objectContaining({
         kind: 'text', role: 'numbering-marker', text: '1.',
         range: { start: -2, end: 0 }, origin: { xPt: 10, yPt: expect.any(Number) },
-        paintOps: [expect.objectContaining({ kerning: 'auto' })],
+        paintOps: [expect.objectContaining({ kerning: 'none' })],
       }),
       expect.objectContaining({
         kind: 'text', text: 'AB', range: { start: 0, end: 2 },
@@ -1837,6 +2239,71 @@ describe('planLine visual geometry', () => {
       offset: { xPt: 0, yPt: 0 }, advancePt: widthPt,
     }],
   });
+
+  it.each(['a😀 b  c', `a${' '.repeat(50_000)}b`])(
+    'projects retained proportional gaps through clusters and contextual paint ops in one sweep', (value) => {
+      let utf16 = 0;
+      let xPt = 0;
+      let spaceIndex = 0;
+      const spaceWidths = new Map<number, number>();
+      const clusters = [...value].map((character, cpIndex) => {
+        const advancePt = character === ' ' ? 2 + (spaceIndex++ % 3) : 3;
+        if (character === ' ') spaceWidths.set(cpIndex, advancePt);
+        const cluster = {
+          range: { start: utf16, end: utf16 + character.length },
+          offset: { xPt, yPt: 0 }, advancePt,
+        };
+        utf16 += character.length;
+        xPt += advancePt;
+        return cluster;
+      });
+      const segment = { ...measuredText(value, 0, xPt), clusters };
+      // The small case crosses op, surrogate and unequal-gap boundaries. The
+      // large case exposes a rescan per gap without a flaky timing threshold.
+      if (value.length < 20) {
+        segment.basePaintOps = [
+          { ...segment.basePaintOps[0]!, text: value.slice(0, 4), range: { start: 0, end: 4 } },
+          { ...segment.basePaintOps[0]!, text: value.slice(4), range: { start: 4, end: value.length },
+            offset: { xPt: clusters[3]!.offset.xPt, yPt: 0 } },
+        ];
+      }
+      const model = lineGapModel([{ text: value, widthPx: xPt, spacePx: 0, spaceWidths }]);
+      const slack = model.S / 8;
+      const line = planLine({
+        paragraphXPt: 0, availableWidthPt: xPt + slack,
+        alignment: 'both', baseRtl: false,
+        isFirstLine: true, isLastLine: false, stretchLastLine: false,
+        line: {
+          range: segment.range, topPt: 0, baselinePt: 10, advancePt: 12,
+          xOffsetPt: 0, availableWidthPt: xPt + slack, endsWithBreak: false,
+          justifiedCompressionPt: 0, gapPlan: { ...model, expansionGaps: [] },
+          segments: [segment],
+        },
+      });
+      const placement = line.placements[0];
+      if (placement?.kind !== 'text') throw new Error('Expected retained text');
+      const characters = [...value];
+      let deltaPt = 0;
+      for (let i = 0; i < clusters.length; i++) {
+        const previous = characters[i - 1];
+        if (previous === ' ') deltaPt += clusters[i - 1]!.advancePt / 8;
+        expect(placement.clusters[i]!.offset.xPt).toBe(clusters[i]!.offset.xPt + deltaPt);
+      }
+      expect(placement.advancePt).toBe(xPt + slack);
+      expect(placement.paintOps.map(op => op.text).join('')).toBe(value);
+      // Independent small reference can afford repeated scans; the stress
+      // expectation above is incremental to keep the test itself linear.
+      if (value.length < 20) {
+        for (const op of placement.paintOps) {
+          const before = clusters.filter(c => c.range.end <= op.range.start
+            && value.slice(c.range.start, c.range.end) === ' ')
+            .reduce((sum, c) => sum + c.advancePt / 8, 0);
+          const natural = clusters.find(c => c.range.start === op.range.start)!;
+          expect(op.offset.xPt).toBe(natural.offset.xPt + before);
+        }
+      }
+    },
+  );
 
   it.each([
     ['left', false, [10, 30]],
@@ -2578,5 +3045,101 @@ describe('planLine visual geometry', () => {
         ],
       },
     });
+  });
+});
+
+describe('native separator metric participants in the line pipeline', () => {
+  /** Vertical metrics follow the requested size; empty text measures nothing. */
+  const sizedContext = () => {
+    const context = {
+      font: '10px serif', letterSpacing: '0px', fontKerning: 'auto',
+      measureText(text: string) {
+        const px = Number(/([0-9.]+)px/.exec(context.font)?.[1] ?? 10);
+        const extent = text ? 1 : 0;
+        return {
+          width: [...text].length * px / 2,
+          actualBoundingBoxAscent: px * 0.8 * extent, actualBoundingBoxDescent: px * 0.2 * extent,
+          fontBoundingBoxAscent: px * 0.8 * extent, fontBoundingBoxDescent: px * 0.2 * extent,
+        } as TextMetrics;
+      },
+    };
+    return context as unknown as CanvasRenderingContext2D;
+  };
+  const participant = (overrides: Record<string, unknown> = {}) => ({
+    type: 'text', text: '', bold: false, italic: false, underline: false, strikethrough: false,
+    fontSize: 10, color: null, fontFamily: 'serif', isLink: false, background: null,
+    vertAlign: null, hyperlink: null, noteSeparatorCharacter: 'paragraph-mark', ...overrides,
+  });
+  const measure = (run: Record<string, unknown>) => {
+    const context = sizedContext();
+    const services = createLayoutServices({
+      section: {
+        pageWidth: 200, pageHeight: 300, marginTop: 30, marginRight: 20, marginBottom: 30,
+        marginLeft: 20, headerDistance: 15, footerDistance: 15, titlePage: false, evenAndOddHeaders: false,
+      },
+      body: [], headers: { default: null, first: null, even: null },
+      footers: { default: null, first: null, even: null },
+    }, { measureContext: context });
+    const paragraph = {
+      type: 'paragraph', alignment: 'left', indentLeft: 0, indentRight: 0, indentFirst: 0,
+      spaceBefore: 0, spaceAfter: 0, lineSpacing: null, numbering: null, tabStops: [],
+      runs: [run], defaultFontSize: 10,
+    } as unknown as DocParagraph;
+    const environment = {
+      pageIndex: 0, totalPages: 1, documentHasEastAsianText: false,
+      pageWritingMode: 'horizontal-tb', layoutServices: services,
+    } as const;
+    const placement = {
+      startYPt: 0, paragraphXPt: 0, availableWidthPt: 100, maximumYPt: 500, suppressSpaceBefore: false,
+    };
+    const measurer = { context, fontFamilyClasses: {} };
+    const measured = measureParagraph(paragraph, acquisitionContext, placement, measurer, environment);
+    const node = paragraphLayoutFromMeasurement(paragraph as never, {
+      id: 'separator-participant', source, flowDomainId: 'body', ordinaryFlow: true,
+      context: acquisitionContext, placement: measured.placement, measurer, environment, exclusions: [],
+    }, measured);
+    return { line: node.lines[0]!, advancePt: node.advancePt };
+  };
+
+  it('keeps probe vertical metrics and composes an authored raise without advance or ink', () => {
+    const plain = measure(participant());
+    expect(plain.line.placements).toEqual([expect.objectContaining({
+      kind: 'anchor-host', range: { start: 0, end: 0 },
+      bounds: expect.objectContaining({ widthPt: 0 }),
+      sourceMetrics: { ascentPt: 8, descentPt: 2 },
+    })]);
+    expect(plain.line.bounds.widthPt).toBe(0);
+    expect(plain.advancePt).toBeCloseTo(10);
+    // Existing library line-box composition for this controlled fixture (not
+    // an ECMA-376 or Office formula): a 6pt raise adds to the probe's ascent.
+    expect(measure(participant({ position: 6 })).advancePt).toBeCloseTo(16);
+    // Superscript uses the existing effective-size policy for the probe.
+    const superscript = measure(participant({ vertAlign: 'super' }));
+    expect(superscript.line.placements[0]).toMatchObject({ sourceMetrics: { ascentPt: 5.2, descentPt: 1.3 } });
+    expect(superscript.advancePt).not.toBeCloseTo(plain.advancePt);
+    // Small caps keep the existing full-size metric policy.
+    expect(measure(participant({ smallCaps: true })).advancePt).toBeCloseTo(plain.advancePt);
+  });
+
+  it('measures the probe at the caller scale without inline advance', () => {
+    const lineAt = (scale: number) => {
+      const context = sizedContext();
+      const services = createLayoutServices({
+        section: {
+          pageWidth: 200, pageHeight: 300, marginTop: 30, marginRight: 20, marginBottom: 30,
+          marginLeft: 20, headerDistance: 15, footerDistance: 15, titlePage: false, evenAndOddHeaders: false,
+        },
+        body: [], headers: { default: null, first: null, even: null },
+        footers: { default: null, first: null, even: null },
+      }, { measureContext: context });
+      const segments = buildSegments([participant({ vertAlign: 'super' })] as never, { layoutServices: services } as never);
+      return layoutLines(context as never, segments, 200 * scale, 0, scale)[0]!;
+    };
+    const unit = lineAt(1);
+    const double = lineAt(2);
+    expect(unit.ascent).toBeGreaterThan(0);
+    expect(double.ascent).toBeCloseTo(unit.ascent * 2);
+    expect(double.descent).toBeCloseTo(unit.descent * 2);
+    expect(double.segments.reduce((sum, segment) => sum + segment.measuredWidth, 0)).toBe(0);
   });
 });

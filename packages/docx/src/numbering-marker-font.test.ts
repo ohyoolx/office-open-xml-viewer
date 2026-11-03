@@ -149,6 +149,50 @@ async function render(num: NumberingInfo | null) {
 const headFamily = (font: string) => /"([^"]+)"/.exec(font)?.[1] ?? font;
 
 describe('numbering marker + body eastAsia font routing (§17.3.2.26 / §17.9.6)', () => {
+  it('moves a following paragraph by the selected marker and body line-box union', async () => {
+    const renderedSuccessorTop = async (markerSizePt: number | null, compatibilityMode = 15): Promise<number> => {
+      const { canvas } = makeRecordingCanvas();
+      const first = {
+        ...(headingDoc(null).body[0] as DocParagraph),
+        runs: [{ type: 'text' as const, ...run('Body', 'Text Face', 'Text Face'), fontSize: 10 }],
+        lineSpacing: { rule: 'auto' as const, value: 1.15, explicit: true },
+        numbering: markerSizePt === null ? null : {
+          ...numbering(),
+          fontFamily: 'Marker Face',
+          fontFacts: { fontSize: markerSizePt, fontFamily: 'Marker Face' },
+        } as unknown as NumberingInfo,
+      };
+      const successor: DocParagraph = {
+        ...first,
+        numbering: null,
+        lineSpacing: null,
+        runs: [{ type: 'text', ...run('Next', 'Text Face', 'Text Face'), fontSize: 10 }],
+      };
+      const base = headingDoc(null);
+      const model = { ...base, settings: { ...base.settings, compatibilityMode }, body: [
+        { type: 'paragraph' as const, ...first },
+        { type: 'paragraph' as const, ...successor },
+      ] } as DocxDocumentModel;
+      const runs: DocxTextRunInfo[] = [];
+      await renderDocumentToCanvas(model, canvas, 0, {
+        dpr: 1, width: 400,
+        onTextRun: (text) => runs.push(text),
+        layoutServices: createLayoutServices(model, { measureContext: canvas.getContext('2d') }),
+      });
+      return runs.find((text) => text.text === 'Next')!.y;
+    };
+    const plain = await renderedSuccessorTop(null);
+    const smallMarker = await renderedSuccessorTop(8);
+    const tallMarker = await renderedSuccessorTop(20);
+    expect(smallMarker).toBeCloseTo(plain);
+    // Windows Word 16.0 (#1884): the 20pt marker raises the line by its 16pt
+    // ascent over the 8pt text ascent; its descent does not join the union.
+    expect(tallMarker - plain).toBeCloseTo(8);
+    // Windows mode-14 controls have the same first-line union as mode 15.
+    expect(await renderedSuccessorTop(20, 14) - await renderedSuccessorTop(null, 14)).toBeCloseTo(8);
+    // Unmeasured older modes retain the previous union, descent included.
+    expect(await renderedSuccessorTop(20, 10) - await renderedSuccessorTop(null, 10)).toBeCloseTo(10);
+  });
   it('routes the CJK title to the eastAsia (MS Gothic / sans) face', async () => {
     const { runs } = await render(numbering());
     const title = runs.find((r) => r.text === '原稿の体裁');

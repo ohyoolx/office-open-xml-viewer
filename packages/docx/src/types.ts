@@ -4,6 +4,7 @@ import type {
   MathNode,
   ChartModel,
   Duotone,
+  BlipEffect,
   FillRect,
   HyperlinkTarget,
   TileInfo,
@@ -13,6 +14,26 @@ import type {
   PullSessionIdentity,
   WorkerErrorPayload,
 } from '@silurus/ooxml-core/worker';
+
+/** A parser/layout limitation or resource acquisition failure. These immutable
+ * values use the same contract in main-thread and worker rendering. */
+export type DocxDiagnosticCode =
+  | 'FLOW_OVERLAP'
+  | 'BOTTOM_MARGIN_INVASION'
+  | 'FLOW_DOMAIN_INVASION'
+  | 'INVALID_REFERENCE'
+  | 'INVALID_GEOMETRY'
+  | 'INVALID_VALUE'
+  | 'MISSING_RESOURCE'
+  | 'NON_CONVERGENCE'
+  | 'UNSUPPORTED_FEATURE';
+
+export interface DocxDiagnostic {
+  readonly code: DocxDiagnosticCode;
+  readonly severity: 'warning' | 'error';
+  readonly source?: Readonly<DocxStorySource>;
+  readonly message: string;
+}
 
 export interface DocxDocumentModel {
   section: SectionProps;
@@ -69,11 +90,13 @@ export interface DocxDocumentModel {
    *  (kinsoku) configuration. Absent when settings.xml has no relevant
    *  elements (the renderer then uses spec defaults: kinsoku ON). */
   settings?: DocSettings;
-  /** RB7 partial degradation: set when `word/document.xml` (the body part) could
-   *  not be read or parsed. The document still "opens" — `body` is empty and this
-   *  part-tagged error (e.g. `"word/document.xml: <detail>"`) is carried — so the
-   *  viewer shows a visible placeholder page instead of throwing. Absent
-   *  (`undefined`) for every healthy document. */
+  /** RB7 partial degradation: set when `word/document.xml` (the body part) is
+   *  present but could not be parsed. The document still "opens" — `body` is
+   *  empty and this part-tagged error (e.g. `"word/document.xml: <detail>"`) is
+   *  carried — so the viewer shows a visible placeholder page instead of
+   *  throwing. Absent (`undefined`) for every healthy document. Input that is not
+   *  a WordprocessingML package (not a ZIP, no `[Content_Types].xml`, or no
+   *  `word/document.xml`) is rejected with `OoxmlError('not-ooxml')` instead. */
   parseError?: string;
 }
 
@@ -87,6 +110,14 @@ export interface EmbeddedFontRef {
 }
 
 export interface DocSettings {
+  /** ECMA-376 Part 4 §14.8.3.20: allow reference-free text following a
+   * continuous section break on a page containing earlier footnotes. */
+  footnoteLayoutLikeWW8?: boolean;
+  /** @internal ECMA-376 Part 4 §14.8.3.38; the parser already applies this
+   *  setting to terminal page breaks, so it is not a renderer model option. */
+  splitPgBreakAndParaMark?: boolean;
+  /** ECMA-376 Part 4 §14.8.3.15 fixed HTML automatic paragraph margins. */
+  doNotUseHtmlParagraphAutoSpacing?: boolean;
   /** §17.15.1.58 `w:kinsoku` — East-Asian line-breaking toggle. `undefined`
    *  means the element is absent; the spec default is ON (treated as `true`). */
   kinsoku?: boolean;
@@ -108,6 +139,11 @@ export interface DocSettings {
   /** §17.15.1.18 `w:characterSpacingControl@w:val` — East Asian punctuation /
    *  character-spacing control. */
   characterSpacingControl?: string;
+  /** §17.15.3.31 `w:compat/w:lineWrapLikeWord6` — fit at uncompressed width
+   * even when character-level whitespace is compressed for display. */
+  lineWrapLikeWord6?: boolean;
+  /** See WORD_KERN_THRESHOLD_AUTHORITY for this compatibility flag. */
+  enableOpenTypeFeatures?: boolean;
   /** ECMA-376 Part 4 §14.8.3.50 `w:compat/w:useFELayout` — Far East layout
    * compatibility. */
   useFeLayout?: boolean;
@@ -117,6 +153,9 @@ export interface DocSettings {
   /** §17.15.3.1 `w:compat/w:adjustLineHeightInTable` — apply the section
    *  document-grid line pitch to text in table cells. */
   adjustLineHeightInTable?: boolean;
+  /** `w:compat/w:compatSetting[@w:name="compatibilityMode"]` (Word URI) — the
+   *  Word version whose layout rules the document uses (for example 14, 15). */
+  compatibilityMode?: number;
 }
 
 export interface DocRevision {
@@ -406,6 +445,8 @@ export type BodyElement =
   | { type: 'table' } & DocTable
   | {
       type: 'pageBreak';
+      /** Parser provenance. Missing on older wire data; absence is not authored intent. */
+      origin?: 'authored' | 'coverPageSynthetic';
       parity?: 'odd' | 'even';
       /** The hard break followed visible content in the same source paragraph. */
       sameParagraphAsPrevious?: boolean;
@@ -484,6 +525,9 @@ export interface DocParagraph {
   indentFirst: number;  // pt
   spaceBefore: number;  // pt
   spaceAfter: number;   // pt
+  /** §17.3.1.33 automatic margin flags resolved through paragraph styles. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   lineSpacing: LineSpacing | null;
   numbering: NumberingInfo | null;
   tabStops: TabStop[];
@@ -525,6 +569,11 @@ export interface DocParagraph {
   /** ECMA-376 §17.3.1.21 `<w:overflowPunct>` — permit one trailing
    *  punctuation character beyond paragraph indents/margins. Omission is true. */
   overflowPunct?: boolean;
+  /** ECMA-376 §17.3.1.2 `<w:autoSpaceDE>` after the style cascade; present
+   *  only when disabled (`false`). Omission means the spec default, on. */
+  autoSpaceDE?: boolean;
+  /** ECMA-376 §17.3.1.3 `<w:autoSpaceDN>`, with the same encoding. */
+  autoSpaceDN?: boolean;
   /** ECMA-376 §17.3.1.1 `<w:adjustRightInd>` — permit automatic right-indent
    *  adjustment when a document grid is active. Absent means true after the
    *  paragraph style hierarchy and specification default are resolved. */
@@ -715,6 +764,9 @@ export interface NumberingInfo {
   picBulletWidthPt?: number;
   /** Picture-bullet marker height in pt (from the `<v:shape style="height">`). */
   picBulletHeightPt?: number;
+  /** Carrier transforms painted within the resolved marker box. They do not
+   *  determine its size or the font governing native AUTO sizing. */
+  picBulletTransform?: Pick<ImageRun, 'srcRect' | 'rotation' | 'flipH' | 'flipV'>;
 }
 
 type DocRunContent =
@@ -829,6 +881,11 @@ export interface ShapeRun {
   /** ECMA-376 §20.4.2.8 — true when the shape is hosted by `<wp:inline>` and
    * therefore advances the paragraph pen like an inline drawing object. */
   inline?: boolean;
+  /** Paint offset (pt) of an inline shape from its pen position — a VML
+   * position:relative shape's left/top (ECMA-376 Part 4 §19.1.2.19). The line
+   * advance is unchanged. */
+  inlineOffsetXPt?: number;
+  inlineOffsetYPt?: number;
   widthPt: number;
   heightPt: number;
   /** X offset in pt */
@@ -872,16 +929,39 @@ export interface ShapeRun {
   behindDoc?: boolean;
   /** ECMA-376 §20.4.2.3 `wp:anchor/@relativeHeight`: lower values render first. */
   zOrder: number;
+  /** ECMA-376 Part 4 §19.1.2.18; VML shadow facts resolved by layout. */
+  vmlShadow?: {
+    kind: 'single' | 'double' | 'emboss' | 'perspective';
+    color: string;
+    color2: string;
+    offset: { xPt: number; yPt: number; xFraction: number; yFraction: number };
+    offset2: { xPt: number; yPt: number; xFraction: number; yFraction: number };
+    opacity: number;
+    obscured: boolean;
+    origin: [number, number];
+    matrix: [number, number, number, number, number, number];
+    absolutePerspective: boolean;
+  };
   /** Normalized [0,1] custom-geometry sub-paths. Empty when `presetGeometry`
-   *  is set; the renderer chooses between buildCustomPath and buildShapePath. */
+   *  is set; the renderer then uses core's preset geometry resolver. */
   subpaths: PathCmd[][];
+  /** ECMA-376 §20.1.9.15 per-path `fill` mode and `stroke` flag, parallel to
+   *  `subpaths`; absent when every path uses the defaults. */
+  subpathPaint?: Array<{
+    fillRule?: 'nonzero' | 'evenodd';
+    fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+    stroke?: false;
+  }>;
   /** OOXML <a:prstGeom prst> name (e.g. "rect", "ellipse", "rtTriangle").
-   *  When set the renderer calls core's buildShapePath with `adjValues`. */
+   *  When set the renderer resolves it through core's ECMA-376 preset engine
+   *  with `adjValues`. */
   presetGeometry?: string | null;
   /** <a:gd name="adj{n}"> values from prstGeom/avLst in adj1..adj8 order.
    *  `null` preserves omitted named guides so the preset engine can use the
    *  geometry's default for that index. */
   adjValues?: Array<number | null>;
+  /** Part 4 §§19.1.2.10/.11: image above the backing fill, below the outline. */
+  vmlPicture?: Pick<ImageRun, 'imagePath' | 'mimeType' | 'srcRect' | 'colorReplaceFrom' | 'duotone'>;
   fill: ShapeFill | null;
   stroke: string | null;
   strokeWidth?: number;
@@ -932,10 +1012,12 @@ export interface ShapeRun {
   textAnchor?: string | null;
   /** ECMA-376 §21.1.2.1.1 auto-fit mode from `<wps:bodyPr>`, normalized to the
    *  shared core `autoFit` vocabulary (core `src/types/common.ts`): "none"
-   *  (`<a:noAutofit/>`, fixed box — overflowing text is CLIPPED to the box),
+   *  (`<a:noAutofit/>`, fixed box; stacked WordArt retains Word's visible overflow),
    *  "sp" (`<a:spAutoFit/>`, box grows to text), or "norm" (`<a:normAutofit/>`,
    *  text shrinks). Absent ⇒ overflow visible. */
   textAutofit?: string | null;
+  /** ECMA-376 §21.1.2.1.1 bodyPr@wrap (square default, none permits overflow). */
+  textWrap?: string | null;
   textInsetL?: number;  // pt
   textInsetT?: number;  // pt
   textInsetR?: number;  // pt
@@ -945,9 +1027,12 @@ export interface ShapeRun {
    *  "vert" (all glyphs 90° CW, chars T→B, lines R→L), "vert270" (all glyphs 270°
    *  CW = 90° CCW, chars B→T, lines L→R), and "eaVert" (East-Asian upright: CJK
    *  stands upright, non-EA rotated 90°, chars T→B, lines R→L). "horz"/absent ⇒
-   *  horizontal (unchanged). Unrecognised values ("mongolianVert", "wordArtVert",
-   *  …) fall back to horizontal until implemented. */
+   *  horizontal (unchanged). WordArt modes use Word's mixed-orientation,
+   *  left-to-right column layout (both wordArtVert and wordArtVertRtl).
+   *  Other unrecognised values fall back to horizontal. */
   textVert?: string | null;
+  /** DrawingML bodyPr@upright: keep text independent of the shape rotation. */
+  textUpright?: boolean | null;
   /** ECMA-376 Part 4 §19.1.2.23 `<v:textpath>` — WordArt text laid on the
    *  shape path (a text watermark). When set the renderer draws this string,
    *  scaled to fill the box (`fitshape`), rotated by {@link ShapeRun.rotation},
@@ -1009,6 +1094,8 @@ export interface ShapeTextRun {
 export interface ShapeText {
   text: string;
   fontSizePt: number;
+  /** Paragraph base/mark size; fontSizePt remains the first-run compatibility field. */
+  defaultFontSize?: number;
   color?: string | null;
   /** Resolved paragraph-mark run color used by compatibility rule
    *  `word-numbering-marker-paragraph-mark-fallback` when the numbering level
@@ -1035,6 +1122,9 @@ export interface ShapeText {
   /** ECMA-376 §17.3.1.33 `<w:spacing w:after>` of this text-box paragraph, in
    *  pt — reserved BELOW the paragraph. Absent/0 ⇒ no offset. */
   spaceAfter?: number;
+  /** §17.3.1.33 automatic margins; the compatibility text-box adapter resolves them. */
+  beforeAutospacing?: boolean;
+  afterAutospacing?: boolean;
   /** ECMA-376 §17.3.1.33 line spacing value (style-chain resolved). Encoded per
    *  {@link lineSpacingRule}: "auto" ⇒ a MULTIPLIER on the natural line box
    *  (1.15 = 276/240), "exact"/"atLeast" ⇒ pt. Absent ⇒ single (natural). */
@@ -1103,6 +1193,13 @@ export type ShapeFill =
   | {
       /** ECMA-376 §20.1.8.14 picture fill on a DrawingML shape. */
       fillType: 'image';
+      /** Part 4 §19.1.2.5 VML brush placement, resolved with lazy image metadata. */
+      vml?: {
+        repeat: boolean;
+        size: [{ value: number; fraction: boolean }, { value: number; fraction: boolean }] | null;
+        origin: [number, number]; position: [number, number];
+        aspect: string; alignShape: boolean;
+      };
       imagePath: string;
       mimeType: string;
       /** Microsoft 2016 SVG original retained beside the raster fallback. */
@@ -1113,6 +1210,9 @@ export type ShapeFill =
       tile?: TileInfo;
       alpha?: number;
       duotone?: Duotone;
+      /** Ordered CT_Blip effects (§20.1.8.13) of a DrawingML blipFill; parsed
+       *  fills carry alphaModFix here rather than in {@link alpha}. */
+      blipEffects?: BlipEffect[];
     };
 
 export type ShapeStrokeFill =
@@ -1161,9 +1261,8 @@ export interface DocxTextRun {
   underline: boolean;
   /** ECMA-376 §17.3.2.40 `<w:u w:val>` — the raw ST_Underline (§17.18.99) style
    *  value (`double` / `thick` / `dotted` / `wave` / `dashLong` / …). Absent for
-   *  the plain single rule (or no underline). The renderer normalizes this
-   *  WordprocessingML vocabulary to the shared DrawingML ST_TextUnderlineType
-   *  (§20.1.10.82) that `core.drawUnderline` dispatches on. */
+   *  the plain single rule (or no underline). Layout resolves this
+   *  WordprocessingML vocabulary into retained decoration geometry. */
   underlineStyle?: string;
   /** ECMA-376 §17.3.2.40 `<w:u w:color>` — underline-only colour (hex 6, or the
    *  literal `auto`). Absent ⇒ the underline follows the glyph colour. */
@@ -1255,7 +1354,8 @@ export interface DocxTextRun {
    *  (`w:val`, 1/20 pt) plus the optional `w:id` that links consecutive runs
    *  into one region. The arbitrary-precision XSD integer id is serialized as a
    *  string; numeric synthetic inputs remain supported for layout tests and
-   *  direct model construction. An id-less run is always standalone. */
+   *  direct model construction. An id-less run has id 0
+   *  (WORD_FIT_TEXT_OMITTED_ID_LINKING). */
   fitTextVal?: number;
   fitTextId?: string | number;
   /** ECMA-376 §17.3.2.43 `<w:w w:val>` — horizontal text scale as a FRACTION of
@@ -1268,9 +1368,11 @@ export interface DocxTextRun {
    *  Absent ⇒ no shift. */
   position?: number;
   /** ECMA-376 §17.3.2.19 `<w:kern w:val>` — font-kerning threshold in POINTS
-   *  (the smallest font size that is kerned). Presence enables kerning subject
-   *  to the threshold; absent ⇒ kerning off (the hierarchy default). `0` = kern
-   *  at all sizes. */
+   *  (the smallest font size that is kerned). A positive resolved threshold
+   *  enables kerning at or above that size; absence disables it. Zero disables
+   *  content-run kerning only in mode 15 (WORD_KERN_THRESHOLD_AUTHORITY);
+   *  unmeasured modes, numbering glyphs and paragraph marks retain the previous
+   *  zero size comparison. */
   kerning?: number;
   /** ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — horizontal-in-vertical
    *  (縦中横 / tate-chū-yoko). `true` means that in a VERTICAL (tbRl) page this
@@ -1304,6 +1406,10 @@ export interface NoteRef {
   /** `@w:id` linking the marker to its note. Empty for the in-note
    *  `<w:footnoteRef/>` placeholder (the renderer uses the enclosing note). */
   id: string;
+  /** CT_FtnEdnRef/@customMarkFollows: suppress the automatic reference mark
+   * and leave this note out of sequential numbering. Following run text owns
+   * the authored mark; the reference still owns its note's placement. */
+  customMarkFollows?: boolean;
 }
 
 export interface RunRevision {
@@ -1396,10 +1502,11 @@ export interface ImageRun {
    * luminance ramp, and caches the recoloured bitmap under a colour-suffixed key.
    */
   duotone?: Duotone;
+  /** Ordered CT_Blip pixel effects, including §20.1.8.42 picture corrections. */
+  blipEffects?: BlipEffect[];
   /**
-   * ECMA-376 §20.1.8.6 `<a:alphaModFix@amt>` opacity as 0..1. Absent ⇒ fully
-   * opaque. When present the renderer multiplies the picture's `globalAlpha` by
-   * this fraction.
+   * Legacy model-source opacity. Parsed alphaModFix is baked once by
+   * blipEffects, so parsed pictures leave this absent.
    */
   alpha?: number;
   /**
@@ -1554,7 +1661,9 @@ export interface DocTableRow {
    *  after this row's last real cell. Omitted/zero means none. */
   gridAfter?: number;
   rowHeight: number | null;  // pt
-  /** ECMA-376 §17.4.80 hRule. "auto" (default) = informational; "atLeast" =
+  /** ECMA-376 §17.4.80 hRule, "auto" when omitted. Without the parser's
+   *  acquisition facts an "auto" row with a height is taken as an omitted
+   *  hRule, a lower bound (word-omitted-row-height-rule-at-least); "atLeast" =
    *  lower bound; "exact" = fixed clip. */
   rowHeightRule: 'auto' | 'atLeast' | 'exact' | string;
   isHeader: boolean;
@@ -1580,6 +1689,9 @@ export interface DocTableCell {
   widthPt: number | null;
   /** `<w:tcW>` type="pct": 50ths of a percent of the final table width. */
   widthPct?: number;
+  /** ECMA-376 §17.4.29 `<w:noWrap>`: in AutoFit, auto/pct cell content
+   *  contributes its unbroken width as the minimum content constraint. */
+  noWrap?: boolean;
   /** Per-cell margins (pt) from `<w:tcPr><w:tcMar>` (ECMA-376 §17.4.42). Each
    *  edge overrides the table-level `cellMargin*` default when set; null/absent
    *  = inherit the table default. */
@@ -1587,6 +1699,12 @@ export interface DocTableCell {
   marginBottom?: number | null;
   marginLeft?: number | null;
   marginRight?: number | null;
+  /** ECMA-376 §17.4.72 `<w:textDirection>` as a transitional §17.18.93 value
+   *  (`tbRl`, `btLr`, `lrTbV`, `tbRlV`, `tbLrV`); absent for the default `lrTb`. */
+  textDirection?: string;
+  /** ECMA-376 §17.4.21 `<w:hideMark>`: the end-of-cell mark does not count
+   *  toward the row height. Absent when false. */
+  hideMark?: boolean;
 }
 
 export interface CellBorders {
@@ -1602,13 +1720,27 @@ export interface CellBorders {
    *  border" (e.g. banded data rows in Medium List 2 / Medium Shading 2). */
   insideH: BorderSpec | null;
   insideV: BorderSpec | null;
+  /** ECMA-376 §17.4.73 tl2br / §17.4.79 tr2bl: diagonal borders drawn from
+   *  the cell's physical top-left to bottom-right corner and from its
+   *  top-right to bottom-left corner. Absent = no diagonal. */
+  tl2br?: BorderSpec;
+  tr2bl?: BorderSpec;
 }
 
 // ===== Worker message protocol =====
 
 export type WorkerRequest =
   | { type: 'init'; wasmUrl: string }
-  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy }
+  | {
+      type: 'parse';
+      id: number;
+      data: ArrayBuffer;
+      resourcePolicy: NormalizedOoxmlResourcePolicy;
+      /** Application-selected model source (LoadOptions.legacyDoc). */
+      source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
+      sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
+    }
   | { type: 'extractImage'; id: number; path: string }
   | { type: 'resourceUsage'; id: number }
   // Project the retained archive to GitHub-flavoured markdown (`DocxArchive.to_markdown`,
@@ -1617,9 +1749,15 @@ export type WorkerRequest =
   | { type: 'toMarkdown'; id: number };
 
 export type WorkerResponse =
-  | ({ type: 'documentSessionOpened'; id: number } & PullSessionIdentity<number>)
+  | ({
+      type: 'documentSessionOpened';
+      id: number;
+      /** The model source's own view preferences, validated in the worker. */
+      viewDefaults?: { showTrackedChanges?: boolean };
+    } & PullSessionIdentity<number>)
   | { type: 'imageExtracted'; id: number; bytes: ArrayBuffer }
-  | { type: 'resourceUsage'; id: number; usage: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
+  // `usage` is absent when the loaded model source has no ZIP accounting.
+  | { type: 'resourceUsage'; id: number; usage?: import('@silurus/ooxml-core').OoxmlResourceUsageSnapshot }
   | { type: 'markdownRendered'; id: number; markdown: string }
   | ({
       type: 'error';
@@ -1653,6 +1791,10 @@ export interface DocxTextRunInfo {
   sourceRunIndex?: number;
   /** Resolved direction of this rendered text segment. */
   direction?: 'ltr' | 'rtl';
+  /** Selected authored discretionary ink keeps its original empty logical
+   * text owner. Its painted '-' is retained by the Canvas layout, not copied
+   * into the selection or the find index. Literal hyphens omit this flag. */
+  optionalHyphenGlyph?: true;
   text: string;
   /** Left edge in canvas CSS px. */
   x: number;
@@ -1660,6 +1802,9 @@ export interface DocxTextRunInfo {
   y: number;
   /** Measured text width in CSS px. */
   w: number;
+  /** Final U+0020 reduction already included in `w`; limits the transparent
+   * selection/hyperlink hit box to the retained Canvas layout width. */
+  trailingSpaceCompressionPx?: number;
   /** Line height in CSS px. */
   h: number;
   /** Exact font-box rectangle used for Word-style highlighting. Falls back to
@@ -1671,7 +1816,7 @@ export interface DocxTextRunInfo {
   fontSize: number;
   /** CSS `font` shorthand used for canvas drawing. */
   font: string;
-  /** Uniform per-code-point pitch in CSS px for horizontal text. */
+  /** Native Canvas tracking pitch in CSS px for horizontal text. */
   letterSpacingPx?: number;
   /** CSS transform used by the overlay for vertical-page text. */
   transform?: string;

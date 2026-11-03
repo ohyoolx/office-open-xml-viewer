@@ -1,3 +1,4 @@
+import type { LayoutDiagnostic } from './layout/types.js';
 import type { DocComment, DocNote, DocRevision, RenderPageOptions, WorkerResponse } from './types';
 import type { CommentAnchorRange } from './comments';
 import type { RevisionAnchorRange } from './revisions';
@@ -17,6 +18,8 @@ import type { DocxElementContext, DocxPagePoint } from './selection-context';
  *  the main-thread proxy needs for its synchronous getters. The full model
  *  stays in the worker. */
 export interface DocumentMeta {
+  diagnostics?: readonly LayoutDiagnostic[];
+  resourceDiagnostics?: readonly LayoutDiagnostic[];
   pageCount: number;
   revisions: DocRevision[];
   comments: DocComment[];
@@ -49,6 +52,7 @@ export interface DocumentMeta {
  * can change. */
 export type DocumentLayoutMeta = Pick<
   DocumentMeta,
+  | 'diagnostics'
   | 'pageCount'
   | 'pageSizes'
   | 'bookmarkPages'
@@ -65,6 +69,7 @@ export type DocumentLayoutMeta = Pick<
  * bookmark, comment and tracked-change capabilities in main and worker modes.
  */
 export interface DocumentLayoutPartial {
+  diagnostics?: readonly LayoutDiagnostic[];
   /** Pages published so far — NOT the document's total. */
   pageCount: number;
   /** Per-page size (pt) for the published pages, index-aligned with `pageCount`. */
@@ -80,13 +85,15 @@ export interface DocumentLayoutPartial {
   /** Whether these pages are known to match the final layout. Always false
    *  today because later convergence can still replace a checkpoint. */
   exact: boolean;
+  /** Leading pages identical to the previous publication's. */
+  unchangedPages?: number;
   /** Model-derived review data, sent with the FIRST publication only.
    *
    *  It comes from the parsed model rather than the layout, so it costs nothing
    *  to produce — but re-cloning it on every publication would be real wire
    *  bandwidth on a heavily reviewed document. The host seeds its metadata from
    *  this and keeps it across later publications. */
-  review?: Pick<DocumentMeta, 'revisions' | 'comments' | 'footnotes' | 'endnotes'>;
+  review?: Pick<DocumentMeta, 'revisions' | 'comments' | 'footnotes' | 'endnotes' | 'resourceDiagnostics'>;
 }
 
 /** Serializable subset of RenderPageOptions (callbacks cannot cross the wire). */
@@ -98,15 +105,44 @@ export type WireRenderPageOptions = Omit<RenderPageOptions, 'onTextRun'>;
 // `init` arm is copied verbatim from `WorkerRequest`.
 export type RenderWorkerRequest =
   | { type: 'init'; wasmUrl: string }
+  | { type: 'hostFontLinesMeasured'; forId: number; measurements: import('./host-font-line-metrics.js').HostFontLineMeasurement[] }
+  | { type: 'nativeRouteLinesMeasured'; forId: number; lines: (import('@silurus/ooxml-core').NativeRouteNormalLine | null)[] }
   // `currentDateMs` / `showTrackedChanges` select the layout VARIANT the worker
   // paginates and reports metadata for. They are acquisition inputs, not paint
   // flags: hiding deletions changes line breaking, and DATE/TIME field text
   // changes measured widths, so each combination is a genuinely different
   // pagination with its own page count. Omitted means the document's default
-  // view, which is what every load selected before these existed.
-  | { type: 'parse'; id: number; data: ArrayBuffer; resourcePolicy: NormalizedOoxmlResourcePolicy; useGoogleFonts?: boolean; cjkFallback?: import('@silurus/ooxml-core').CjkLang; defaultCurrentDateMs: number; currentDateMs?: number; showTrackedChanges?: boolean; renderers?: WorkerRendererDescriptors; progressiveLayout?: boolean }
+  // view. `showTrackedChanges` is tri-state: it is sent only when the caller
+  // chose a view, so the worker can otherwise apply the model source's view
+  // default before its first pagination.
+  | {
+      type: 'parse';
+      id: number;
+      data: ArrayBuffer;
+      resourcePolicy: NormalizedOoxmlResourcePolicy;
+      /** Application-selected model source (LoadOptions.legacyDoc). */
+      source?: import('@silurus/ooxml-core').ModelSourceModuleDescriptor;
+      sourceTransfer?: readonly Transferable[];
+      sourceOwnerUrl?: string;
+      useGoogleFonts?: boolean;
+      allowFootnoteContinuation?: boolean;
+      cjkFallback?: import('@silurus/ooxml-core').CjkLang;
+      defaultCurrentDateMs: number;
+      currentDateMs?: number;
+      showTrackedChanges?: boolean;
+      renderers?: WorkerRendererDescriptors;
+      progressiveLayout?: boolean;
+    }
   | { type: 'selectLayoutView'; id: number; currentDateMs: number; showTrackedChanges: boolean }
-  | { type: 'renderPage'; id: number; pageIndex: number; opts: WireRenderPageOptions }
+  | {
+      type: 'renderPage';
+      id: number;
+      pageIndex: number;
+      opts: WireRenderPageOptions;
+      /** Contextless caller-realm surface, transferred so worker text uses the
+       *  caller's inherited canvas language. Absent: the worker creates one. */
+      canvas?: OffscreenCanvas;
+    }
   // IX6 — collect a page's text-run geometry WITHOUT transferring a bitmap. The
   // find controller scans every page for its runs; a bitmap per page would be
   // wasted work + transfer for pages the user never looks at.
@@ -127,6 +163,8 @@ export type RenderWorkerWireRequest =
   | PullSessionCommand<number>;
 
 export type RenderWorkerResponse =
+  | { type: 'measureHostFontLines'; forId: number; routes: import('@silurus/ooxml-core').OfficeFontFallbackRoute[] }
+  | { type: 'measureNativeRouteLines'; forId: number; requests: import('@silurus/ooxml-core').NativeRouteLineRequest[] }
   | Exclude<WorkerResponse, { type: 'documentSessionOpened' }>
   | PullSessionResponse<ArrayBuffer, number>
   | {
@@ -134,20 +172,31 @@ export type RenderWorkerResponse =
       id: number;
       meta: DocumentMeta;
       usage?: OoxmlResourceUsageSnapshot;
+      /** Leading pages of this authoritative layout identical to the last
+       *  progressive publication's (`DocumentLayoutPartial.unchangedPages`). */
+      unchangedPages?: number;
+      /** The tracked-change view the worker paginated (the effective view). */
+      showTrackedChanges?: boolean;
     }
   | { type: 'layoutViewSelected'; id: number; meta: DocumentLayoutMeta }
   // OffscreenCanvas cannot select/probe the OpenType `vert` feature. A render
   // worker that parses vertical East-Asian content opens a bounded model stream
   // so the proxy can continue through main-thread rendering instead of silently
   // painting horizontal glyph forms or receiving one monolithic JSON value.
+  // The same continuation serves a worker realm that cannot register the
+  // native-route sentinels (native-route-line-metrics.ts).
   | ({
       type: 'mainThreadVerticalFallback';
       id: number;
+      /** Omitted for DOM vertical glyph selection. */
+      reason?: 'nativeRouteSentinels';
       usage?: OoxmlResourceUsageSnapshot;
+      /** The model source's own view preferences, validated in the worker. */
+      viewDefaults?: { showTrackedChanges?: boolean };
     } & PullSessionIdentity<number>)
   // The worker projects structured-clone-safe run geometry from the same
   // retained layout variant it paints and ships it beside the bitmap.
-  | { type: 'pageRendered'; id: number; bitmap: ImageBitmap; runs: DocxTextRunInfo[] }
+  | { type: 'pageRendered'; id: number; bitmap: ImageBitmap; runs: DocxTextRunInfo[]; diagnostics?: readonly LayoutDiagnostic[] }
   | { type: 'runsCollected'; id: number; runs: DocxTextRunInfo[] }
   // Progressive layout in worker mode: the worker publishes its provisional
   // prefixes as they are primed, then answers the original `parse` with the
@@ -157,7 +206,7 @@ export type RenderWorkerResponse =
   // parse early and the authoritative metadata would arrive with nowhere to go.
   // An uncorrelated message is routed to the bridge's `onUnsolicited` hook
   // instead, which is exactly the push channel this needs.
-  | { type: 'layoutPartial'; forId: number; partial: DocumentLayoutPartial }
+  | { type: 'layoutPartial'; forId: number; partial: DocumentLayoutPartial; showTrackedChanges?: boolean }
   // Throttled liveness + progress heartbeat during a progressive parse. Also
   // load-bearing for safety: a document that never publishes a preview (one
   // short enough that previewing is pointless, or whose preview attempt threw)

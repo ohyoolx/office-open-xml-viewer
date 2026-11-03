@@ -31,7 +31,41 @@
 //! `Requires`), and xlsx always took the Choice (never the Fallback), so an
 //! un-understood Choice with a renderable Fallback silently dropped content.
 
+use crate::bounded_xml::{MceScope, MCE_NS};
 use roxmltree::Node;
+use std::collections::HashSet;
+use std::rc::Rc;
+
+/// Derive inherited Ignorable/ProcessContent state for a parsed DOM element.
+/// Resolve names at their declaration site (ECMA-376 Part 3 §§7.2–7.3, 9.2),
+/// so descendant prefix rebinding cannot change an inherited declaration.
+/// This is a scope adapter for DOM projections, not a full MCE validator;
+/// streaming validation and its resource budgets remain in `bounded_xml`.
+pub fn derive_scope(node: Node<'_, '_>, inherited: &Rc<MceScope>) -> Rc<MceScope> {
+    let ignorable: HashSet<String> = node
+        .attribute((MCE_NS, "Ignorable"))
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .filter_map(|prefix| node.lookup_namespace_uri(Some(prefix)))
+        .map(str::to_owned)
+        .collect();
+    let process_content: HashSet<(String, String)> = node
+        .attribute((MCE_NS, "ProcessContent"))
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .filter_map(|name| {
+            let (prefix, local) = name.split_once(':')?;
+            let namespace = node.lookup_namespace_uri(Some(prefix))?;
+            Some((namespace.to_owned(), local.to_owned()))
+        })
+        .collect();
+    let derived_bytes = ignorable.iter().map(String::len).sum::<usize>()
+        + process_content
+            .iter()
+            .map(|(namespace, local)| namespace.len() + local.len())
+            .sum::<usize>();
+    MceScope::derive(inherited, ignorable, process_content, derived_bytes)
+}
 
 /// Namespace support result for one prefix named by `Choice/@Requires`.
 #[doc(hidden)]
@@ -110,10 +144,13 @@ pub fn select_alternate_content<'a, 'i>(
     ac: Node<'a, 'i>,
     understood: &dyn Fn(&str) -> bool,
 ) -> Option<Node<'a, 'i>> {
-    for choice in ac
-        .children()
-        .filter(|n| n.is_element() && n.tag_name().name() == "Choice")
-    {
+    // Part 3 Annex A.1.7 permits ignorable foreign children here. A foreign
+    // `Choice` or `Fallback` cannot pre-empt the actual mc branch.
+    for choice in ac.children().filter(|n| {
+        n.is_element()
+            && n.tag_name().namespace() == Some(MCE_NS)
+            && n.tag_name().name() == "Choice"
+    }) {
         let classification = classify_choice_requires(choice.attribute("Requires"), |prefix| {
             match choice.lookup_namespace_uri(Some(prefix)) {
                 None => RequiredNamespaceSupport::Unresolved,
@@ -127,8 +164,11 @@ pub fn select_alternate_content<'a, 'i>(
         }
     }
     // §9.3: no Choice selected → the Fallback (if any) is selected.
-    ac.children()
-        .find(|n| n.is_element() && n.tag_name().name() == "Fallback")
+    ac.children().find(|n| {
+        n.is_element()
+            && n.tag_name().namespace() == Some(MCE_NS)
+            && n.tag_name().name() == "Fallback"
+    })
 }
 
 #[cfg(test)]
@@ -144,6 +184,26 @@ mod tests {
         let ac = doc.root_element();
         let pred = |ns: &str| understood.contains(&ns);
         select_alternate_content(ac, &pred).and_then(|n| n.attribute("id").map(str::to_string))
+    }
+
+    #[test]
+    fn dom_scope_resolves_inherited_names_before_prefix_rebinding() {
+        let xml = format!(
+            r#"<root xmlns:mc="{MCE_NS}" xmlns:u="urn:original"
+                mc:Ignorable="u" mc:ProcessContent="u:wrap">
+                <child xmlns:u="urn:rebound" xmlns:alias="urn:original"
+                    mc:Ignorable="u" mc:ProcessContent="alias:other"/>
+            </root>"#
+        );
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let root = derive_scope(doc.root_element(), &MceScope::root());
+        let child = derive_scope(doc.root_element().first_element_child().unwrap(), &root);
+        assert!(child.is_ignorable("urn:original"));
+        assert!(child.is_ignorable("urn:rebound"));
+        assert!(child.processes_content("urn:original", "wrap"));
+        assert!(child.processes_content("urn:original", "other"));
+        assert!(!child.processes_content("urn:rebound", "wrap"));
+        assert!(!root.processes_content("urn:original", "other"));
     }
 
     // Fixtures bind prefixes to distinct URIs (mixing the Transitional-style and
@@ -205,6 +265,29 @@ mod tests {
                </mc:AlternateContent>"#
         );
         assert_eq!(select_id(&xml, &["urn:known:one"]).as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn foreign_namesakes_do_not_select_choice_or_fallback() {
+        let choice = format!(
+            r#"<mc:AlternateContent {NS} mc:Ignorable="u1">
+                 <u1:Choice id="foreign" Requires="k1"/>
+                 <mc:Choice id="effective" Requires="k1"/>
+                 <mc:Fallback id="fallback"/>
+               </mc:AlternateContent>"#
+        );
+        assert_eq!(
+            select_id(&choice, &["urn:known:one"]).as_deref(),
+            Some("effective")
+        );
+        let fallback = format!(
+            r#"<mc:AlternateContent {NS} mc:Ignorable="u1">
+                 <mc:Choice id="unsupported" Requires="u1"/>
+                 <u1:Fallback id="foreign"/>
+                 <mc:Fallback id="effective"/>
+               </mc:AlternateContent>"#
+        );
+        assert_eq!(select_id(&fallback, &[]).as_deref(), Some("effective"));
     }
 
     #[test]

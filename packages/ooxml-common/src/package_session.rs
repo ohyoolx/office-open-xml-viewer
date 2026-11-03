@@ -14,7 +14,7 @@ use crc32fast::Hasher;
 use flate2::read::DeflateDecoder;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::rc::Rc;
 use zip::CompressionMethod;
 
@@ -306,6 +306,10 @@ pub(crate) struct PackageSession {
     source: Option<PackageBytes>,
     entries: Vec<EntryMetadata>,
     by_name: HashMap<String, usize>,
+    /// ECMA-376 Part 2 §6.2.2.3 part-name equivalence index
+    /// ([`crate::rels::part_name_equivalence_key`]). ZIP validation rejects
+    /// two items with one key, so each key names exactly one entry.
+    by_key: HashMap<String, usize>,
     governor: ResourceGovernor,
     operations: HashMap<ResourceOperation, OperationRecord>,
     finalized_operations: VecDeque<ResourceOperation>,
@@ -330,16 +334,22 @@ impl PackageSession {
             max_archive_entries,
         );
         let _scope = governor.scope("open");
-        let mut archive = bounded_zip::open_validated_cursor(Cursor::new(source.as_slice()))?;
+        let mut archive = bounded_zip::open_validated_slice(source.as_slice())?;
 
         let mut entries = Vec::with_capacity(archive.len());
         let mut by_name = HashMap::with_capacity(archive.len());
+        let mut by_key = HashMap::with_capacity(archive.len());
         for index in 0..archive.len() {
             let entry = archive
                 .by_index_raw(index)
                 .map_err(|error| format!("ZIP archive entry metadata error: {error}"))?;
-            let data_start = usize::try_from(entry.data_start())
-                .map_err(|_| "ZIP entry data offset exceeds this platform".to_string())?;
+            let data_start = entry
+                .data_start()
+                .ok_or_else(|| "ZIP entry data offset was not resolved".to_string())
+                .and_then(|start| {
+                    usize::try_from(start)
+                        .map_err(|_| "ZIP entry data offset exceeds this platform".to_string())
+                })?;
             let compressed_size = entry.compressed_size();
             let data_end = data_start
                 .checked_add(
@@ -350,8 +360,12 @@ impl PackageSession {
             if data_end > source.as_slice().len() {
                 return Err("ZIP entry data range exceeds package bytes".to_string());
             }
-            let path = entry.name().to_string();
+            let path = entry
+                .name()
+                .map_err(|error| format!("ZIP archive entry name error: {error}"))?
+                .into_owned();
             by_name.insert(path.clone(), index);
+            by_key.insert(crate::rels::part_name_equivalence_key(&path), index);
             entries.push(EntryMetadata {
                 index,
                 path,
@@ -371,6 +385,7 @@ impl PackageSession {
             source: Some(source),
             entries,
             by_name,
+            by_key,
             governor,
             operations: HashMap::new(),
             finalized_operations: VecDeque::new(),
@@ -464,9 +479,7 @@ impl PackageSession {
         self.ensure_healthy()?;
         self.assert_operation_active(operation_id)?;
         let index = self
-            .by_name
-            .get(path)
-            .copied()
+            .entry_index(path)
             .ok_or_else(|| format!("entry not found: {path}"))?;
         self.open_entry_by_index(operation_id, index)
     }
@@ -599,9 +612,34 @@ impl PackageSession {
         self.entries.len()
     }
 
-    /// Whether a validated package contains this exact entry path.
+    /// Index of the entry naming the same part as `path`: the exact ZIP item
+    /// name first, else the unique item equivalent under ECMA-376 Part 2
+    /// §6.2.2.3 (ASCII case folding, with RFC 3986 §6.2.2 percent-encoding
+    /// equivalence). Every by-path read goes through this, in all formats.
+    fn entry_index(&self, path: &str) -> Option<usize> {
+        self.by_name.get(path).copied().or_else(|| {
+            self.by_key
+                .get(&crate::rels::part_name_equivalence_key(path))
+                .copied()
+        })
+    }
+
+    /// Whether a validated package contains a part equivalent to `path`.
     pub(crate) fn contains_entry(&self, path: &str) -> bool {
+        self.entry_index(path).is_some()
+    }
+
+    /// Whether the package contains this exact ZIP item name. Used for
+    /// physical items whose name is fixed octet-for-octet, such as the Media
+    /// Types stream `[Content_Types].xml` (Part 2 §7.3.7), which is not a part.
+    pub(crate) fn contains_exact_entry(&self, path: &str) -> bool {
         self.by_name.contains_key(path)
+    }
+
+    /// Stored ZIP item name of the part equivalent to `path`.
+    pub(crate) fn entry_name(&self, path: &str) -> Option<String> {
+        self.entry_index(path)
+            .map(|index| self.entries[index].path.clone())
     }
 
     /// Clone entry paths in deterministic validated-index order without
@@ -663,6 +701,7 @@ impl PackageSession {
         self.governor.clear_operations();
         self.entries.clear();
         self.by_name.clear();
+        self.by_key.clear();
         self.source = None;
         self.state = SessionState::Closed;
     }
@@ -692,10 +731,59 @@ impl PackageSession {
         limit: u64,
         observed: u64,
     ) -> Result<(), String> {
+        self.observe_limit(operation_id, kind, part, limit, observed, false)
+    }
+
+    fn observe_policy_limit(
+        &mut self,
+        operation_id: ResourceOperation,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        observed: u64,
+    ) -> Result<(), String> {
+        self.observe_limit(operation_id, kind, part, limit, observed, true)
+    }
+
+    /// Single lifecycle path (healthy, active, scoped, poison convergence) for
+    /// both hard and public-policy crossings; only the wire flag differs.
+    fn observe_limit(
+        &mut self,
+        operation_id: ResourceOperation,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        observed: u64,
+        configurable: bool,
+    ) -> Result<(), String> {
         self.ensure_healthy()?;
         self.assert_operation_active(operation_id)?;
         let scope = self.governor.scope_operation(operation_id)?;
-        let result = resource::observe_hard_limit(kind, part, limit, observed);
+        let result = if configurable {
+            resource::observe_policy_limit(kind, part, limit, observed)
+        } else {
+            resource::observe_hard_limit(kind, part, limit, observed)
+        };
+        drop(scope);
+        if result.is_err() {
+            self.converge_poison();
+        }
+        result
+    }
+
+    fn retain_instance(
+        &mut self,
+        operation_id: ResourceOperation,
+        kind: HardResourceLimitKind,
+        source_part: &str,
+        site: &str,
+        limit: u64,
+        bytes: u64,
+    ) -> Result<(), String> {
+        self.ensure_healthy()?;
+        self.assert_operation_active(operation_id)?;
+        let scope = self.governor.scope_operation(operation_id)?;
+        let result = resource::retain_instance(kind, source_part, site, limit, bytes);
         drop(scope);
         if result.is_err() {
             self.converge_poison();
@@ -774,6 +862,7 @@ impl PackageSessionHandle {
         run: impl FnOnce(&PackageOperation) -> Result<T, String>,
     ) -> Result<T, String> {
         let mut operation = self.begin_operation(name)?;
+        let _resource_scope = operation.resource_scope()?;
         let result = run(&operation);
         if let Err(resource_error) = self.assert_healthy() {
             let _ = operation.cancel();
@@ -808,8 +897,20 @@ impl PackageSessionHandle {
         self.inner.borrow().entry_count()
     }
 
+    /// Whether the package contains a part equivalent to `path` (ECMA-376
+    /// Part 2 §6.2.2.3).
     pub fn contains_entry(&self, path: &str) -> bool {
         self.inner.borrow().contains_entry(path)
+    }
+
+    /// Whether the package contains this exact ZIP item name.
+    pub fn contains_exact_entry(&self, path: &str) -> bool {
+        self.inner.borrow().contains_exact_entry(path)
+    }
+
+    /// Stored ZIP item name of the part equivalent to `path`, if present.
+    pub fn entry_name(&self, path: &str) -> Option<String> {
+        self.inner.borrow().entry_name(path)
     }
 
     pub fn entry_paths(&self) -> Vec<String> {
@@ -841,6 +942,15 @@ pub struct PackageOperation {
 }
 
 impl PackageOperation {
+    /// Route shared infallible XML/model walkers to this operation's governor.
+    /// Their bounded projections are provisional: check package health before
+    /// publishing output, including at each cursor pull. Keep this lexical
+    /// scope within one synchronous call, never across a yield.
+    pub fn resource_scope(&self) -> Result<resource::ResourceScope, String> {
+        self.assert_active()?;
+        self.handle.inner.borrow().governor.scope_operation(self.id)
+    }
+
     /// Derive format-model limit reporting from this logical operation. This is
     /// used by materializing compatibility paths that do not have an entry
     /// stream in hand when their retained-model or serialization ceiling is
@@ -936,9 +1046,7 @@ impl PackageOperation {
         let declared_size = {
             let session = self.handle.inner.borrow();
             let index = session
-                .by_name
-                .get(path)
-                .copied()
+                .entry_index(path)
                 .ok_or_else(|| format!("ZIP entry not found: {path}"))?;
             session.entries[index].declared_size
         };
@@ -1165,6 +1273,43 @@ impl PackageLimitReporter {
             observed,
         )
     }
+
+    /// Report a crossing of a finite public (configurable) policy limit with
+    /// the same operation lifecycle as `observe_hard_limit`.
+    pub fn observe_policy_limit(
+        &self,
+        kind: HardResourceLimitKind,
+        part: Option<&str>,
+        limit: u64,
+        observed: u64,
+    ) -> Result<(), String> {
+        self.handle.inner.borrow_mut().observe_policy_limit(
+            self.operation_id,
+            kind,
+            part,
+            limit,
+            observed,
+        )
+    }
+
+    /// Retain one model instance, keyed by its source part and ownership site.
+    pub fn retain_instance(
+        &self,
+        kind: HardResourceLimitKind,
+        source_part: &str,
+        site: &str,
+        limit: u64,
+        bytes: u64,
+    ) -> Result<(), String> {
+        self.handle.inner.borrow_mut().retain_instance(
+            self.operation_id,
+            kind,
+            source_part,
+            site,
+            limit,
+            bytes,
+        )
+    }
 }
 
 /// Owned, resumable archive-entry reader suitable for `quick_xml::Reader`.
@@ -1250,7 +1395,7 @@ impl Drop for PackageEntryStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
 
     fn package(entries: &[(&str, &[u8], CompressionMethod)]) -> Vec<u8> {
@@ -1582,7 +1727,7 @@ mod tests {
             ("word/good.bin", b"good", CompressionMethod::Stored),
         ]);
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
-        let bad_start = archive.by_index_raw(0).unwrap().data_start() as usize;
+        let bad_start = archive.by_index_raw(0).unwrap().data_start().unwrap() as usize;
         drop(archive);
         bytes[bad_start] ^= 0xff;
 
@@ -1665,6 +1810,37 @@ mod tests {
     }
 
     #[test]
+    fn by_path_reads_use_part_name_equivalence() {
+        let bytes = package(&[
+            ("xl/Media/Image1.PNG", b"image", CompressionMethod::Stored),
+            ("[Content_Types].xml", b"types", CompressionMethod::Stored),
+        ]);
+        let handle =
+            PackageSessionHandle::open(bytes, OoxmlFormat::Xlsx, Some(64), Some(64), None).unwrap();
+        // ASCII case folding and percent-encoded unreserved characters
+        // (ECMA-376 Part 2 §6.2.2.3, RFC 3986 §6.2.2) name the same part.
+        for spelling in ["xl/media/image1.png", "XL/%4d%65dia/%49mage1.png"] {
+            assert!(handle.contains_entry(spelling), "{spelling}");
+            assert_eq!(
+                handle.entry_name(spelling).as_deref(),
+                Some("xl/Media/Image1.PNG")
+            );
+            let mut operation = handle.begin_operation("read").unwrap();
+            assert_eq!(operation.read_bytes(spelling).unwrap(), b"image");
+            assert_eq!(
+                operation.read_bytes_bounded(spelling, 16).unwrap(),
+                b"image"
+            );
+            operation.finish().unwrap();
+        }
+        // Reserved-character encodings are distinct octets.
+        assert!(!handle.contains_entry("xl/media%2Fimage1.png"));
+        // The Media Types stream is a ZIP item with a fixed name, not a part.
+        assert!(handle.contains_exact_entry("[Content_Types].xml"));
+        assert!(!handle.contains_exact_entry("[content_types].xml"));
+    }
+
+    #[test]
     fn package_metadata_preserves_validated_index_order() {
         let bytes = package(&[
             ("xl/a.xml", b"first", CompressionMethod::Stored),
@@ -1725,7 +1901,7 @@ mod tests {
             PackageSession::open(case_collision, OoxmlFormat::Xlsx, Some(64), Some(64), None)
                 .err()
                 .unwrap();
-        assert!(case_error.contains("unique ignoring ASCII case"));
+        assert!(case_error.contains("unique under part-name equivalence"));
         assert!(!case_error.starts_with("OOXML_RESOURCE_LIMIT:"));
     }
 

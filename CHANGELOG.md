@@ -5,7 +5,189 @@ semantic versioning. While the major version is zero, minor releases may contain
 explicitly documented breaking changes; patch releases remain compatible with
 the corresponding minor release.
 
-## Unreleased
+## 0.89.7-jiyu.1 — 2026-11-03
+
+Integrate upstream v0.89.7 into the private distribution. Preserve the fork's
+same-side combo-axis resolution, chart-group number formats, outside pie-label
+fit, readable radar/scatter ticks, and automatic category-label rotation in the
+upstream chart modules. Use upstream's expanded clock-format and one-cell image
+implementations in place of the older fork patches. Existing import aliases
+remain supported.
+
+## 0.89.7 — 2026-10-29
+
+Compatible patch release. No migration is required.
+
+- **Word documents with strongly condensed character spacing:** documents whose
+  condensed character spacing is wider than a character no longer fail to load
+  with "segment.measuredWidthPt must be finite and non-negative". As in Word,
+  each character advances by at least zero, so over-condensed characters stack
+  instead of moving text backwards (#1975). Over-condensed cursive scripts such
+  as Arabic keep their joined shapes and still paint at their natural advances
+  (#1981).
+- **Office files written with ZIP64 local headers:** packages whose local file
+  headers declare version 4.5 with a reserved ZIP64 field, while the central
+  directory is classic, open again instead of being refused as not Office Open
+  XML (#1976).
+- **Excel frozen panes:** text overflowing from a frozen column now continues
+  across the freeze line instead of being clipped there, in main-thread and
+  worker mode (#1973).
+- **Excel charts:** workbooks with many charts that use source-linked number
+  formats load faster; each chart source worksheet is now read once instead of
+  once per axis or series (#1971).
+- **Legacy Word 97-2003 documents (experimental):** documents from third-party
+  producers that use the invariant default language, omit the Table Normal
+  style, or mark unshaded table cells with automatic colors now open instead of
+  being rejected. Thanks to Vadim Kosin for the contributions (#1963, #1970).
+
+## 0.89.6 — 2026-10-27
+
+Compatible patch release. No migration is required.
+
+- **Excel sheet tab colors:** sheet tab colors and other workbook colors are
+  resolved to validated `#RRGGBB` values before they are used for styling;
+  other color text is ignored instead of being passed through to CSS (#1957).
+- **Excel merged cells:** workbooks with repeated or overlapping `mergeCell`
+  entries no longer freeze the page; merge handling now scales with the
+  distinct cells covered (#1958).
+- **Word VML pictures with tight or through wrapping:** floating VML pictures
+  with `<w10:wrap type="tight"/>` or `"through"` are painted again, and text
+  wraps around their `wrapcoords` polygon. Wrap polygon parsing (VML
+  `wrapcoords` and DrawingML `wp:wrapPolygon`) is bounded to the vertex limit
+  regardless of input size (#1959).
+
+## 0.89.5 — 2026-10-26
+
+Compatible patch release. No migration is required.
+
+- **Word progressive layout:** documents whose sections have page borders and
+  a page- or margin-relative floating picture with text wrapping load again
+  with `progressiveLayout: true` instead of failing with "Page-border
+  finalization requires explicit section-owned page identity" (#1949).
+- **Word SVG pictures in worker mode:** an SVG picture whose aspect ratio
+  differs from its frame no longer fails `load()` with
+  `ooxml-decoded-image-limit` in `mode: 'worker'`; worker and main-thread modes
+  now apply the same image budget, which still rejects genuinely oversized
+  images (#1950).
+
+## 0.89.4 — 2026-10-25
+
+Compatible patch release. No migration is required.
+
+- **XLSX worker scrolling:** in `mode: 'worker'`, `XlsxViewer` and
+  `XlsxSheetViewer` keep repainting during continuous scrolling instead of
+  freezing until scrolling stops (#1938).
+- **XLSX selection and overlays:** drag-selection keeps extending while the
+  viewer auto-scrolls in worker mode, and `onViewportChange` fires once when a
+  delayed worker frame moves the displayed cell geometry, so overlays placed
+  from `getCellViewportRect` follow it.
+
+## 0.89.3 — 2026-10-24
+
+Compatible patch release. No migration is required.
+
+- **Word pagination:** multi-column documents place footnotes, document-end
+  endnotes and their separators more faithfully. Paragraph endnotes continue
+  across pages, and list markers no longer add excess line height in affected
+  compatibility modes (#1921, #1932, #1933, #1935).
+- **Word frames and wrapping:** paragraph text frames retain inherited spacing
+  and placement, and zero-size drawing anchors preserve authored text wrapping
+  (#1921, #1931).
+- **Smaller downloads:** shrink parser downloads for DOCX, XLSX and PPTX and
+  reduce JavaScript build overhead, while preserving public APIs and loading
+  behavior (#1914, #1936).
+
+## 0.89.2 — 2026-10-21
+
+Compatible patch release. No migration is required.
+
+- **Office file compatibility:** more converter-generated DOCX, XLSX and PPTX
+  files now open successfully. ZIP integrity checks and resource limits remain
+  enforced (#1924, #1927).
+- **XLSX loading:** destroying a viewer while its first worksheet preview is
+  loading no longer causes an unhandled promise rejection (#1923, #1925).
+- **Chart data tables:** date-axis charts retain their date labels and place
+  data tables separately below the plot, including charts with secondary value
+  axes (#1926).
+
+## 0.89.1 — 2026-10-20
+
+Compatible patch release.
+
+- **XLSX viewer limits:** `XlsxViewer` and `XlsxSheetViewer` now forward
+  `xlsxWorksheetLimits` (and every other load option) when they load a file
+  themselves, so a configured worksheet limit applies as it does with
+  `XlsxWorkbook.load` (#1917).
+- **XLSX viewer chrome:** the sheet-list popover opens at the same place from
+  either sheet-tab scroll button (mirrored in right-to-left sheets), and
+  whole-row/column selection borders beside the headers sit on the grid line
+  like ordinary cell selections.
+- **WMF text:** metafile text records (for example MathType equations) render
+  with MS-WMF text semantics: alignment, spacing, background, clipping,
+  escapement, character-set decoding and Symbol fonts, including joined
+  Arabic text and right-to-left ordering.
+- **Experimental legacy DOC:** documents with custom footnote reference marks,
+  empty-paragraph note separators and per-cell table border colours now open.
+
+## 0.89.0 — 2026-10-19
+
+Compatible minor release laying out documents from the host's installed fonts
+and Windows Office rules, rendering full picture effects, speeding up first
+display, hardening parsing, and adding optional experimental legacy Office
+reading.
+
+- **Word layout from the host font:** lines are sized from the installed face
+  that paints each run (including absent authored faces and empty paragraph
+  marks), and DOCX/XLSX layout no longer depends on the viewer OS; where Word
+  for Windows and Mac differ on identical font data, Windows is followed.
+- **Windows Word rules:** single-sample constants were replaced with rules
+  measured against Windows Word: East Asian/Latin automatic spacing, justified
+  compression and kerning, line-grid snapping, blank-header reserve, page-top
+  spacing, footnote stacking, collapsed table rules, and page-anchored floating
+  tables that flow by their anchor. Picture bullets, picture brightness and
+  contrast, grouped VML, inline groups, rotated text boxes, numbering levels,
+  and text boxes in headers, footers and notes (including PAGE fields) now
+  render as authored.
+- **picture effects and fills:** the full DrawingML picture-effect chain renders
+  in DOCX, XLSX and PPTX, together with path gradients, preset patterns, WMF
+  clipping, Office-sized line ends and LZW-compressed TIFF strips (optional
+  codec). Tiled chart picture fills with huge offsets no longer hang.
+- **PowerPoint text:** faces, sizes and paragraph spacing follow the list-style
+  chain, built-in text styles, font alignment, compatible line spacing,
+  per-language theme fonts and stacked vertical WordArt; table styles, theme
+  overrides and equation fallbacks match PowerPoint more closely, and
+  zero-height text-less shapes render as rules.
+- **Excel sheets:** column widths derive from the first font; table and
+  PivotTable style font colours, time-only and fractional-second formats,
+  one-cell-anchored pictures and cached `TODAY()`/`NOW()` values display as
+  Excel saved them. The viewer adds a sheet list popover, whole-row/column
+  selection outlines and multi-band resizing; `XlsxSheetViewer` gains
+  `minRows`, `minCols`, `marginRows` and `marginCols`, and `xlsxWorksheetLimits`
+  adjusts worksheet budgets per load.
+- **charts:** box-and-whisker, histogram and Pareto ChartEx charts follow Office
+  aggregation, binning and paint order; date and time axis labels use the
+  worksheet formatter; chart category, value, legend, data-table, title and
+  text-box labels now keep authored line breaks.
+- **faster first display:** XLSX paints the first viewport before the worksheet
+  pull completes, PPTX regains its pre-v0.88.0 first-display speed, DOCX
+  main-mode layout is sliced to keep the UI responsive with lower retained
+  heap, and CJK line breaking is linear.
+- **hardening:** parser amplification and input-sized allocations are bounded,
+  parser and image budgets fail closed with messages naming the resource and
+  stage, Markdown output escapes document text, the MCP server and VS Code
+  webview confine file access, and the Rust zip dependency was upgraded for
+  published advisories.
+- **experimental legacy Office add-on:** the new `@silurus/ooxml-legacy-office`
+  package reads a supported subset of `.doc`, `.xls` and `.ppt` directly into
+  the existing viewers. Import `legacyDoc` from
+  `@silurus/ooxml-legacy-office/doc` and pass `{ legacyDoc }` (likewise
+  `legacyXls`, `legacyPpt`; `createLegacyDoc(...)` etc. for custom asset URLs).
+  Its version must match `@silurus/ooxml` exactly; unsupported input rejects.
+- **compatibility:** no option or method is removed or renamed, and no migration
+  is required. Applications that branch on `OoxmlError.code` should handle the
+  new codes `not-ooxml`, `unsupported-image-effect`, `invalid-numbering` and
+  `unsupported-content`. Rendering changes are intentional for affected
+  documents.
 
 ## 0.88.0 — 2026-09-21
 

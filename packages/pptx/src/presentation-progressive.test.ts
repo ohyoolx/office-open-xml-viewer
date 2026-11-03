@@ -159,9 +159,15 @@ describe('PptxPresentation progressive layout lifecycle', () => {
       fontPreloadNames: [],
     });
     await parsing;
-    await presentation.renderSlideToBitmap(0, {
-      imageResources: { decodedByteBudget: 64 * 1024 * 1024, strategy: 'strict' },
-    });
+    // Worker mode requires OffscreenCanvas; the caller creates the render surface.
+    vi.stubGlobal('OffscreenCanvas', class { constructor(readonly width: number, readonly height: number) {} });
+    try {
+      await presentation.renderSlideToBitmap(0, {
+        imageResources: { decodedByteBudget: 64 * 1024 * 1024, strategy: 'strict' },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
     expect(renderRequest?.imageResources).toEqual({
       decodedByteBudget: 64 * 1024 * 1024,
       strategy: 'strict',
@@ -192,6 +198,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
 
   it('publishes the opening slide while keeping the final slide count stable', async () => {
     const releaseSecondSlide = deferred<void>();
+    const secondSlidePullStart = deferred<void>();
     let secondSlidePullStarted = false;
     const slideIndexBySession = new Map<number, number>();
     let pullRequestId = 1;
@@ -203,6 +210,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
           if (index === undefined) throw new Error('missing slide session');
           if (index === 1) {
             secondSlidePullStarted = true;
+            secondSlidePullStart.resolve();
             await releaseSecondSlide.promise;
           }
           const payload = new TextEncoder().encode(JSON.stringify(slide(index))).buffer;
@@ -320,8 +328,7 @@ describe('PptxPresentation progressive layout lifecycle', () => {
     // The opening publication releases the load continuation before the next
     // host task starts slide 2 preflight. A Viewer can therefore enqueue the
     // opening paint/resource work in this gap, matching worker-mode ACK gating.
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    expect(secondSlidePullStarted).toBe(true);
+    await secondSlidePullStart.promise;
 
     let completed = false;
     const completion = presentation.waitUntilLayoutComplete().then(() => {

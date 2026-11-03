@@ -15,6 +15,7 @@ import type {
   TableLayout,
   TextBoxLayout,
 } from './types.js';
+import { noteOwnedBlocks } from './reserved-note-separators.js';
 
 export const PAGE_LAYER_IDS = [
   'background',
@@ -104,15 +105,17 @@ function visitAnchoredDrawings(
     const noteFrames = node.story.clipBounds
       ? Object.freeze([...frames, clipFrame(node.story.clipBounds)])
       : frames;
-    for (const block of node.story.blocks) {
-      visitAnchoredDrawings(
-        block,
-        root,
-        noteFrames,
-        layoutTranslationPt,
-        candidates,
-      );
-    }
+    // Separator/notice occurrences paint outside the story clip.
+    const visit = (block: PaintNode, blockFrames: typeof frames) => visitAnchoredDrawings(
+      block,
+      root,
+      blockFrames,
+      layoutTranslationPt,
+      candidates,
+    );
+    if (node.leading?.paragraph) visit(node.leading.paragraph, frames);
+    for (const block of node.story.blocks) visit(block, noteFrames);
+    if (node.trailing?.paragraph) visit(node.trailing.paragraph, frames);
     return;
   }
   if (node.kind === 'paragraph') {
@@ -196,12 +199,30 @@ function visitTableAnchoredDrawings(
     : frames;
   for (const row of table.rows) {
     for (const cell of row.cells) {
-      const ownsContinuationPaint = 'visualMergeOwnership' in cell
-        && cell.visualMergeOwnership === 'continuation';
+      const ownsContinuationPaint = cell.visualMergeOwnership === 'continuation';
       if (cell.verticalMerge === 'continue' && !ownsContinuationPaint) continue;
       const cellFrames = cell.clipBounds
         ? Object.freeze([...tableFrames, clipFrame(cell.clipBounds)])
         : tableFrames;
+      if (cell.verticalText) {
+        // ECMA-376 §17.4.72: anchored content inside a rotated cell follows
+        // the cell's local-to-table rotation.
+        const rotatedFrames = Object.freeze([
+          ...cellFrames,
+          Object.freeze({ kind: 'transform' as const, transform: cell.verticalText.transform }),
+        ]);
+        for (const block of cell.blocks) {
+          visitPlacedTableChild(
+            block.layout,
+            { xPt: cell.contentBounds.xPt, yPt: block.offsetPt },
+            root,
+            rotatedFrames,
+            layoutTranslationPt,
+            candidates,
+          );
+        }
+        continue;
+      }
       for (const block of cell.blocks) {
         visitPlacedTableChild(
           block.layout,
@@ -311,7 +332,7 @@ function retainedNodeRequiresElementBackedVerticalGlyphPaint(
     ));
   }
   if (node.kind === 'textbox' || node.kind === 'note') {
-    return node.story.blocks.some((block) => (
+    return (node.kind === 'note' ? noteOwnedBlocks(node) : node.story.blocks).some((block) => (
       retainedNodeRequiresElementBackedVerticalGlyphPaint(block, seen)
     ));
   }
@@ -331,6 +352,7 @@ function collectRetainedNodeResourceKeys(
   seen.add(node);
   if (node.kind === 'drawing') {
     for (const command of node.commands) {
+      if (command.kind === 'watermark-text' && command.imageResourceKey) keys.add(command.imageResourceKey);
       if (command.kind === 'resource' || command.kind === 'drawingml-image-fill') {
         keys.add(command.resourceKey);
       }
@@ -344,7 +366,8 @@ function collectRetainedNodeResourceKeys(
     return;
   }
   if (node.kind === 'textbox' || node.kind === 'note') {
-    for (const block of node.story.blocks) collectRetainedNodeResourceKeys(block, keys, seen);
+    const blocks = node.kind === 'note' ? noteOwnedBlocks(node) : node.story.blocks;
+    for (const block of blocks) collectRetainedNodeResourceKeys(block, keys, seen);
     return;
   }
   for (const row of node.rows) {

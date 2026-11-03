@@ -8,11 +8,15 @@ import {
   getCachedBitmapByPath,
   chartImageFillKey,
   OoxmlDecodedImageLimitError,
+  OoxmlResourceLimitError,
   TiffDecodeError,
   type OffscreenFactory,
   type TiffRenderOptions,
 } from '@silurus/ooxml-core';
 import { isOptionalImageUnavailable } from './internal/optional-image-fallback.js';
+import { captureInitialAnchorSizes, bindInitialAnchorSizes } from './internal/initial-anchor-sizes.js';
+import { getGridGeometryForWorksheet } from './renderer.js';
+import { GridGeometry } from './internal/grid-geometry.js';
 
 /**
  * The render orchestrator decodes embedded images lazily by zip path:
@@ -180,6 +184,20 @@ function worksheetWithImages(): Worksheet {
 describe('render-orchestrator image decode (lazy bytes)', () => {
   afterEach(() => vi.unstubAllGlobals());
 
+  it('does not fetch a tagged oneCell picture whose anchor-level extent is missing', async () => {
+    const ws = worksheetWithImages();
+    ws.images = [];
+    const group = ws.shapeGroups![0]!;
+    group.anchorTag = 'oneCellAnchor';
+    group.editAs = 'oneCell';
+    // A stale child transform cannot make a missing anchor-level size renderable.
+    group.nativeExtCx = 914400;
+    group.nativeExtCy = 914400;
+    const fetchImage = vi.fn();
+    await prefetchImages(ws, new Map(), fetchImage);
+    expect(fetchImage).not.toHaveBeenCalled();
+  });
+
   it('prefetchImages collects BOTH ws.images and group-leaf images, keyed by imagePath, decoded once each', async () => {
     vi.stubGlobal('createImageBitmap', vi.fn(async (blob: Blob) => new FakeBitmap(blob.type)));
     const fetchImage = vi.fn(async (path: string, mime: string) =>
@@ -343,12 +361,15 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
   });
 
   it('retains the authored display target for worker-decoded SVG images', async () => {
+    // Targets are coverage minimums (#1950): an SVG taller than its anchor box
+    // keeps its own aspect, so the retained grid exceeds the box on one axis
+    // and must still be admitted.
     const svgDecoder = vi.fn(async (_blob: Blob, target?: {
       targetWidthPx?: number;
       targetHeightPx?: number;
     }) => ({
       width: target?.targetWidthPx ?? 1,
-      height: target?.targetHeightPx ?? 1,
+      height: (target?.targetHeightPx ?? 1) * 2,
       close() {},
     }) as unknown as ImageBitmap);
     const fetchImage = vi.fn(async () => new Blob([
@@ -362,11 +383,14 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
       mimeType: 'image/svg+xml',
     };
 
-    await prefetchImages(ws, new Map(), fetchImage, {
+    const images = new Map<string, CanvasImageSource | null>();
+    await prefetchImages(ws, images, fetchImage, {
       effectiveDpr: 2,
       svgDecoder,
     });
 
+    expect([...images.values()]).toHaveLength(1);
+    expect([...images.values()][0]).toBeTruthy();
     expect(svgDecoder).toHaveBeenCalledWith(expect.any(Blob), {
       targetWidthPx: expect.any(Number),
       targetHeightPx: expect.any(Number),
@@ -548,7 +572,7 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
     },
   );
 
-  it('excludes a chart whose finite frame overflows one usage before no-viewport aggregate gating', async () => {
+  it('propagates an overflowing chart usage before no-viewport aggregate decoding', async () => {
     const png = new Uint8Array(24);
     png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     png.set([0x49, 0x48, 0x44, 0x52], 12);
@@ -563,7 +587,7 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
       imagePath: 'xl/media/visible-overflow-gate.png',
       mimeType: 'image/png',
     };
-    const sourceCount = 257;
+    const sourceCount = 256;
     const overflowChart = {
       chartType: 'line',
       categories: Array.from({ length: sourceCount }, (_, index) => String(index)),
@@ -608,17 +632,11 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
       new Blob([png as BlobPart], { type: mime }));
     const cache = new Map<string, CanvasImageSource | null>();
 
-    await prefetchImages(ws, cache, fetchImage, { effectiveDpr: 1 });
-
-    expect(fetchImage).toHaveBeenCalledOnce();
-    expect(fetchImage).toHaveBeenCalledWith('xl/media/visible-overflow-gate.png', 'image/png');
-    expect(decode).toHaveBeenCalledOnce();
-    expect(decode.mock.calls[0]?.[1]).toMatchObject({
-      resizeWidth: 4_096,
-      resizeQuality: 'high',
-    });
-    expect(cache.size).toBe(1);
-    expect(cache.has(chartImageFillKey(visibleFill))).toBe(true);
+    await expect(prefetchImages(ws, cache, fetchImage, { effectiveDpr: 1 }))
+      .rejects.toMatchObject({ code: 'unsupported-image-effect' });
+    expect(fetchImage).not.toHaveBeenCalled();
+    expect(decode).not.toHaveBeenCalled();
+    expect(cache.size).toBe(0);
   });
 
   it.each([false, true])(
@@ -690,6 +708,42 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
     expect(fetchImage).toHaveBeenCalledTimes(1);
   });
 
+  it('prefetchImages acquires an off-viewport picture whose CT_Blip outset may reach it', async () => {
+    vi.stubGlobal('createImageBitmap', vi.fn(async (blob: Blob) => new FakeBitmap(blob.type)));
+    const fetchImage = vi.fn(async (path: string, mime: string) =>
+      new Blob([new TextEncoder().encode(path)], { type: mime }));
+    const ws = worksheetWithImages();
+    const group = ws.shapeGroups![0]!;
+    group.nativeExtCx = group.nativeExtCy = 914400;
+    const leaf = group.shapes[0]!.geom;
+    if (leaf.type !== 'image') throw new Error('fixture leaf must be a picture');
+    const acquired = async (viewport: { row: number; col: number; rows: number; cols: number }) => {
+      fetchImage.mockClear();
+      leaf.blipEffects = [{ type: 'blur', radius: 12700, grow: true }, { type: 'alphaInv' }];
+      await prefetchImages(ws, new Map(), fetchImage, { viewport }).catch(() => undefined);
+      return fetchImage.mock.calls.map(([path]) => path).includes('xl/media/image2.png');
+    };
+    // A grown grid rounds to whole source pixels and alphaInv can make that
+    // margin opaque, so a nearby viewport acquires the off-viewport picture;
+    // a distant viewport still culls it.
+    expect(await acquired({ row: 1, col: 1, rows: 2, cols: 2 })).toBe(true);
+    expect(await acquired({ row: 2000, col: 2000, rows: 2, cols: 2 })).toBe(false);
+  });
+
+  it('prefetchImages keeps culling an off-viewport picture whose chain is pointwise', async () => {
+    vi.stubGlobal('createImageBitmap', vi.fn(async (blob: Blob) => new FakeBitmap(blob.type)));
+    const fetchImage = vi.fn(async (path: string, mime: string) =>
+      new Blob([new TextEncoder().encode(path)], { type: mime }));
+    const ws = worksheetWithImages();
+    const leaf = ws.shapeGroups![0]!.shapes[0]!.geom;
+    if (leaf.type !== 'image') throw new Error('fixture leaf must be a picture');
+    leaf.blipEffects = [{ type: 'grayscale' }, { type: 'alphaModFix', amt: 0.5 }];
+    await prefetchImages(ws, new Map(), fetchImage, {
+      viewport: { row: 1, col: 1, rows: 2, cols: 2 },
+    }).catch(() => undefined);
+    expect(fetchImage.mock.calls.map(([path]) => path)).not.toContain('xl/media/image2.png');
+  });
+
   it('prefetchImages retains an off-cell anchor whose signed offset reaches the viewport', async () => {
     vi.stubGlobal('createImageBitmap', vi.fn(async (blob: Blob) => new FakeBitmap(blob.type)));
     const fetchImage = vi.fn(async (path: string, mime: string) =>
@@ -730,6 +784,28 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
 
     expect(fetchImage).not.toHaveBeenCalled();
     expect(cache.size).toBe(0);
+  });
+
+  it('fetches a rotated picture whose painted corner reaches the viewport', async () => {
+    vi.stubGlobal('createImageBitmap', vi.fn(async (blob: Blob) => new FakeBitmap(blob.type)));
+    const fetchImage = vi.fn(async (path: string, mime: string) =>
+      new Blob([new TextEncoder().encode(path)], { type: mime }));
+    const cache = new Map<string, CanvasImageSource | null>();
+    const ws = worksheetWithImages();
+    ws.shapeGroups = [];
+    const image = ws.images[0];
+    image.toCol = 2;
+    image.toRow = 1;
+    image.rotation = 90;
+
+    // The unrotated 128×20 box ends at row 2. Rotating about its centre makes
+    // its 128px vertical bound reach rows 3–4, so resource culling must retain it.
+    await prefetchImages(ws, cache, fetchImage, {
+      viewport: { row: 3, col: 1, rows: 2, cols: 2 },
+    });
+
+    expect(fetchImage).toHaveBeenCalledOnce();
+    expect(cache.has('xl/media/image1.png')).toBe(true);
   });
 
   it('falls back to both to-markers when a one-cell native extent is incomplete', async () => {
@@ -1012,7 +1088,7 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
     expect(fetchImage).toHaveBeenCalledWith('xl/media/image1.png', 'image/png');
   });
 
-  it('uses the raster twin for duotone and fails closed for SVG-only duotone', async () => {
+  it('uses the raster twin for duotone when available', async () => {
     const bitmap = new FakeBitmap('image/png');
     vi.stubGlobal('createImageBitmap', vi.fn(async () => bitmap));
     const fetchImage = vi.fn(async (_path: string, mime: string) => new Blob(['X'], { type: mime }));
@@ -1024,13 +1100,68 @@ describe('render-orchestrator image decode (lazy bytes)', () => {
     );
     expect(fetchImage).not.toHaveBeenCalledWith('xl/media/image1.svg', expect.anything());
     expect(fetchImage).toHaveBeenCalledWith('xl/media/image1.png', 'image/png');
+  });
 
-    fetchImage.mockClear();
-    await expect(decodeImageSource(
+  it.each(['worker', 'window'])('rasterizes SVG-only duotone in %s, recolours once and releases the derivative', async (environment) => {
+    const base = new FakeBitmap('svg');
+    const recoloured = { width: 1, height: 1, close: vi.fn() };
+    const svgDecoder = vi.fn(async () => base as unknown as ImageBitmap);
+    if (environment === 'window') {
+      vi.stubGlobal('Image', class {
+        naturalWidth = 1;
+        naturalHeight = 1;
+        onload?: () => void;
+        set src(_value: string) { this.onload?.(); }
+      });
+      vi.stubGlobal('OffscreenCanvas', class {
+        getContext() { return { drawImage() {} }; }
+        transferToImageBitmap() { return base; }
+      });
+    }
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => recoloured));
+    const fetchImage = vi.fn(async () => new Blob(['<svg/>'], { type: 'image/svg+xml' }));
+    const record: { out?: Uint8ClampedArray } = {};
+    const decode = () => decodeImageSource(
       'xl/media/image-only.svg', 'image/svg+xml', undefined, fetchImage,
-      0, 0, null, duo,
-    )).resolves.toBeNull();
-    expect(fetchImage).not.toHaveBeenCalled();
+      72, 72, { l: 0.1, t: 0, r: 0, b: 0 }, { clr1: '000000', clr2: 'FF0000' },
+      recordingFactory(record), true, undefined, undefined,
+      environment === 'worker' ? svgDecoder : undefined,
+    );
+    expect(await decode()).toBe(recoloured);
+    expect(await decode()).toBe(recoloured);
+    expect(svgDecoder).toHaveBeenCalledTimes(environment === 'worker' ? 1 : 0);
+    expect(record.out).toEqual(new Uint8ClampedArray([246, 0, 0, 255]));
+    dropDuotoneBitmapCache(fetchImage);
+    await flush();
+    expect(recoloured.close).toHaveBeenCalledOnce();
+    dropBitmapCacheByPath(fetchImage);
+  });
+
+  it.each([false, true])('rejects oversized SVG effect bases (cached: %s) without closing borrowed hits', async (warmCache) => {
+    const base = { width: 3000, height: 3000, close: vi.fn() } as unknown as ImageBitmap;
+    const svgDecoder = vi.fn(async () => base);
+    const fetchImage = vi.fn(async () => new Blob(['<svg/>'], { type: 'image/svg+xml' }));
+    const offscreenFactory = vi.fn(() => { throw new Error('effect surface must not be allocated'); });
+    if (warmCache) {
+      await getCachedBitmapByPath('xl/media/large.svg', 'image/svg+xml', fetchImage, { svgDecoder });
+    }
+    await expect(decodeImageSource(
+      'xl/media/large.svg', 'image/svg+xml', undefined, fetchImage,
+      0, 0, null, { clr1: '000000', clr2: 'FF0000' }, offscreenFactory,
+      true, undefined, undefined, svgDecoder,
+    )).rejects.toMatchObject({
+      code: 'ooxml-decoded-image-limit', metric: 'image-pixels',
+      limit: 8_388_608, observed: 9_000_000,
+    });
+    expect(offscreenFactory).not.toHaveBeenCalled();
+    expect(base.close).toHaveBeenCalledTimes(warmCache ? 0 : 1);
+    if (warmCache) {
+      expect(await getCachedBitmapByPath('xl/media/large.svg', 'image/svg+xml', fetchImage, { svgDecoder })).toBe(base);
+    }
+    dropBitmapCacheByPath(fetchImage);
+    await flush();
+    expect(base.close).toHaveBeenCalledOnce();
+    expect(svgDecoder).toHaveBeenCalledOnce();
   });
 
   it('fails closed for a chart duotone when pixel readback is unavailable', async () => {
@@ -1382,6 +1513,45 @@ describe('render-pass lease: >cap prefetch never draws a closed bitmap', () => {
     fonts: [], fills: [], borders: [], cellXfs: [], numFmts: [],
   } as unknown as ParsedWorkbook['styles'];
 
+  it.each(['raster', 'svg-fallback', 'image-planning'] as const)(
+    'rejects worksheet rendering on archive resource failures during %s', async (site) => {
+      vi.stubGlobal('createImageBitmap', vi.fn(async () => new FakeBitmap('healthy')));
+      const error = new OoxmlResourceLimitError('archive limit', {
+        stage: 'decompression', violation: {
+          format: 'xlsx', operation: 'extract-image', resource: 'archive-entry',
+          metric: 'actual-inflated-bytes', part: 'xl/media/limit.png',
+          limit: 1, observed: 2, configurable: true,
+          usage: { archiveEntryCount: 1, declaredInflatedBytes: 2,
+            distinctInflatedBytes: 2, operationInflatedBytes: 2 },
+        },
+      });
+      const ws = {
+        ...worksheetWithImages(), name: 'S', rows: [], colWidths: {}, rowHeights: {},
+        defaultColWidth: 64, defaultRowHeight: 20, mergeCells: [], freezeRows: 0, freezeCols: 0,
+        conditionalFormats: [], charts: [], shapeGroups: [],
+      } as Worksheet;
+      ws.images = [{ ...ws.images[0],
+        mimeType: site === 'image-planning' ? 'image/emf' : 'image/png',
+        ...(site === 'svg-fallback' ? { svgImagePath: 'xl/media/original.svg' } : {}),
+      }];
+      const fetchImage = vi.fn(async (path: string) => {
+        // Inspection fails once; a swallowed failure would let decode succeed.
+        // For SVG the raster twin remains healthy, isolating the fallback catch.
+        if (site === 'raster' || path.endsWith('.svg')
+          || (site === 'image-planning' && fetchImage.mock.calls.length === 1)) throw error;
+        return new Blob(['healthy'], { type: 'image/png' });
+      });
+      const drawn = { closedAtDraw: [] as boolean[] };
+      await expect(renderWorksheetViewport(
+        { ws, styles: STYLES }, makeRecordingCanvas(drawn),
+        { row: 1, col: 1, rows: 10, cols: 10 },
+        { fetchImage, width: 800, height: 600, dpr: 1 },
+      )).rejects.toBe(error);
+      expect(drawn.closedAtDraw).toEqual([]);
+      expect(fetchImage).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('renders the missing-codec TIFF placeholder without blanking the worksheet', async () => {
     const fetchImage = vi.fn(async () =>
       new Blob([tiffHeader(32, 24) as BlobPart], { type: 'image/tiff' }));
@@ -1597,5 +1767,71 @@ describe('render-pass lease: >cap prefetch never draws a closed bitmap', () => {
 
     dropDuotoneBitmapCache(fetchImage);
     dropBitmapCacheByPath(fetchImage);
+  });
+});
+
+// Production metafile raster sizing must agree with tagged placement geometry,
+// including retained viewer sizes and true oneCell anchor ext. Untagged models
+// preserve their existing native extent and crop is still expanded exactly once.
+describe('tagged anchor metafile raster preparation (#1713)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it.each([
+    ['picture', [480, 180]], ['group', [240, 90]],
+    ['oneCell-crop', [480, 90]], ['untagged', [2, 2]],
+  ] as const)('sizes the real WMF player for %s', async (kind, expected) => {
+    stubOffscreenCanvas();
+    vi.stubGlobal('createImageBitmap', vi.fn(async (surface: { width: number; height: number }) =>
+      ({ width: surface.width, height: surface.height, close() {} })));
+    const ws = worksheetWithImages();
+    const facts = {
+      fromCol: 0, fromColOff: 0, fromRow: 0, fromRowOff: 0,
+      toCol: 0, toColOff: 320 * 9525, toRow: 0, toRowOff: 120 * 9525,
+      nativeExtCx: 9525, nativeExtCy: 9525, editAs: 'oneCell' as const,
+    };
+    const path = 'xl/media/synthetic-metafile.wmf';
+    ws.images = [];
+    ws.shapeGroups = [];
+    if (kind === 'picture' || kind === 'untagged') {
+      ws.images = [{ ...facts, ...(kind === 'picture' ? { anchorTag: 'twoCellAnchor' as const } : {}), imagePath: path, mimeType: 'image/wmf' }];
+    } else {
+      ws.shapeGroups = [{
+        ...facts, anchorTag: kind === 'group' ? 'twoCellAnchor' : 'oneCellAnchor',
+        anchorExtCx: 320 * 9525, anchorExtCy: 120 * 9525,
+        shapes: [{ x: 0, y: 0, w: .5, h: .5, rot: 0, strokeWidth: 0,
+          geom: { type: 'image', imagePath: path, mimeType: 'image/wmf',
+            ...(kind === 'oneCell-crop' ? { srcRect: { l: .25, r: .25, t: 0, b: 0 } } : {}) } }],
+      }] as Worksheet['shapeGroups'];
+    }
+    const fetch = vi.fn(async () => new Blob([buildMinimalWmf() as BlobPart], { type: 'image/wmf' }));
+    const cache = new Map<string, CanvasImageSource | null>();
+    try {
+      await prefetchImages(ws, cache, fetch, { effectiveDpr: 1 });
+      const bitmap = cache.get(path) as ImageBitmap;
+      expect(bitmap).not.toBeNull();
+      expect([bitmap.width, bitmap.height]).toEqual(expected);
+    } finally { dropBitmapCacheByPath(fetch); }
+  });
+
+  it('uses the bound prepared size for the WMF decoder after band edits and zoom', async () => {
+    stubOffscreenCanvas();
+    vi.stubGlobal('createImageBitmap', vi.fn(async (surface: { width: number; height: number }) =>
+      ({ width: surface.width, height: surface.height, close() {} })));
+    const ws = worksheetWithImages();
+    ws.colWidths = { 1: 20, 2: 20 };
+    ws.rowHeights = { 1: 45, 2: 45 };
+    ws.shapeGroups = [];
+    const image = ws.images[0];
+    Object.assign(image, { anchorTag: 'twoCellAnchor', editAs: 'oneCell', nativeExtCx: 9525, nativeExtCy: 9525,
+      imagePath: 'xl/media/retained-metafile.wmf', mimeType: 'image/wmf' });
+    bindInitialAnchorSizes(ws, captureInitialAnchorSizes(ws, getGridGeometryForWorksheet(ws))!);
+    ws.colWidths[1] = 60;
+    GridGeometry.invalidate(ws);
+    const fetch = vi.fn(async () => new Blob([buildMinimalWmf() as BlobPart], { type: 'image/wmf' }));
+    const cache = new Map<string, CanvasImageSource | null>();
+    try {
+      await prefetchImages(ws, cache, fetch, { cellScale: 2, effectiveDpr: 1 });
+      const bitmap = cache.get(image.imagePath) as ImageBitmap;
+      expect([bitmap.width, bitmap.height]).toEqual([960, 360]);
+    } finally { dropBitmapCacheByPath(fetch); }
   });
 });

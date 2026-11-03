@@ -5,9 +5,11 @@ import {
   applySizeOverrides,
   createSizeOverriddenWorksheet,
   WorksheetViewProjectionCache,
+  extractViewerRenderContext,
+  type WireRenderViewportOptions,
   type WireSizeOverrides,
 } from './worker-protocol.js';
-import { getSheetRenderCache, inheritSheetRenderCache } from './renderer.js';
+import { getSheetRenderCache, inheritSheetRenderCache, getGridGeometryForWorksheet } from './renderer.js';
 import type { Worksheet } from './types.js';
 import type { OutlineLayout } from './outline.js';
 
@@ -80,21 +82,25 @@ interface ViewerPriv {
   currentSheet: number;
   canvasArea: FakeEl;
   scrollHost: FakeEl;
-  rowOutline: OutlineLayout | null;
+  outlineGutter: {
+    rowOutline: OutlineLayout | null;
+    applyGroupToggle(group: OutlineLayout['groups'][number], axis: 'row' | 'col'): void;
+  };
   scrollOutlineSummaryToStart(axis: 'row' | 'col', summary: number): void;
-  resizeDrag: { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number } | null;
+  selectionInput: {
+    resizeDrag: { kind: 'col' | 'row'; index: number; originScaled: number; mdw: number; indices: readonly number[]; worksheet: Worksheet } | null;
+    applyResize(clientX: number, clientY: number): void;
+  };
   buildOutline(ws: Worksheet): void;
-  applyGroupToggle(group: OutlineLayout['groups'][number], axis: 'row' | 'col'): void;
-  applyResize(clientX: number, clientY: number): void;
   renderCurrentSheet(): Promise<void>;
 }
 
 /** Worker-mode viewer over the outline worksheet, with a controllable first
  *  bitmap so the latest-only render queue can be advanced deterministically. */
-function buildWorker() {
+function buildWorker(onError?: (error: Error) => void) {
   installDom();
   const container = makeContainer();
-  const v = new XlsxViewer(container as unknown as HTMLElement, { mode: 'worker' });
+  const v = new XlsxViewer(container as unknown as HTMLElement, { mode: 'worker', onError });
   const renderGate = deferred<ImageBitmap>();
   const renderViewportToBitmap = vi.fn(() => renderGate.promise);
   const fakeWb = {
@@ -130,13 +136,54 @@ function lastOverrides(fn: ReturnType<typeof vi.fn>): WireSizeOverrides | undefi
 }
 
 describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
+  it('rolls back a huge-row preview after its worker frame fails and gives the next gesture a fresh revision', async () => {
+    const onError = vi.fn();
+    const { v, priv, renderViewportToBitmap, completeRender } = buildWorker(onError);
+    priv.scrollHost.clientWidth = 800; priv.scrollHost.clientHeight = 600;
+    v.setSelection('1:1048576');
+    const initial = getGridGeometryForWorksheet(priv.currentWorksheet).row.offsetOf(1048577);
+    const event = (y: number) => ({ button: 0, pointerId: 1, pointerType: 'mouse', clientX: 5,
+      clientY: y, preventDefault() {}, shiftKey: false, ctrlKey: false, metaKey: false });
+    const begin = (height: number) => {
+      const cell = v.getCellViewportRect('A2')!;
+      priv.scrollHost.dispatch('pointerdown', event(cell.y + cell.height + 0.5));
+      priv.scrollHost.dispatch('pointermove', event(cell.y + height));
+      return event(cell.y + height);
+    };
+    begin(84);
+    expect(getGridGeometryForWorksheet(priv.currentWorksheet).row.sizeOf(1048576)).toBe(84);
+    renderViewportToBitmap.mockImplementationOnce(() => Promise.reject(new Error('compact worker frame failed')))
+      .mockImplementation(() => Promise.resolve({ close: vi.fn() } as unknown as ImageBitmap));
+    completeRender({ close: vi.fn() } as unknown as ImageBitmap);
+    await settleRenders(); await settleRenders();
+    expect(onError).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'compact worker frame failed' }));
+    expect(getGridGeometryForWorksheet(priv.currentWorksheet).row.offsetOf(1048577)).toBe(initial);
+    const failedCall = renderViewportToBitmap.mock.calls.find(call =>
+      (call as unknown as [unknown, unknown, { sizeOverrides?: WireSizeOverrides }])[2].sizeOverrides?.rowHeightRanges);
+    expect(failedCall).toBeDefined();
+    const failedOptions = (failedCall as unknown as [unknown, unknown, { sizeOverrides: WireSizeOverrides }])[2];
+    expect(JSON.stringify(failedOptions.sizeOverrides).length).toBeLessThan(1024);
+    const cache = new WorksheetViewProjectionCache(), source = outlineWorksheet();
+    const failedContext = extractViewerRenderContext(failedOptions as WireRenderViewportOptions);
+    const failedProjection = cache.resolve(source, 0, failedContext.projection, failedOptions.sizeOverrides).worksheet;
+    const end = begin(90); priv.scrollHost.dispatch('pointerup', end);
+    await settleRenders(); await settleRenders();
+    const nextOptions = (renderViewportToBitmap.mock.calls.at(-1) as unknown as [unknown, unknown, WireRenderViewportOptions])[2];
+    const nextContext = extractViewerRenderContext(nextOptions);
+    const worker = cache.resolve(source, 0, nextContext.projection, structuredClone(nextOptions.sizeOverrides)).worksheet;
+    expect(worker).not.toBe(failedProjection);
+    expect(getGridGeometryForWorksheet(worker).row.sizeOf(1048576)).toBe(90);
+    expect([4, 5, 6, 7].map(i => getGridGeometryForWorksheet(worker).row.sizeOf(i))).toEqual([0, 0, 0, 0]);
+    expect(onError).toHaveBeenCalledTimes(1);
+    v.destroy();
+  });
   it('expanding the collapsed group sends row overrides that reveal rows 4-7', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    const l3 = priv.rowOutline?.groups.find((g) => g.level === 3);
+    const l3 = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
     expect(l3?.collapsed).toBe(true);
 
     // Expand (the sync-render fallback fires renderCurrentSheet immediately).
-    priv.applyGroupToggle(l3 as OutlineLayout['groups'][number], 'row');
+    priv.outlineGutter.applyGroupToggle(l3 as OutlineLayout['groups'][number], 'row');
     expect(renderViewportToBitmap).toHaveBeenCalled();
     const o = lastOverrides(renderViewportToBitmap);
     // Rows 4-7 were revealed: the model has NO entry (default height) ⇒ null.
@@ -153,12 +200,12 @@ describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
 
   it('re-collapsing sends rows back as 0-height overrides', async () => {
     const { priv, renderViewportToBitmap, completeRender } = buildWorker();
-    const expand = priv.rowOutline?.groups.find((g) => g.level === 3);
-    priv.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
+    const expand = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
+    priv.outlineGutter.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
     // The layout was rebuilt after the expand — fetch the group's new object.
-    const collapse = priv.rowOutline?.groups.find((g) => g.level === 3);
+    const collapse = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
     expect(collapse?.collapsed).toBe(false);
-    priv.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
+    priv.outlineGutter.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
     completeRender({ close: vi.fn() } as unknown as ImageBitmap);
     await settleRenders();
 
@@ -177,11 +224,11 @@ describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
     priv.scrollHost.clientHeight = 60;
     priv.scrollHost.scrollWidth = 1000;
     priv.scrollHost.scrollHeight = 1000;
-    const expand = priv.rowOutline?.groups.find((g) => g.level === 3);
-    priv.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
-    const collapse = priv.rowOutline?.groups.find((g) => g.level === 3);
+    const expand = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
+    priv.outlineGutter.applyGroupToggle(expand as OutlineLayout['groups'][number], 'row');
+    const collapse = priv.outlineGutter.rowOutline?.groups.find((g) => g.level === 3);
 
-    priv.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
+    priv.outlineGutter.applyGroupToggle(collapse as OutlineLayout['groups'][number], 'row');
 
     // Rows 1-3 remain at the 15pt default (= 20 CSS px) and rows 4-7 collapse
     // to zero, so summary row 8 starts exactly 60px into the scrollable axis.
@@ -190,10 +237,63 @@ describe('worker-mode outline collapse/expand reaches the grid bitmap', () => {
 });
 
 describe('worker-mode drag-to-resize reaches the grid bitmap (#567 hole)', () => {
+  it('reports a failed worker frame after a complete batch, and accepts the next gesture', async () => {
+    const onError = vi.fn();
+    const { v, priv, renderViewportToBitmap, completeRender } = buildWorker(onError);
+    v.setSelection('B:D');
+    const selection = v.selectionState;
+    const drag = (pixels: number) => {
+      const cell = v.getCellViewportRect('B1')!;
+      const event = (x: number) => ({ button: 0, pointerId: 1, pointerType: 'mouse',
+        clientX: x, clientY: 5, preventDefault() {}, shiftKey: false, ctrlKey: false, metaKey: false });
+      priv.scrollHost.dispatch('pointerdown', event(cell.x + cell.width + 0.5));
+      priv.scrollHost.dispatch('pointermove', event(cell.x + pixels));
+      priv.scrollHost.dispatch('pointercancel', event(cell.x + pixels));
+    };
+    renderViewportToBitmap.mockImplementation(() => Promise.reject(new Error('synthetic worker frame failure')));
+    drag(84);
+    completeRender({ close: vi.fn() } as unknown as ImageBitmap);
+    await settleRenders();
+    expect(onError).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'synthetic worker frame failure' }));
+    expect(lastOverrides(renderViewportToBitmap)?.columnCssWidths).toEqual({ 2: 84, 3: 84, 4: 84 });
+    expect(priv.currentWorksheet.colWidths[4]).toBe(priv.currentWorksheet.colWidths[2]);
+    expect(v.selectionState).toEqual(selection);
+    renderViewportToBitmap.mockImplementation(() => Promise.resolve({ close: vi.fn() } as unknown as ImageBitmap));
+    drag(90);await settleRenders();
+    expect(lastOverrides(renderViewportToBitmap)?.columnCssWidths).toEqual({ 2: 90, 3: 90, 4: 90 });
+    expect(onError).toHaveBeenCalledTimes(1);
+    v.destroy();
+  });
+
+  it.each(['col', 'row'] as const)('transfers every selected %s resize through the actual override channel', async (axis) => {
+    const { v, priv, renderViewportToBitmap, completeRender } = buildWorker();
+    v.setSelection(axis === 'col' ? 'B:D' : '2:9');
+    const cell = v.getCellViewportRect(axis === 'col' ? 'B1' : 'A2');
+    if (!cell) throw new Error('Expected visible header geometry');
+    const event = (clientX: number, clientY: number) => ({ button: 0, pointerId: 1, pointerType: 'mouse',
+      clientX, clientY, preventDefault() {}, shiftKey: false, ctrlKey: false, metaKey: false });
+    priv.scrollHost.dispatch('pointerdown', event(axis === 'col' ? cell.x + cell.width + 0.5 : 5,
+      axis === 'row' ? cell.y + cell.height + 0.5 : 5));
+    const end = event(axis === 'col' ? cell.x + 84 : 5, axis === 'row' ? cell.y + 84 : 5);
+    priv.scrollHost.dispatch('pointermove', end);
+    priv.scrollHost.dispatch('pointerup', end);
+    completeRender({ close: vi.fn() } as unknown as ImageBitmap);
+    await settleRenders();
+    const workerSheet = outlineWorksheet();
+    applySizeOverrides(workerSheet, structuredClone(lastOverrides(renderViewportToBitmap)));
+    const actual = axis === 'col' ? workerSheet.colWidths : workerSheet.rowHeights;
+    const viewerSizes = axis === 'col' ? priv.currentWorksheet.colWidths : priv.currentWorksheet.rowHeights;
+    expect(actual).toEqual(viewerSizes);
+    const indices = axis === 'col' ? [2, 3, 4] : [2, 3, 8, 9];
+    for (const index of indices) expect(actual[index]).toBe(actual[2]);
+    if (axis === 'row') expect([4, 5, 6, 7].map((index) => actual[index])).toEqual([0, 0, 0, 0]);
+    v.destroy();
+  });
+
   it('a column resize sends the new width as a col override', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    priv.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7 };
-    priv.applyResize(100, 0); // drag column B's right border to x=100
+    priv.selectionInput.resizeDrag = { kind: 'col', index: 2, originScaled: 0, mdw: 7, indices: [2], worksheet: priv.currentWorksheet };
+    priv.selectionInput.applyResize(100, 0); // drag column B's right border to x=100
 
     const o = lastOverrides(renderViewportToBitmap);
     const newWidth = priv.currentWorksheet.colWidths[2];
@@ -207,8 +307,8 @@ describe('worker-mode drag-to-resize reaches the grid bitmap (#567 hole)', () =>
 
   it('a row resize sends the new height as a row override', () => {
     const { priv, renderViewportToBitmap } = buildWorker();
-    priv.resizeDrag = { kind: 'row', index: 9, originScaled: 0, mdw: 7 };
-    priv.applyResize(0, 60);
+    priv.selectionInput.resizeDrag = { kind: 'row', index: 9, originScaled: 0, mdw: 7, indices: [9], worksheet: priv.currentWorksheet };
+    priv.selectionInput.applyResize(0, 60);
 
     const o = lastOverrides(renderViewportToBitmap);
     const newHeight = priv.currentWorksheet.rowHeights[9];

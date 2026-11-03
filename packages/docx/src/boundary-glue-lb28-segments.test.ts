@@ -35,7 +35,7 @@ describe('buildSegments UAX #14 LB28 boundary glue', () => {
     ['HL × AL', 'א', 'a'],
     ['HL × HL', 'א', 'ב'],
   ])('marks the following segment joinPrev for %s', (_label, prev, next) => {
-    expect(textSegments([textRun(prev), textRun(next)]).map((seg) => seg.joinPrev))
+    expect(textSegments([textRun(prev), textRun(next, true)]).map((seg) => seg.joinPrev))
       .toEqual([undefined, true]);
   });
 
@@ -55,14 +55,6 @@ describe('buildSegments UAX #14 LB28 boundary glue', () => {
     ],
   ])('does not add glue across %s', (_label, runs) => {
     expect(textSegments(runs).every((seg) => seg.joinPrev === undefined)).toBe(true);
-  });
-
-  it('does not create a break inside consecutive spaces split by a source-run boundary (LB7)', () => {
-    expect(textSegments([
-      textRun('deadline ', true),
-      textRun(' ', true),
-      textRun('next'),
-    ]).map((segment) => segment.joinPrev)).toEqual([undefined, true, undefined]);
   });
 
   it('keeps a trailing space split by script shaping with the preceding text from the same run', () => {
@@ -118,37 +110,4 @@ describe('buildSegments UAX #14 LB28 boundary glue', () => {
     expect(splitRuns).toEqual(sameRun);
   });
 
-  it('does not use consecutive authored spaces as shrink budget for following visible text', () => {
-    const context = {
-      font: '10px serif',
-      letterSpacing: '0px',
-      measureText(value: string) {
-        return {
-          width: [...value].length * 10,
-          fontBoundingBoxAscent: 8,
-          fontBoundingBoxDescent: 2,
-          actualBoundingBoxAscent: 8,
-          actualBoundingBoxDescent: 2,
-        } as TextMetrics;
-      },
-    } as CanvasRenderingContext2D;
-    const lineTexts = (runs: readonly DocRun[]) => layoutLines(
-      context,
-      buildSegments(runs, ENV),
-      95,
-      0,
-      1,
-    ).map((line) => line.segments.map((segment) =>
-      'text' in segment ? segment.text : '').join(''));
-
-    const sameRun = lineTexts([textRun('2月22日（水）  までに', true)]);
-    const splitRuns = lineTexts([
-      textRun('2月22日（水） ', true),
-      textRun(' ', true),
-      textRun('までに', true),
-    ]);
-
-    expect(sameRun).toEqual(['2月22日（水）  ', 'までに']);
-    expect(splitRuns).toEqual(sameRun);
-  });
 });

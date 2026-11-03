@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { isEmf } from './wmf.js';
 import { playEmf, renderEmfToBitmap } from './emf.js';
+import { EmfPlusPlayer, scanEmfPlus } from './emf-plus.js';
+import { MAX_RASTER_DIMENSION } from './pixel-budget.js';
+import {
+  decodeRasterOrMetafile,
+  getIncompleteMetafileReport,
+  isOoxmlIncompleteMetafileError,
+} from './raster-or-metafile.js';
+import { dropBitmapCacheByPath, getCachedBitmapByPath } from './bitmap-image-by-path.js';
+import { getCachedDuotoneBitmapByPath } from './duotone-bitmap-by-path.js';
 
 // ── EMF (Enhanced Metafile) player unit tests ───────────────────────────────
 // The renderer falls back to this player for true `.emf` blips the browser can't
@@ -267,8 +276,9 @@ function makeRecordingCtx(): MockCtx {
     rotate(a: number) {
       calls.push({ op: 'rotate', args: [a] });
     },
-    clip(rule?: string) {
-      calls.push({ op: 'clip', args: rule ? [rule] : [] });
+    clip(...a: unknown[]) {
+      // clip(rule) or clip(path, rule): a Path2D region is recorded by name.
+      calls.push({ op: 'clip', args: a.filter((v) => v !== undefined).map((v) => (typeof v === 'string' ? v : 'Path2D')) });
     },
   };
   return { ctx: ctx as unknown as CanvasRenderingContext2D, calls, styles };
@@ -818,7 +828,115 @@ describe('playEmf — polygon16 fill + brush/pen select', () => {
 
 // ── playEmf: text-out ────────────────────────────────────────────────────────
 
+function symbolTextFile(face: string, charset: number, text: string, options = 0, advances: number[] = []): Uint8Array {
+  return concat(
+    emfHeader(0, 0, 100, 100),
+    record(EMR.EXTCREATEFONTINDIRECTW, (w) => {
+      w.u32(1).i32(-12).i32(0).i32(0).i32(0).i32(400);
+      w.raw(0, 0, 0, charset).raw(0, 0, 0, 0).utf16(face);
+      for (let i = face.length; i < 32; i++) w.u16(0);
+    }),
+    record(EMR.SELECTOBJECT, (w) => w.u32(1)),
+    record(EMR.EXTTEXTOUTW, (w) => {
+      w.i32(0).i32(0).i32(100).i32(100).u32(1).f32(1).f32(1);
+      const headerSize = options & 0x100 ? 60 : 76;
+      w.i32(20).i32(30).u32(text.length).u32(headerSize).u32(options);
+      if (!(options & 0x100)) w.i32(0).i32(0).i32(0).i32(0);
+      w.u32(advances.length ? headerSize + text.length * 2 : 0).utf16(text);
+      for (const advance of advances) w.u32(advance);
+    }),
+    record(EMR.EOF, () => {}),
+  );
+}
+
 describe('playEmf — EXTTEXTOUTW text', () => {
+  it('preserves valid text with ETO_NO_RECT and its shorter record header', () => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('Arial', 0, 'A', 0x100), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args).toEqual(['A', 20, 30]);
+    expect(report).not.toHaveBeenCalled();
+  });
+  it('normalizes private Symbol glyphs only under SYMBOL_CHARSET', () => {
+    const m = makeRecordingCtx();
+    playEmf(symbolTextFile('Symbol', 2, '\uf0ae'), m.ctx, 100, 100);
+    expect(m.calls.find((c) => c.op === 'fillText')?.args).toEqual(['→', 20, 30]);
+    expect(m.ctx.font).toBe('12px serif');
+    const ordinary = makeRecordingCtx();
+    playEmf(symbolTextFile('Symbol', 0, '\uf0ae'), ordinary.ctx, 100, 100);
+    expect(ordinary.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('\uf0ae');
+  });
+
+  it('decodes MT Extra private ellipses in the exact family, leaving other families and ANSI alone', () => {
+    const text = '\uf04b\uf04c\uf04d\uf04e\uf04f';
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('MT Extra', 2, text), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args).toEqual(['…⋯⋮⋰⋱', 20, 30]);
+    expect(m.ctx.font).toBe('12px serif');
+    expect(report).not.toHaveBeenCalled();
+    for (const [face, charset] of [['MT Extra Tiger', 2], ['MT Extra', 0]] as const) {
+      const other = makeRecordingCtx();
+      playEmf(symbolTextFile(face, charset, text), other.ctx, 100, 100);
+      expect(other.calls.find((c) => c.op === 'fillText')?.args[0]).toBe(text);
+    }
+  });
+
+  it('retains unknown symbol-font compatibility text and reports the unsupported encoding', () => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('MT Extra', 2, '\uf04c\uf041'), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('\uf04c\uf041');
+    expect(report).toHaveBeenCalledWith(['EMR_EXTTEXTOUTW (unsupported symbol encoding)']);
+  });
+
+  it.each([
+    ['Symbol', '\uf0ae\uf0e6', 0], // 0xE6 has only an Adobe Corporate-Use target
+    ['SymbolMT', '\uf0ae', 0],
+    ['Symbol', '\uf0ae', 0x10],
+  ])('does not partially decode unknown glyphs, faces or glyph-index options (%s)', (face, text, options) => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile(face, 2, text, options), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe(text);
+    expect(report).toHaveBeenCalledWith(['EMR_EXTTEXTOUTW (unsupported symbol encoding)']);
+  });
+
+  it('keeps real Unicode alongside a private Symbol entry and reports unimplemented advances', () => {
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(symbolTextFile('Symbol', 2, 'α\uf0ae', 0, [30, 10]), m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.find((c) => c.op === 'fillText')?.args[0]).toBe('α→');
+    expect(report).toHaveBeenCalledWith(['EMR_EXTTEXTOUTW (symbol character advances)']);
+  });
+
+  it('does not decode Symbol text from following records when offString crosses the record boundary', () => {
+    const file = symbolTextFile('Symbol', 2, '\uf0ae');
+    const view = new DataView(file.buffer);
+    let pos = view.getUint32(4, true);
+    while (view.getUint32(pos, true) !== EMR.EXTTEXTOUTW) pos += view.getUint32(pos + 4, true);
+    view.setUint32(pos + 48, view.getUint32(pos + 4, true), true);
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(file, m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.filter((c) => c.op === 'fillText')).toEqual([]);
+    expect(report).toHaveBeenCalledWith(['EMF record 84 (malformed)']);
+  });
+
+  it('does not construct a Symbol font by reading the next record', () => {
+    const original = symbolTextFile('Symbol', 2, '\uf0ae');
+    const originalView = new DataView(original.buffer);
+    const fontStart = originalView.getUint32(4, true);
+    const fontEnd = fontStart + originalView.getUint32(fontStart + 4, true);
+    const file = concat(original.slice(0, fontStart + 40), original.slice(fontEnd));
+    new DataView(file.buffer).setUint32(fontStart + 4, 40, true);
+    const m = makeRecordingCtx();
+    const report = vi.fn();
+    playEmf(file, m.ctx, 100, 100, { onUnsupported: report });
+    expect(m.calls.filter((c) => c.op === 'fillText')).toEqual([]);
+    expect(report).toHaveBeenCalledWith(['EMF record 82 (malformed)']);
+  });
+
   it('draws the UTF-16 string with the selected font color at the mapped ref point', () => {
     // offString = byte offset from the RECORD start to the string. The EXTTEXTOUTW
     // data layout up to the string: header(8) + RECTL(16) + iGraphicsMode(4) +
@@ -1008,7 +1126,7 @@ describe('playEmf — picture frame mapping + path clip', () => {
     expect(m.calls.filter((call) => call.op === 'fill')).toHaveLength(1);
   });
 
-  it('discards a path bracket that exceeds the cumulative geometry budget', () => {
+  it('rejects a picture that exceeds the cumulative geometry budget', () => {
     const file = concat(
       emfHeader(0, 0, 100, 100),
       record(EMR.CREATEBRUSHINDIRECT, (w) => w.u32(1).u32(0).u32(0x0000ff00).u32(0)),
@@ -1039,9 +1157,251 @@ describe('playEmf — picture frame mapping + path clip', () => {
       height: number,
       limits: { maxPathCommands: number },
     ) => boolean;
-    expect(playWithLimits(file, m.ctx, 100, 100, { maxPathCommands: 4 })).toBe(true);
+    expect(() => playWithLimits(file, m.ctx, 100, 100, { maxPathCommands: 4 })).toThrow(expect.objectContaining({ code: 'ooxml-decoded-image-limit', metric: 'metafile-path-commands', limit: 4, observed: 5 }));
     expect(m.calls.filter((call) => call.op === 'fill')).toHaveLength(0);
-    expect(m.calls.filter((call) => call.op === 'stroke')).toHaveLength(1);
+    expect(m.calls.filter((call) => call.op === 'stroke')).toHaveLength(0);
+  });
+
+  it.each([EMR.POLYGON16, EMR.POLYBEZIERTO16, EMR.POLYPOLYGON16])('charges only appendable geometry for malformed record %i in a full path bracket', (type) => {
+    const m = makeRecordingCtx();
+    const file = concat(
+      emfHeader(),
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000000)), // WHITE_BRUSH
+      record(EMR.BEGINPATH, () => {}),
+      record(43, (w) => w.i32(0).i32(0).i32(20).i32(20)), // RECTANGLE: five commands
+      record(type, (w) => w.i32(0).i32(0).i32(20).i32(20)), // missing count header
+      record(type, (w) => {
+        w.i32(0).i32(0).i32(20).i32(20);
+        if (type === EMR.POLYPOLYGON16) w.u32(2).u32(3).u32(1).u32(2).i16(0).i16(0);
+        else if (type === EMR.POLYBEZIERTO16) w.u32(3).i16(0).i16(0).i16(1).i16(1);
+        else w.u32(2); // declares two points, supplies none
+      }),
+      record(EMR.ENDPATH, () => {}),
+      record(EMR.FILLPATH, (w) => w.i32(0).i32(0).i32(20).i32(20)),
+      record(EMR.EOF, () => {}),
+    );
+    const playWithLimits = playEmf as (
+      bytes: Uint8Array, ctx: CanvasRenderingContext2D, width: number, height: number,
+      limits: { maxPathCommands: number },
+    ) => boolean;
+    expect(playWithLimits(file, m.ctx, 100, 100, { maxPathCommands: 5 })).toBe(true);
+    expect(m.calls.filter((call) => call.op === 'fill')).toHaveLength(1);
+    expect(m.calls.filter((call) => call.op === 'closePath')).toHaveLength(1);
+  });
+
+  it.each([
+    ['MOVETOEX', EMR.MOVETOEX, []],
+    ['LINETO', EMR.LINETO, [10]],
+    ['RECTANGLE', 43, [0, 0, 20]],
+    ['ARC', 45, [0, 0, 20, 20, 20, 10, 10]],
+    ['ANGLEARC radius', 41, [10, 10]],
+    ['ANGLEARC sweep', 41, [10, 10, 10, 0]],
+  ] as const)('does not borrow following-record bytes for truncated %s', (_name, type, fields) => {
+    const m = makeRecordingCtx();
+    const reported: string[] = [];
+    const file = concat(
+      emfHeader(), record(EMR.SELECTOBJECT, (w) => w.u32(0x80000000)),
+      record(EMR.BEGINPATH, () => {}),
+      record(43, (w) => w.i32(0).i32(0).i32(20).i32(20)),
+      record(type, (w) => { for (const field of fields) w.i32(field); }),
+      record(EMR.ENDPATH, () => {}), record(EMR.FILLPATH, () => {}), record(EMR.EOF, () => {}),
+    );
+    expect(playEmf(file, m.ctx, 100, 100, {
+      maxPathCommands: 5, onUnsupported: (r) => reported.push(...r),
+    } as Parameters<typeof playEmf>[4])).toBe(true);
+    expect(reported).toEqual([`EMF record ${type} (malformed)`]);
+    expect(m.calls.filter(({ op }) => ['moveTo', 'lineTo', 'bezierCurveTo', 'closePath'].includes(op))).toHaveLength(5);
+  });
+
+  it.each([
+    ['MOVETOEX', EMR.MOVETOEX, 1, (w: Writer) => w.i32(10).i32(10)],
+    ['LINETO', EMR.LINETO, 1, (w: Writer) => w.i32(10).i32(10)],
+    ['CLOSEFIGURE', EMR.CLOSEFIGURE, 1, (_w: Writer) => {}],
+    ['RECTANGLE', 43, 5, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20)],
+    ['ELLIPSE', 42, 6, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20)],
+    ['POLYLINE16', 87, 2, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).u32(2).i16(0).i16(0).i16(10).i16(10)],
+    ['POLYLINETO16', 89, 2, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).u32(2).i16(0).i16(0).i16(10).i16(10)],
+    ['POLYGON16', 86, 3, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).u32(2).i16(0).i16(0).i16(10).i16(10)],
+    ['POLYBEZIER16', 85, 2, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).u32(4).i32(0).i32(0).i32(0).i32(0)],
+    ['POLYBEZIERTO16', 88, 1, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).u32(3).i32(0).i32(0).i32(0)],
+    ['POLYPOLYGON16', 91, 3, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).u32(1).u32(2).u32(2).i32(0).i32(0)],
+    ['POLYPOLYLINE16', 90, 2, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).u32(1).u32(2).u32(2).i32(0).i32(0)],
+    ['ARC', 45, 2, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).i32(20).i32(10).i32(10).i32(0)],
+    ['ARCTO', 55, 2, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).i32(20).i32(10).i32(10).i32(0)],
+    ['CHORD', 46, 3, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).i32(20).i32(10).i32(10).i32(0)],
+    ['PIE', 47, 4, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).i32(20).i32(10).i32(10).i32(0)],
+    ['ANGLEARC zero sweep', 41, 1, (w: Writer) => w.i32(10).i32(10).u32(10).f32(0).f32(0)],
+    ['ANGLEARC quarter turn', 41, 2, (w: Writer) => w.i32(10).i32(10).u32(10).f32(0).f32(90)],
+    ['ROUNDRECT zero corner width', 44, 5, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).i32(0).i32(10)],
+    ['ROUNDRECT zero corner height', 44, 5, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).i32(10).i32(0)],
+    ['ROUNDRECT curved corners', 44, 9, (w: Writer) => w.i32(0).i32(0).i32(20).i32(20).i32(10).i32(10)],
+  ] as const)('charges exactly the commands appended by %s', (_name, type, commands, body) => {
+    const cap = 5 + commands;
+    const file = (extra: boolean) => concat(
+      emfHeader(), record(EMR.SELECTOBJECT, (w) => w.u32(0x80000000)), record(EMR.BEGINPATH, () => {}),
+      record(43, (w) => w.i32(0).i32(0).i32(20).i32(20)), record(type, body),
+      ...(extra ? [record(EMR.LINETO, (w) => w.i32(30).i32(30))] : []),
+      record(EMR.ENDPATH, () => {}), record(EMR.FILLPATH, () => {}), record(EMR.EOF, () => {}),
+    );
+    const m = makeRecordingCtx();
+    const options = { maxPathCommands: cap } as Parameters<typeof playEmf>[4];
+    expect(playEmf(file(false), m.ctx, 100, 100, options)).toBe(true);
+    expect(m.calls.filter(({ op }) => ['moveTo', 'lineTo', 'bezierCurveTo', 'closePath'].includes(op))).toHaveLength(cap);
+    expect(() => playEmf(file(true), makeRecordingCtx().ctx, 100, 100, options)).toThrow(expect.objectContaining({
+      code: 'ooxml-decoded-image-limit', metric: 'metafile-path-commands', limit: cap, observed: cap + 1,
+    }));
+  });
+
+  it('admits 65,536 region rectangles and rejects the next only when supplied', () => {
+    const region = (count: number, supplied = count) => {
+      const bytes = new Uint8Array(48 + supplied * 16);
+      const v = new DataView(bytes.buffer);
+      [75, bytes.length, 32 + supplied * 16, 1, 32, 1, count, count * 16].forEach((n, i) => v.setUint32(i * 4, n, true));
+      return bytes;
+    };
+    const run = (data: Uint8Array, mode = 1) => {
+      new DataView(data.buffer, data.byteOffset, data.byteLength).setUint32(12, mode, true);
+      const m = makeRecordingCtx();
+      const reported: string[] = [];
+      playEmf(concat(emfHeader(), data, record(EMR.EOF, () => {})), m.ctx, 100, 100, {
+        onUnsupported: (r) => reported.push(...r),
+      });
+      return { m, reported };
+    };
+    const boundary = run(region(0x10000));
+    expect(boundary.m.calls.filter(({ op }) => op === 'closePath')).toHaveLength(0x10000);
+    expect(boundary.m.calls.filter(({ op }) => op === 'clip')).toHaveLength(1);
+    expect(boundary.reported).toEqual([]);
+    for (const mode of [1, 2, 4, 5]) {
+      expect(() => run(region(0x10001), mode)).toThrowError(expect.objectContaining({
+        code: 'ooxml-decoded-image-limit', metric: 'metafile-record-rectangles', limit: 0x10000, observed: 0x10001,
+      }));
+    }
+    const truncated = run(region(0x10001, 0x10000));
+    expect(truncated.reported).toEqual(['EMF record 75 (malformed)']);
+    expect(truncated.m.calls.some(({ op }) => op === 'clip')).toBe(false);
+    const shortRegion = region(0x10001, 0x10000);
+    new DataView(shortRegion.buffer).setUint32(8, 32 + 0x10001 * 16, true);
+    expect(run(shortRegion).reported).toEqual(['EMF record 75 (malformed)']);
+  });
+
+  it.each([0, 0x100])('admits 65,536 UTF-16 units and rejects the next after string validation (options %i)', (options) => {
+    const textRecord = (count: number, supplied = count, offset?: number) => record(EMR.EXTTEXTOUTW, (w) => {
+      w.i32(0).i32(0).i32(20).i32(20).u32(1).f32(1).f32(1)
+        .i32(0).i32(0).u32(count).u32(offset ?? (options ? 60 : 76)).u32(options);
+      if (!options) w.i32(0).i32(0).i32(20).i32(20);
+      w.u32(0).utf16('A'.repeat(supplied));
+    });
+    const run = (data: Uint8Array) => {
+      const m = makeRecordingCtx();
+      const reported: string[] = [];
+      playEmf(concat(emfHeader(), record(EMR.EXTCREATEFONTINDIRECTW, (w) => {
+        w.u32(1).i32(-12);
+        for (let i = 0; i < 88; i++) w.raw(0);
+      }), record(EMR.SELECTOBJECT, (w) => w.u32(1)), data, record(EMR.EOF, () => {})), m.ctx, 100, 100, {
+        onUnsupported: (r) => reported.push(...r),
+      });
+      return { m, reported };
+    };
+    const boundary = run(textRecord(0x10000));
+    expect(boundary.m.calls.find(({ op }) => op === 'fillText')?.args[0]).toBe('A'.repeat(0x10000));
+    expect(boundary.reported).toEqual([]);
+    expect(() => run(textRecord(0x10001))).toThrowError(expect.objectContaining({
+      code: 'ooxml-decoded-image-limit', metric: 'metafile-record-text-units', limit: 0x10000, observed: 0x10001,
+    }));
+    for (const data of [textRecord(0x10001, 0x10000), textRecord(0x10001, 0x10001, 8)]) {
+      const malformed = run(data);
+      expect(malformed.reported).toEqual(['EMF record 84 (malformed)']);
+      expect(malformed.m.calls.some(({ op }) => op === 'fillText')).toBe(false);
+    }
+  });
+
+  it.each([2, 3, 4, 5, 6, 85, 86, 87, 88, 89])(
+    'rejects proven per-record point crossings for record %i, while tolerating truncated counts',
+    (type) => {
+      const selection = record(EMR.SELECTOBJECT, (w) => w.u32(0x80000007)); // BLACK_PEN
+      for (const count of [0x100000, 0x100001]) {
+        const header = record(type, (w) => w.i32(0).i32(0).i32(20).i32(20).u32(count));
+        const pointBytes = type >= 85 ? 4 : 8;
+        // Typed arrays and counting sinks keep actual production-ceiling tests
+        // independent of a million-point JS fixture or mock call log.
+        const full = new Uint8Array(header.length + count * pointBytes);
+        full.set(header);
+        new DataView(full.buffer).setUint32(4, full.length, true);
+        const m = makeRecordingCtx();
+        let commands = 0;
+        m.ctx.moveTo = m.ctx.lineTo = m.ctx.bezierCurveTo = () => { commands++; };
+        const run = (data: Uint8Array, select = selection) => playEmf(concat(emfHeader(), select, data), m.ctx, 100, 100);
+        if (count === 0x100000) {
+          expect(run(full)).toBe(true);
+          expect(commands).toBeGreaterThan(0);
+        } else {
+          const expected = expect.objectContaining({
+            code: 'ooxml-decoded-image-limit', metric: 'metafile-record-points', limit: 0x100000, observed: count,
+          });
+          expect(() => run(full)).toThrowError(expected);
+          // Drawing state must not hide a fully supplied oversized record.
+          expect(() => run(full, new Uint8Array(0))).toThrowError(expected);
+          const truncated = full.slice(0, full.length - pointBytes);
+          new DataView(truncated.buffer).setUint32(4, truncated.length, true);
+          expect(() => run(truncated)).not.toThrow();
+        }
+      }
+    },
+  );
+
+  it.each([7, 8, 90, 91])('rejects proven multi-poly ceilings for record %i only after validating its payload', (type) => {
+    const selection = record(EMR.SELECTOBJECT, (w) => w.u32(0x80000007)); // BLACK_PEN
+    for (const exceeded of ['points', 'polygons'] as const) {
+      for (const extra of [0, 1]) {
+        const polygons = exceeded === 'polygons' ? 0x10000 + extra : 1;
+        const points = exceeded === 'points' ? 0x200000 + extra : polygons * 2;
+        const prefix = record(type, (w) => w.i32(0).i32(0).i32(20).i32(20).u32(polygons).u32(points));
+        const pointBytes = type >= 90 ? 4 : 8;
+        const full = new Uint8Array(prefix.length + polygons * 4 + points * pointBytes);
+        full.set(prefix);
+        const view = new DataView(full.buffer);
+        view.setUint32(4, full.length, true);
+        for (let i = 0; i < polygons; i++) view.setUint32(prefix.length + i * 4, polygons === 1 ? points : 2, true);
+        const m = makeRecordingCtx();
+        let commands = 0;
+        m.ctx.moveTo = m.ctx.lineTo = m.ctx.closePath = () => { commands++; };
+        const run = (data: Uint8Array) => playEmf(concat(emfHeader(), selection, data, record(EMR.EOF, () => {})), m.ctx, 100, 100);
+        if (extra === 0) {
+          expect(run(full)).toBe(true);
+          expect(commands).toBe(points + (type === 8 || type === 91 ? polygons : 0));
+        } else {
+          const truncated = full.slice(0, full.length - pointBytes);
+          new DataView(truncated.buffer).setUint32(4, truncated.length, true);
+          expect(() => run(truncated)).not.toThrow();
+          expect(() => run(full)).toThrowError(expect.objectContaining({
+            code: 'ooxml-decoded-image-limit', metric: `metafile-record-${exceeded}`,
+            limit: exceeded === 'points' ? 0x200000 : 0x10000,
+            observed: exceeded === 'points' ? points : polygons,
+          }));
+          // A fully supplied but inconsistent count table is malformed, not a crossing.
+          view.setUint32(prefix.length, 0, true);
+          expect(() => run(full)).not.toThrow();
+        }
+      }
+    }
+  });
+
+  it.each([7, 8, 90, 91])('does not let empty polygons bypass the polygon ceiling for record %i', (type) => {
+    const polygons = (count: number, supplied = count) => {
+      const bytes = new Uint8Array(32 + supplied * 4);
+      const v = new DataView(bytes.buffer);
+      v.setUint32(0, type, true);
+      v.setUint32(4, bytes.length, true);
+      v.setUint32(24, count, true); // zero total points, zero per-polygon counts
+      return bytes;
+    };
+    const run = (data: Uint8Array) => playEmf(concat(emfHeader(), data), makeRecordingCtx().ctx, 100, 100);
+    expect(run(polygons(0x10000))).toBe(false);
+    expect(() => run(polygons(0x10001))).toThrowError(expect.objectContaining({
+      code: 'ooxml-decoded-image-limit', metric: 'metafile-record-polygons', limit: 0x10000, observed: 0x10001,
+    }));
+    expect(() => run(polygons(0x10001, 0x10000))).not.toThrow();
   });
 
   it('rejects a poly-polygon whose per-polygon counts exceed its declared total', () => {
@@ -1061,6 +1421,54 @@ describe('playEmf — picture frame mapping + path clip', () => {
 
     playEmf(file, m.ctx, 100, 100);
     expect(m.calls.filter((call) => call.op === 'fill')).toHaveLength(0);
+  });
+
+  it.each([76, 81, 93, 94])('bounds bitmap offsets to their containing record for record %i', (type) => {
+    const dib = new Writer().u32(40).i32(40000).i32(1).u16(1).u16(24)
+      .u32(0).u32(0).i32(0).i32(0).u32(0).u32(0).raw(0, 0, 0, 0).build();
+    const headerSize = type === 76 ? 100 : type === 81 ? 80 : 32;
+    const malformed = record(type, (w) => {
+      if (type === 76) {
+        for (let i = 0; i < 19; i++) w.i32(0); // through usageSrc
+      } else if (type === 81) {
+        for (let i = 0; i < 10; i++) w.i32(0); // through cySrc
+      } else w.u32(1).u32(0); // handle, usage
+      w.u32(headerSize + 8).u32(40).u32(headerSize + 48).u32(4); // following record's data
+      if (type === 81) w.u32(0).u32(0x00cc0020).i32(1).i32(1);
+    });
+    const m = makeRecordingCtx();
+    expect(playEmf(concat(
+      emfHeader(), malformed, record(0, (w) => { for (const byte of dib) w.raw(byte); }),
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000000)), record(EMR.BEGINPATH, () => {}),
+      record(43, (w) => w.i32(0).i32(0).i32(20).i32(20)),
+      record(EMR.ENDPATH, () => {}), record(EMR.FILLPATH, () => {}), record(EMR.EOF, () => {}),
+    ), m.ctx, 100, 100, { maxPathCommands: 5 } as Parameters<typeof playEmf>[4])).toBe(true);
+    expect(m.calls.filter(({ op }) => op === 'fill')).toHaveLength(1);
+  });
+
+  it('propagates DIB budget errors through bitmap and pattern-brush playback catches', () => {
+    const dib = new Writer().u32(40).i32(40000).i32(1).u16(1).u16(24)
+      .u32(0).u32(0).i32(0).i32(0).u32(0).u32(0).build();
+    const completeDib = new Uint8Array(40 + 120000);
+    completeDib.set(dib);
+    const brush = record(EMR.CREATEDIBPATTERNBRUSHPT, (w) => {
+      w.u32(1).u32(0).u32(32).u32(40).u32(72).u32(120000);
+      for (const byte of completeDib) w.raw(byte);
+    });
+    const bitmap = record(81, (w) => {
+      for (let i = 0; i < 10; i++) w.i32(0); // bounds and destination/source fields
+      w.u32(80).u32(40).u32(120).u32(120000).u32(0).u32(0x00cc0020).i32(1).i32(1);
+      for (const byte of completeDib) w.raw(byte);
+    });
+    for (const drawing of [brush, bitmap]) {
+      const m = makeRecordingCtx();
+      expect(() => playEmf(concat(emfHeader(), drawing, record(EMR.EOF, () => {})), m.ctx, 100, 100))
+        .toThrowError(expect.objectContaining({
+          code: 'ooxml-decoded-image-limit', metric: 'image-dimension', limit: MAX_RASTER_DIMENSION, observed: 40000,
+        }));
+      expect(m.calls.filter((c) => c.op === 'save').length)
+        .toBe(m.calls.filter((c) => c.op === 'restore').length);
+    }
   });
 
   it('decodes a 4bpp DIB pattern brush (MATLAB bar-chart fill colour)', () => {
@@ -1193,26 +1601,950 @@ describe('renderEmfToBitmap', () => {
       ),
       record(EMR.EOF, () => {}),
     );
-    const bmp = await renderEmfToBitmap(file, 64, 48);
+    const { bitmap: bmp, unsupported } = await renderEmfToBitmap(file, 64, 48);
     expect(bmp).not.toBeNull();
     expect(bmp?.width).toBe(64);
     expect(bmp?.height).toBe(48);
+    expect(unsupported).toEqual([]);
   });
 
-  it('returns null for non-EMF bytes', async () => {
-    const bmp = await renderEmfToBitmap(new Uint8Array([1, 2, 3, 4]), 10, 10);
-    expect(bmp).toBeNull();
+  it('propagates an unmapped symbol-font gap through bitmap decode and strict refusal', async () => {
+    const file = symbolTextFile('MT Extra', 2, '\uf041');
+    const blob = () => new Blob([file as Uint8Array<ArrayBuffer>]);
+    const partial = await decodeRasterOrMetafile(blob());
+    expect(getIncompleteMetafileReport(partial)).toEqual({
+      format: 'emf', unsupported: ['EMR_EXTTEXTOUTW (unsupported symbol encoding)'],
+    });
+    await expect(decodeRasterOrMetafile(blob(), { incompleteMetafile: 'reject' })).rejects.toMatchObject({
+      code: 'ooxml-incomplete-metafile', format: 'emf',
+    });
   });
 
-  it('returns null when nothing draws (header + EOF only)', async () => {
+  it('returns a null bitmap for non-EMF bytes', async () => {
+    expect(await renderEmfToBitmap(new Uint8Array([1, 2, 3, 4]), 10, 10)).toEqual({ bitmap: null, unsupported: [] });
+  });
+
+  it('returns a null bitmap when nothing draws (header + EOF only)', async () => {
     const file = concat(emfHeader(0, 0, 10, 10), record(EMR.EOF, () => {}));
-    const bmp = await renderEmfToBitmap(file, 16, 16);
-    expect(bmp).toBeNull();
+    expect(await renderEmfToBitmap(file, 16, 16)).toEqual({ bitmap: null, unsupported: [] });
   });
 
-  it('returns null for a non-positive target size', async () => {
+  it('returns a null bitmap for a non-positive target size', async () => {
     const file = concat(emfHeader(0, 0, 10, 10), record(EMR.EOF, () => {}));
-    expect(await renderEmfToBitmap(file, 0, 10)).toBeNull();
-    expect(await renderEmfToBitmap(file, 10, 0)).toBeNull();
+    expect((await renderEmfToBitmap(file, 0, 10)).bitmap).toBeNull();
+    expect((await renderEmfToBitmap(file, 10, 0)).bitmap).toBeNull();
+  });
+
+  // A drawn polyline followed by POLYTEXTOUTW, a text record the player does
+  // not implement: the partial picture the player has always drawn.
+  const partial = () => concat(
+    emfHeader(0, 0, 100, 100),
+    record(EMR.CREATEPEN, (w) => w.u32(1).u32(0).i32(1).i32(0).u32(0)),
+    record(EMR.SELECTOBJECT, (w) => w.u32(1)),
+    record(EMR.POLYLINE16, (w) => w.i32(0).i32(0).i32(100).i32(100).u32(2).i16(0).i16(0).i16(50).i16(50)),
+    record(97, (w) => w.u32(0)),
+    record(EMR.EOF, () => {}),
+  );
+
+  it('returns the unsupported content with the bitmap through the normal loading path', async () => {
+    const { bitmap, unsupported } = await renderEmfToBitmap(partial(), 64, 48);
+    expect(bitmap).not.toBeNull();
+    expect(unsupported).toEqual(['EMR_POLYTEXTOUTW']);
+  });
+
+  it('decodeRasterOrMetafile keeps the partial drawing with its report by default, and rejects it on request', async () => {
+    const blob = () => new Blob([partial() as Uint8Array<ArrayBuffer>], { type: 'image/x-emf' });
+    const drawn = await decodeRasterOrMetafile(blob(), { widthPt: 48, heightPt: 36 });
+    expect(drawn).not.toBeNull();
+    expect(getIncompleteMetafileReport(drawn)).toEqual({ format: 'emf', unsupported: ['EMR_POLYTEXTOUTW'] });
+
+    const rejected = await decodeRasterOrMetafile(blob(), { widthPt: 48, heightPt: 36, incompleteMetafile: 'reject' })
+      .then(() => undefined, (error: unknown) => error);
+    expect(isOoxmlIncompleteMetafileError(rejected)).toBe(true);
+    expect(rejected).toMatchObject({ code: 'ooxml-incomplete-metafile', format: 'emf', unsupported: ['EMR_POLYTEXTOUTW'] });
+
+    // A complete metafile carries no report under either policy.
+    const complete = concat(
+      emfHeader(0, 0, 100, 100),
+      record(EMR.CREATEPEN, (w) => w.u32(1).u32(0).i32(1).i32(0).u32(0)),
+      record(EMR.SELECTOBJECT, (w) => w.u32(1)),
+      record(EMR.POLYLINE16, (w) => w.i32(0).i32(0).i32(100).i32(100).u32(2).i16(0).i16(0).i16(50).i16(50)),
+      record(EMR.EOF, () => {}),
+    );
+    const strict = await decodeRasterOrMetafile(new Blob([complete as Uint8Array<ArrayBuffer>]), { widthPt: 48, heightPt: 36, incompleteMetafile: 'reject' });
+    expect(strict).not.toBeNull();
+    expect(getIncompleteMetafileReport(strict)).toBeUndefined();
+  });
+
+  it('keeps the incomplete report on a bitmap derived by a pixel effect', async () => {
+    const fetchImage = async () => new Blob([partial() as Uint8Array<ArrayBuffer>], { type: 'image/x-emf' });
+    const offscreenFactory = (w: number, h: number) => ({
+      width: w,
+      height: h,
+      getContext: () => ({
+        drawImage() {},
+        getImageData: () => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+        putImageData() {},
+      }),
+    }) as unknown as OffscreenCanvas;
+    const opts = { widthPt: 48, heightPt: 36, offscreenFactory };
+    const base = await getCachedBitmapByPath('p.emf', 'image/x-emf', fetchImage, opts);
+    const effects = { effects: [{ type: 'grayscale' as const }] };
+    const derived = await getCachedDuotoneBitmapByPath('p.emf', 'image/x-emf', effects, fetchImage, opts);
+    expect(derived).not.toBe(base);
+    expect(getIncompleteMetafileReport(derived)).toEqual({ format: 'emf', unsupported: ['EMR_POLYTEXTOUTW'] });
+    // A later hit on the derived cache entry carries it as well.
+    const again = await getCachedDuotoneBitmapByPath('p.emf', 'image/x-emf', effects, fetchImage, opts);
+    expect(getIncompleteMetafileReport(again)?.unsupported).toEqual(['EMR_POLYTEXTOUTW']);
+    dropBitmapCacheByPath(fetchImage);
+  });
+
+  it('never serves a cached partial picture to a strict request', async () => {
+    const fetchImage = vi.fn(async () => new Blob([partial() as Uint8Array<ArrayBuffer>], { type: 'image/x-emf' }));
+    const opts = { widthPt: 48, heightPt: 36 };
+    const drawn = await getCachedBitmapByPath('word/media/partial.emf', 'image/x-emf', fetchImage, opts);
+    expect(getIncompleteMetafileReport(drawn)?.unsupported).toEqual(['EMR_POLYTEXTOUTW']);
+    await expect(getCachedBitmapByPath('word/media/partial.emf', 'image/x-emf', fetchImage, {
+      ...opts,
+      incompleteMetafile: 'reject',
+    })).rejects.toMatchObject({ code: 'ooxml-incomplete-metafile' });
+    dropBitmapCacheByPath(fetchImage);
+  });
+});
+
+// ── arcs, pies, chords, rounded rectangles and clip records ────────────────
+
+describe('playEmf — elliptical arc records ([MS-EMF] ARC/ARCTO/CHORD/PIE/ANGLEARC/ROUNDRECT)', () => {
+  const ARC = 45;
+  const CHORD = 46;
+  const PIE = 47;
+  const ARCTO = 55;
+  const ANGLEARC = 41;
+  const ROUNDRECT = 44;
+  const SETARCDIRECTION = 57;
+  const MOVETOEX = 27;
+  const LINETO = 54;
+  const stock = (id: number) => record(EMR.SELECTOBJECT, (w) => w.u32(0x80000000 + id));
+  const radial = (type: number, box: number[], start: number[], end: number[]) =>
+    record(type, (w) => {
+      for (const v of [...box, ...start, ...end]) w.i32(v);
+    });
+  function run(records: Uint8Array[], onUnsupported?: (r: readonly string[]) => void) {
+    const m = makeRecordingCtx();
+    const drew = playEmf(concat(emfHeader(), ...records, record(EMR.EOF, () => {})), m.ctx, 100, 100, {
+      onUnsupported: onUnsupported ?? (() => {}),
+    });
+    return { ...m, drew };
+  }
+  const ops = (m: MockCtx) => m.calls.map((c) => c.op);
+  const last = (m: MockCtx, op: string) => m.calls.filter((c) => c.op === op).at(-1)?.args;
+  const close = (actual: (number | string)[] | undefined, expected: number[]) => {
+    expect(actual).toHaveLength(expected.length);
+    expected.forEach((v, i) => expect(actual?.[i] as number).toBeCloseTo(v, 6));
+  };
+
+  it('PIE draws centre → start radial → counterclockwise arc → closed, filled and stroked', () => {
+    // Start radial points right, end radial up: counterclockwise (the default)
+    // is the short quarter from (100,50) up to (50,0) on a y-down surface.
+    const m = run([stock(4), stock(7), radial(PIE, [0, 0, 100, 100], [100, 50], [50, 0])]);
+    expect(ops(m)).toEqual(['save', 'beginPath', 'moveTo', 'lineTo', 'bezierCurveTo', 'closePath', 'fill', 'stroke', 'restore']);
+    close(last(m, 'moveTo'), [50, 50]);
+    close(last(m, 'lineTo'), [100, 50]);
+    const k = (4 / 3) * Math.tan(Math.PI / 8) * 50;
+    close(last(m, 'bezierCurveTo'), [100, 50 - k, 50 + k, 0, 50, 0]);
+    expect(m.styles.fill).toEqual(['#000000']);
+    expect(m.drew).toBe(true);
+  });
+
+  it('SETARCDIRECTION AD_CLOCKWISE takes the long way round, and SAVEDC scopes it', () => {
+    const m = run([
+      stock(4),
+      record(EMR.SAVEDC, () => {}),
+      record(SETARCDIRECTION, (w) => w.u32(2)),
+      radial(PIE, [0, 0, 100, 100], [100, 50], [50, 0]),
+      record(EMR.RESTOREDC, (w) => w.i32(-1)),
+      radial(PIE, [0, 0, 100, 100], [100, 50], [50, 0]),
+    ]);
+    const curves = m.calls.filter((c) => c.op === 'bezierCurveTo');
+    expect(curves).toHaveLength(4); // three quarters clockwise, then one counterclockwise
+    close(curves[2].args.slice(4), [50, 0]);
+    close(curves[3].args.slice(4), [50, 0]);
+  });
+
+  it('ARC strokes only and leaves the current position; ARCTO lines from it and moves it', () => {
+    const m = run([
+      stock(7),
+      record(MOVETOEX, (w) => w.i32(10).i32(90)),
+      radial(ARC, [0, 0, 100, 100], [100, 50], [50, 0]),
+      record(LINETO, (w) => w.i32(20).i32(90)),
+      radial(ARCTO, [0, 0, 100, 100], [100, 50], [50, 0]),
+      record(LINETO, (w) => w.i32(0).i32(0)),
+    ]);
+    expect(m.styles.fill).toEqual([]);
+    const moves = m.calls.filter((c) => c.op === 'moveTo').map((c) => c.args);
+    // ARC starts its own figure; LINETO still starts at (10,90); ARCTO starts at
+    // the current position (20,90) and the final LINETO at the arc end (50,0).
+    expect(moves).toEqual([[100, 50], [10, 90], [20, 90], [50, 0]]);
+  });
+
+  it('CHORD closes the arc with a straight chord and fills it', () => {
+    const m = run([stock(4), radial(CHORD, [0, 0, 100, 100], [100, 50], [50, 0])]);
+    expect(ops(m)).toEqual(['save', 'beginPath', 'moveTo', 'bezierCurveTo', 'closePath', 'fill', 'restore']);
+  });
+
+  it('equal radials draw the complete ellipse', () => {
+    const m = run([stock(7), radial(ARC, [0, 0, 100, 50], [100, 25], [100, 25])]);
+    const curves = m.calls.filter((c) => c.op === 'bezierCurveTo');
+    expect(curves).toHaveLength(4);
+    close(curves[3].args.slice(4), [100, 25]);
+  });
+
+  it('maps arc control points through the world transform (rotated, not axis-aligned)', () => {
+    // 90° rotation about the origin, then translate back on-canvas.
+    const m = run([
+      stock(4),
+      record(EMR.SETWORLDTRANSFORM, (w) => w.f32(0).f32(1).f32(-1).f32(0).f32(100).f32(0)),
+      radial(PIE, [0, 0, 100, 100], [100, 50], [50, 0]),
+    ]);
+    // Logical (100,50) → page (50,100); logical (50,0) → page (100,50).
+    close(last(m, 'lineTo'), [50, 100]);
+    close(last(m, 'bezierCurveTo')?.slice(4), [100, 50]);
+  });
+
+  it('ANGLEARC lines from the current position and sweeps counterclockwise from the x-axis', () => {
+    const m = run([
+      stock(7),
+      record(MOVETOEX, (w) => w.i32(0).i32(50)),
+      record(ANGLEARC, (w) => w.i32(50).i32(50).u32(50).f32(0).f32(90)),
+      record(LINETO, (w) => w.i32(0).i32(0)),
+    ]);
+    close(m.calls.find((c) => c.op === 'lineTo')?.args, [100, 50]);
+    close(m.calls.find((c) => c.op === 'bezierCurveTo')?.args.slice(4), [50, 0]);
+    // The current position moved to the arc end.
+    close(m.calls.filter((c) => c.op === 'moveTo')[1].args, [50, 0]);
+  });
+
+  it('ROUNDRECT fills a closed outline with four elliptical corners', () => {
+    const m = run([stock(4), record(ROUNDRECT, (w) => w.i32(0).i32(0).i32(100).i32(60).i32(20).i32(10))]);
+    expect(m.calls.filter((c) => c.op === 'bezierCurveTo')).toHaveLength(4);
+    expect(m.calls.filter((c) => c.op === 'lineTo')).toHaveLength(3);
+    expect(m.styles.fill).toEqual(['#000000']);
+  });
+
+  it('builds pies and ellipses inside path brackets for a later FILLPATH', () => {
+    const m = run([
+      stock(4),
+      record(59, () => {}),
+      radial(PIE, [0, 0, 100, 100], [100, 50], [50, 0]),
+      record(42, (w) => w.i32(0).i32(0).i32(20).i32(20)),
+      record(60, () => {}),
+      record(62, (w) => w.i32(0).i32(0).i32(100).i32(100)),
+    ]);
+    expect(m.calls.filter((c) => c.op === 'bezierCurveTo')).toHaveLength(5);
+    expect(m.styles.fill).toEqual(['#000000']);
+  });
+
+  it('reports instead of guessing the direction when the mapping reflects an axis', () => {
+    const reported: string[] = [];
+    const m = run(
+      [
+        stock(4),
+        record(EMR.SETWORLDTRANSFORM, (w) => w.f32(1).f32(0).f32(0).f32(-1).f32(0).f32(100)),
+        radial(PIE, [0, 0, 100, 100], [100, 50], [50, 0]),
+      ],
+      (records) => reported.push(...records),
+    );
+    expect(m.calls.filter((c) => c.op === 'fill')).toHaveLength(0);
+    expect(reported).toEqual(['EMR_PIE (reflected mapping)']);
+  });
+});
+
+describe('playEmf — clip rectangles and regions', () => {
+  const INTERSECTCLIPRECT = 30;
+  const EXCLUDECLIPRECT = 29;
+  const EXTSELECTCLIPRGN = 75;
+  const rect = (type: number, l: number, t: number, r: number, b: number) =>
+    record(type, (w) => w.i32(l).i32(t).i32(r).i32(b));
+  function run(records: Uint8Array[], onUnsupported: (r: readonly string[]) => void = () => {}) {
+    const m = makeRecordingCtx();
+    playEmf(concat(emfHeader(), ...records, record(EMR.EOF, () => {})), m.ctx, 100, 100, { onUnsupported });
+    return m;
+  }
+
+  it('INTERSECTCLIPRECT clips to the rectangle; EXCLUDECLIPRECT clips to its complement', () => {
+    const m = run([rect(INTERSECTCLIPRECT, 10, 10, 50, 50), rect(EXCLUDECLIPRECT, 20, 20, 30, 30)]);
+    expect(m.calls.filter((c) => c.op === 'clip').map((c) => c.args)).toEqual([['nonzero'], ['evenodd']]);
+  });
+
+  it('scopes clips to SAVEDC/RESTOREDC and balances every canvas save', () => {
+    const m = run([record(EMR.SAVEDC, () => {}), rect(INTERSECTCLIPRECT, 10, 10, 50, 50), record(EMR.RESTOREDC, (w) => w.i32(-1))]);
+    const saves = m.calls.filter((c) => c.op === 'save').length;
+    expect(saves).toBe(2);
+    expect(m.calls.filter((c) => c.op === 'restore').length).toBe(saves);
+    // An unmatched SAVEDC is also unwound at the end of playback.
+    const open = run([record(EMR.SAVEDC, () => {}), rect(INTERSECTCLIPRECT, 10, 10, 50, 50)]);
+    expect(open.calls.filter((c) => c.op === 'restore').length).toBe(2);
+  });
+
+  it('EXTSELECTCLIPRGN RGN_COPY with no region resets a clip set at the same level', () => {
+    const m = run([rect(INTERSECTCLIPRECT, 10, 10, 50, 50), record(EXTSELECTCLIPRGN, (w) => w.u32(0).u32(5))]);
+    expect(m.calls.map((c) => c.op).slice(-4)).toEqual(['clip', 'restore', 'save', 'restore']);
+  });
+
+  it('reports a reset that would have to drop a clip inherited from an outer level', () => {
+    const reported: string[] = [];
+    run(
+      [rect(INTERSECTCLIPRECT, 10, 10, 50, 50), record(EMR.SAVEDC, () => {}), record(EXTSELECTCLIPRGN, (w) => w.u32(0).u32(5))],
+      (r) => reported.push(...r),
+    );
+    expect(reported).toEqual(['EMR_EXTSELECTCLIPRGN (reset of an inherited clip)']);
+  });
+
+  it('EXTSELECTCLIPRGN intersects device-unit region rectangles, and subtracts them for RGN_DIFF', () => {
+    const region = (mode: number, rects: number[][]) =>
+      record(EXTSELECTCLIPRGN, (w) => {
+        w.u32(32 + rects.length * 16).u32(mode);
+        w.u32(32).u32(1).u32(rects.length).u32(rects.length * 16).i32(0).i32(0).i32(100).i32(100);
+        for (const r of rects) for (const v of r) w.i32(v);
+      });
+    const m = run([region(1, [[0, 0, 10, 10], [20, 0, 30, 10]]), region(4, [[0, 0, 5, 5], [2, 2, 8, 8]])]);
+    expect(m.calls.filter((c) => c.op === 'clip').map((c) => c.args)).toEqual([['nonzero'], ['evenodd'], ['evenodd']]);
+    const reported: string[] = [];
+    run([region(2, [[0, 0, 10, 10]])], (r) => reported.push(...r));
+    expect(reported).toEqual(['EMR_EXTSELECTCLIPRGN (mode 2)']);
+  });
+});
+
+describe('playEmf — clip records inside an open path bracket ([MS-EMF] 2.3.2, 2.3.10)', () => {
+  const INTERSECTCLIPRECT = 30;
+  const EXTSELECTCLIPRGN = 75;
+  afterEach(() => vi.unstubAllGlobals());
+  const bracket = (clip: Uint8Array) => [
+    record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)),
+    record(EMR.BEGINPATH, () => {}),
+    record(EMR.POLYGON16, (w) => w.i32(0).i32(0).i32(10).i32(10).u32(3).i16(0).i16(0).i16(40).i16(0).i16(0).i16(40)),
+    clip,
+    record(EMR.ENDPATH, () => {}),
+    record(EMR.FILLPATH, (w) => w.i32(0).i32(0).i32(100).i32(100)),
+  ];
+  function run(records: Uint8Array[]) {
+    const m = makeRecordingCtx();
+    const reported: string[] = [];
+    playEmf(concat(emfHeader(), ...records, record(EMR.EOF, () => {})), m.ctx, 100, 100, {
+      onUnsupported: (r) => reported.push(...r),
+    });
+    return { ...m, reported };
+  }
+  /** The ops from the first clip on: the clip region, then the DC path traced
+   *  for FILLPATH. */
+  const fromClip = (m: ReturnType<typeof run>) => {
+    const ops = m.calls.map((c) => c.op);
+    return ops.slice(ops.indexOf('clip') - 5, ops.indexOf('fill') + 1);
+  };
+
+  it('clips at once and still fills the bracket figures under that clip', () => {
+    const m = run(bracket(record(INTERSECTCLIPRECT, (w) => w.i32(10).i32(10).i32(50).i32(50))));
+    expect(fromClip(m)).toEqual([
+      'moveTo', 'lineTo', 'lineTo', 'lineTo', 'closePath', 'clip', // the clip rectangle
+      'beginPath', 'moveTo', 'lineTo', 'lineTo', 'closePath', 'fill', // the bracket's polygon
+    ]);
+    expect(m.calls.find((c) => c.op === 'clip')?.args).toEqual(['nonzero']);
+    expect(m.styles.fill).toEqual(['#000000']);
+    expect(m.reported).toEqual([]);
+  });
+
+  it('applies region data (EXTSELECTCLIPRGN) inside a bracket the same way', () => {
+    const m = run(bracket(record(EXTSELECTCLIPRGN, (w) => {
+      w.u32(48).u32(1);
+      w.u32(32).u32(1).u32(1).u32(16).i32(0).i32(0).i32(100).i32(100);
+      w.i32(0).i32(0).i32(20).i32(20);
+    })));
+    expect(fromClip(m).slice(-6)).toEqual(['beginPath', 'moveTo', 'lineTo', 'lineTo', 'closePath', 'fill']);
+    expect(m.styles.fill).toEqual(['#000000']);
+  });
+
+  it('keeps a closed path across a clip record until FILLPATH consumes it', () => {
+    // BEGINPATH, RECTANGLE, ENDPATH, then INTERSECTCLIPRECT before FILLPATH.
+    const m = run([
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)),
+      record(EMR.BEGINPATH, () => {}),
+      record(43, (w) => w.i32(10).i32(10).i32(20).i32(20)),
+      record(EMR.ENDPATH, () => {}),
+      record(INTERSECTCLIPRECT, (w) => w.i32(0).i32(0).i32(90).i32(90)),
+      record(EMR.FILLPATH, (w) => w.i32(0).i32(0).i32(100).i32(100)),
+    ]);
+    const moves = m.calls.filter((c) => c.op === 'moveTo').map((c) => c.args);
+    expect(moves).toEqual([[0, 0], [10, 10]]); // clip region, then the held rectangle
+    expect(fromClip(m).slice(-7)).toEqual(['beginPath', 'moveTo', 'lineTo', 'lineTo', 'lineTo', 'closePath', 'fill']);
+    expect(m.reported).toEqual([]);
+  });
+});
+
+describe('playEmf — the device context path ([MS-EMF] 2.3.10, 2.3.11)', () => {
+  const RECTANGLE = 43;
+  const ABORTPATH = 68;
+  const rect = (l: number, t: number, r: number, b: number) => record(RECTANGLE, (w) => w.i32(l).i32(t).i32(r).i32(b));
+  const fillPath = record(EMR.FILLPATH, (w) => w.i32(0).i32(0).i32(100).i32(100));
+  const saveDc = record(EMR.SAVEDC, () => {});
+  const restoreDc = record(EMR.RESTOREDC, (w) => w.i32(-1));
+  /** BEGINPATH, rectangle A (10..20), ENDPATH: A is held in the DC. */
+  const holdA = [record(EMR.BEGINPATH, () => {}), rect(10, 10, 20, 20), record(EMR.ENDPATH, () => {})];
+  const A = [['M', 10, 10], ['L', 20, 10], ['L', 20, 20], ['L', 10, 20], ['Z']];
+  const B = [['M', 50, 50], ['L', 60, 50], ['L', 60, 60], ['L', 50, 60], ['Z']];
+
+  /** Each fill's geometry, and each clip's. `maxPathCommands` lowers the
+   *  path budget; `reported` then collects what playback left out. */
+  function play(records: Uint8Array[], maxPathCommands?: number) {
+    const m = makeRecordingCtx();
+    let current: unknown[] = [];
+    const fills: unknown[][] = [];
+    const clips: unknown[][] = [];
+    m.ctx.beginPath = () => { current = []; };
+    m.ctx.moveTo = (...a) => { current.push(['M', ...a]); };
+    m.ctx.lineTo = (...a) => { current.push(['L', ...a]); };
+    m.ctx.closePath = () => { current.push(['Z']); };
+    m.ctx.fill = () => { fills.push([...current]); };
+    m.ctx.clip = () => { clips.push([...current]); };
+    const unsupported: string[] = [];
+    playEmf(concat(
+      emfHeader(),
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)), // BLACK_BRUSH
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000007)), // BLACK_PEN
+      ...records,
+      record(EMR.EOF, () => {}),
+    ), m.ctx, 100, 100, {
+      onUnsupported: (r) => unsupported.push(...r),
+      ...(maxPathCommands ? { maxPathCommands } : {}),
+    } as Parameters<typeof playEmf>[4]);
+    if (!maxPathCommands) expect(unsupported).toEqual([]);
+    return { fills: fills.filter((p) => p.length), clips, reported: unsupported };
+  }
+
+  it('keeps the held path across ordinary drawing outside the bracket', () => {
+    // RECTANGLE and LINETO after ENDPATH paint at once and leave A held.
+    expect(play([...holdA, rect(50, 50, 60, 60), fillPath]).fills).toEqual([B, A]);
+    expect(play([...holdA, record(EMR.LINETO, (w) => w.i32(90).i32(90)), fillPath]).fills).toEqual([A]);
+  });
+
+  it('consumes the path once, and paints nothing after ABORTPATH', () => {
+    expect(play([...holdA, fillPath, fillPath]).fills).toEqual([A]);
+    expect(play([...holdA, record(ABORTPATH, () => {}), rect(50, 50, 60, 60), fillPath]).fills).toEqual([B]);
+  });
+
+  it('fails FILLPATH and SELECTCLIPPATH while the bracket is open, leaving it open', () => {
+    const r = play([
+      record(EMR.BEGINPATH, () => {}), rect(10, 10, 20, 20),
+      fillPath, record(EMR.SELECTCLIPPATH, (w) => w.u32(1)),
+      rect(10, 10, 20, 20), record(EMR.ENDPATH, () => {}), fillPath,
+    ]);
+    expect(r.clips).toEqual([]);
+    expect(r.fills).toEqual([[...A, ...A]]);
+    // With no path at all SELECTCLIPPATH changes no clip either.
+    expect(play([rect(50, 50, 60, 60), record(EMR.SELECTCLIPPATH, (w) => w.u32(1))]).clips).toEqual([]);
+  });
+
+  it('saves and restores the path with the DC', () => {
+    // A held, saved twice, aborted, restored twice: A is back and fills.
+    expect(play([...holdA, saveDc, saveDc, record(ABORTPATH, () => {}), restoreDc, restoreDc, fillPath]).fills).toEqual([A]);
+    // A bracket saved while open is open again after RESTOREDC (Wine gdi32
+    // path tests), so the figures drawn before ENDPATH join the path.
+    expect(play([
+      record(EMR.BEGINPATH, () => {}), rect(10, 10, 20, 20), saveDc,
+      record(EMR.ENDPATH, () => {}), fillPath, restoreDc,
+      fillPath, rect(50, 50, 60, 60), record(EMR.ENDPATH, () => {}), fillPath,
+    ]).fills).toEqual([A, [...A, ...B]]);
+    // A path begun after SAVEDC goes away with RESTOREDC.
+    expect(play([saveDc, ...holdA, restoreDc, fillPath]).fills).toEqual([]);
+  });
+
+  // A RECTANGLE is 5 path commands; the budget covers the current path plus
+  // every prefix a SAVEDC snapshot keeps, counting a shared buffer once.
+  const hold = (l: number) => [record(EMR.BEGINPATH, () => {}), rect(l, l, l + 10, l + 10), record(EMR.ENDPATH, () => {})];
+
+  it('bounds the paths kept by repeated SAVEDC and reports the one past the budget', () => {
+    // Two saved 5-command paths retain 10 of 12; a third bracket would hold 15.
+    expect(() => play([
+      ...hold(10), saveDc, ...hold(50), saveDc, ...hold(70),
+      fillPath, restoreDc, fillPath, restoreDc, fillPath,
+    ], 12)).toThrow(expect.objectContaining({
+      code: 'ooxml-decoded-image-limit', metric: 'metafile-path-commands',
+      limit: 12, observed: 15,
+    }));
+    // Snapshots of one buffer are one retained copy: A saved three times
+    // still leaves room for a second 5-command path.
+    const shared = play([...holdA, saveDc, saveDc, saveDc, ...hold(50), fillPath, restoreDc, fillPath], 12);
+    expect(shared.reported).toEqual([]);
+    expect(shared.fills).toEqual([B, A]);
+  });
+
+  it('keeps only the saved prefix, so an empty snapshot retains nothing', () => {
+    // Each round saves an empty path, then appends 10 commands and aborts.
+    // Those tails are unreachable; were they kept, the last path (10 of 12)
+    // would exceed the budget.
+    const round = [record(EMR.BEGINPATH, () => {}), saveDc, rect(0, 0, 5, 5), rect(0, 0, 6, 6), record(ABORTPATH, () => {})];
+    const r = play([
+      ...round, ...round, ...round,
+      record(EMR.BEGINPATH, () => {}), rect(10, 10, 20, 20), rect(50, 50, 60, 60), record(EMR.ENDPATH, () => {}), fillPath,
+    ], 12);
+    expect(r.reported).toEqual([]);
+    expect(r.fills).toEqual([[...A, ...B]]);
+    // A snapshot of an open bracket keeps its prefix: restoring it drops the
+    // commands appended after SAVEDC, and they no longer count.
+    const prefix = play([
+      record(EMR.BEGINPATH, () => {}), rect(10, 10, 20, 20), saveDc, rect(50, 50, 60, 60), restoreDc,
+      rect(50, 50, 60, 60), record(EMR.ENDPATH, () => {}), fillPath,
+    ], 10);
+    expect(prefix.reported).toEqual([]);
+    expect(prefix.fills).toEqual([[...A, ...B]]);
+  });
+});
+
+describe('playEmf — explicit report of records it cannot draw', () => {
+  function run(records: Uint8Array[]) {
+    const m = makeRecordingCtx();
+    const reported: string[] = [];
+    playEmf(concat(emfHeader(), ...records, record(EMR.EOF, () => {})), m.ctx, 100, 100, {
+      onUnsupported: (r) => reported.push(...r),
+    });
+    return { ...m, reported };
+  }
+
+  it('reports each unsupported drawing record once per playback, and nothing for state records', () => {
+    const polyText = record(97, (w) => w.u32(0));
+    const m = run([polyText, polyText, record(21 /* SETROP2-class state */, (w) => w.u32(13))]);
+    expect(m.reported).toEqual(['EMR_POLYTEXTOUTW']);
+  });
+
+  it('has no default report: without a callback nothing reaches the console', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const file = concat(emfHeader(), record(118, (w) => w.u32(0)), record(EMR.EOF, () => {}));
+      playEmf(file, makeRecordingCtx().ctx, 10, 10);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('keeps the other figures of a path bracket around an unsupported record, as before it was reported', () => {
+    const polygon = record(EMR.POLYGON16, (w) => w.i32(0).i32(0).i32(10).i32(10).u32(3).i16(0).i16(0).i16(40).i16(0).i16(0).i16(40));
+    const m = run([
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)),
+      record(EMR.BEGINPATH, () => {}),
+      polygon,
+      record(97, (w) => w.u32(0)), // POLYTEXTOUTW
+      record(EMR.ENDPATH, () => {}),
+      record(66 /* WIDENPATH */, () => {}),
+      record(EMR.FILLPATH, (w) => w.i32(0).i32(0).i32(100).i32(100)),
+    ]);
+    expect(m.styles.fill).toEqual(['#000000']);
+    expect(m.calls.filter((c) => c.op === 'lineTo')).toHaveLength(2);
+    expect(m.reported).toEqual(['EMR_POLYTEXTOUTW', 'EMR_WIDENPATH']);
+  });
+
+  it('draws EXTTEXTOUTW inside a path bracket directly and reports the missing glyph path', () => {
+    const font = record(EMR.EXTCREATEFONTINDIRECTW, (w) => {
+      w.u32(1).i32(-12).i32(0).i32(0).i32(0).i32(400).raw(0, 0, 0, 0).raw(0, 0, 0, 0);
+      w.utf16('Arial');
+      for (let i = 5; i < 32; i++) w.u16(0);
+    });
+    const text = record(EMR.EXTTEXTOUTW, (w) => {
+      w.i32(0).i32(0).i32(100).i32(100).u32(1).f32(1).f32(1); // rclBounds, iGraphicsMode, exScale, eyScale
+      w.i32(10).i32(20).u32(1).u32(76).u32(0).i32(0).i32(0).i32(0).i32(0).u32(0); // EMRTEXT
+      w.utf16('A');
+    });
+    const m = run([font, record(EMR.SELECTOBJECT, (w) => w.u32(1)), record(EMR.BEGINPATH, () => {}), text, record(EMR.ENDPATH, () => {})]);
+    expect(m.styles.text).toHaveLength(1);
+    expect(m.reported).toEqual(['EMR_EXTTEXTOUTW (glyph path)']);
+  });
+
+  it('reports a truncated record stream and a malformed record, keeping what drew', () => {
+    const polygon = record(EMR.POLYGON16, (w) => w.i32(0).i32(0).i32(10).i32(10).u32(3).i16(0).i16(0).i16(40).i16(0).i16(0).i16(40));
+    const truncated = concat(emfHeader(), record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)), polygon, new Uint8Array([86, 0, 0, 0, 64, 0, 0, 0]));
+    const m = makeRecordingCtx();
+    const reported: string[] = [];
+    expect(playEmf(truncated, m.ctx, 100, 100, { onUnsupported: (r) => reported.push(...r) })).toBe(true);
+    expect(reported).toEqual(['EMF record stream (truncated or invalid record size)']);
+    // SETWORLDTRANSFORM without its XFORM is malformed.
+    expect(run([record(EMR.SETWORLDTRANSFORM, (w) => w.u32(0))]).reported).toEqual(['EMF record 35 (malformed)']);
+  });
+
+  it('paints PATCOPY/BLACKNESS pattern blits and reports other brush-only raster operations', () => {
+    const bitblt = (rop: number) =>
+      record(76, (w) => {
+        w.i32(0).i32(0).i32(10).i32(10); // rclBounds
+        w.i32(10).i32(20).i32(30).i32(40).u32(rop).i32(0).i32(0);
+        for (let i = 0; i < 6; i++) w.f32(i === 0 || i === 3 ? 1 : 0);
+        w.u32(0).u32(0).u32(0).u32(0).u32(0).u32(0);
+      });
+    const m = run([record(EMR.SELECTOBJECT, (w) => w.u32(0x80000000 + 2)), bitblt(0x00f00021), bitblt(0x00000042), bitblt(0x005a0049)]);
+    expect(m.styles.fill).toEqual(['#808080', '#000000']);
+    expect(m.reported).toEqual(['EMR_BITBLT (raster operation 0x5a0049)']);
+  });
+
+});
+
+// ── EMF+ ([MS-EMFPLUS]) bitmap playback ─────────────────────────────────────
+
+describe('playEmf — EMF+ bitmap records', () => {
+  /** One EMF+ record: Type, Flags, Size, DataSize, data (4-byte aligned). */
+  const plusRecord = (type: number, flags: number, data: number[] = []) => {
+    const body = [...data];
+    while (body.length % 4) body.push(0);
+    const w = new Writer().u16(type).u16(flags).u32(12 + body.length).u32(data.length);
+    for (const byte of body) w.raw(byte);
+    return w.build();
+  };
+  const f32 = (v: number) => [...new Uint8Array(new Float32Array([v]).buffer)];
+  const u32 = (v: number) => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+  /** EMR_COMMENT carrying EMF+ records. */
+  const comment = (...records: Uint8Array[]) => {
+    const payload = concat(...records);
+    return record(70, (w) => {
+      w.u32(4 + payload.length).u32(0x2b464d45);
+      for (const byte of payload) w.raw(byte);
+    });
+  };
+  const header = (dual: boolean) => plusRecord(0x4001, dual ? 1 : 0, [...u32(0xdbc01002), ...u32(1), ...u32(96), ...u32(96)]);
+  // A 2×1 premultiplied-ARGB bitmap: opaque red, half-transparent white.
+  const bitmap = (flags = 0x0501, pixelFormat = 0x000e200b, bitmapType = 0) =>
+    plusRecord(0x4008, flags, [
+      ...u32(0xdbc01002), ...u32(1), ...u32(2), ...u32(1), ...u32(8), ...u32(pixelFormat), ...u32(bitmapType),
+      0, 0, 255, 255, 128, 128, 128, 128,
+    ]);
+  /** EmfPlusImageAttributes object 0: Version, Reserved1, WrapMode (Tile, as
+   *  Excel writes), ClampColor, ObjectClamp, Reserved2. */
+  const attributes = (wrapMode = 0, objectClamp = 0) =>
+    plusRecord(0x4008, 0x0800, [...u32(0xdbc01002), ...u32(0), ...u32(wrapMode), ...u32(0xffffffff), ...u32(objectClamp), ...u32(0)]);
+  const drawImage = (dest: number[], src = [0, 0, 2, 1]) =>
+    plusRecord(0x401a, 0x0001, [...u32(0), ...u32(2), ...src.flatMap(f32), ...dest.flatMap(f32)]);
+
+  function run(records: Uint8Array[], gdi: Uint8Array[] = []) {
+    const draws: { data: number[]; rect: number[] }[] = [];
+    vi.stubGlobal('OffscreenCanvas', class {
+      width: number;
+      height: number;
+      constructor(w: number, h: number) {
+        this.width = w;
+        this.height = h;
+      }
+      getContext() {
+        const owner = this;
+        return {
+          createImageData: (w: number, h: number) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
+          putImageData(img: { data: Uint8ClampedArray }) {
+            (owner as unknown as { pixels: number[] }).pixels = [...img.data];
+          },
+        };
+      }
+    });
+    const m = makeRecordingCtx();
+    (m.ctx as unknown as { drawImage: unknown }).drawImage = (img: { pixels: number[] }, ...rect: number[]) => {
+      draws.push({ data: img.pixels, rect });
+    };
+    (m.ctx as unknown as { clearRect: unknown }).clearRect = (...a: number[]) => m.calls.push({ op: 'clearRect', args: a });
+    (m.ctx as unknown as { fillRect: unknown }).fillRect = (...a: number[]) => m.calls.push({ op: 'fillRect', args: a });
+    const reported: string[] = [];
+    const drew = playEmf(concat(emfHeader(0, 0, 100, 100), ...gdi, ...records, record(EMR.EOF, () => {})), m.ctx, 100, 100, {
+      onUnsupported: (r) => reported.push(...r),
+    });
+    vi.unstubAllGlobals();
+    return { ...m, draws, reported, drew };
+  }
+
+  it('draws an uncompressed 32bpp bitmap object through EmfPlusDrawImage', () => {
+    const result = run([
+      comment(
+        header(true),
+        plusRecord(0x4030, 0x0002, f32(1)), // SetPageTransform: UnitPixel, scale 1
+        plusRecord(0x4009, 0, u32(0x00ffffff)), // Clear to transparent white
+        plusRecord(0x4023, 0), // SourceOver
+        attributes(),
+        bitmap(),
+        drawImage([10, 20, 50, 40]),
+      ),
+      comment(plusRecord(0x4002, 0)),
+    ]);
+    expect(result.drew).toBe(true);
+    expect(result.reported).toEqual([]);
+    expect(result.draws).toHaveLength(1);
+    expect(result.draws[0].rect).toEqual([10, 20, 50, 40]);
+    // BGRA → RGBA, and premultiplied 128/128 un-premultiplied to white.
+    expect(result.draws[0].data).toEqual([255, 0, 0, 255, 255, 255, 255, 128]);
+    expect(result.calls.some((c) => c.op === 'clearRect')).toBe(true);
+  });
+
+  it('assembles continued objects, applies world transforms and crops the source', () => {
+    const whole = bitmap();
+    const data = whole.slice(12); // object data after the record header
+    const first = plusRecord(0x4008, 0x8501, [...u32(data.length), ...data.slice(0, 10)]);
+    const second = plusRecord(0x4008, 0x8501, [...u32(data.length), ...data.slice(10)]);
+    const result = run([
+      comment(
+        header(true),
+        attributes(),
+        first,
+        second,
+        plusRecord(0x402d, 0, [...f32(5), ...f32(5)]), // translate
+        plusRecord(0x402e, 0x2000, [...f32(2), ...f32(2)]), // then scale (append)
+        drawImage([0, 0, 10, 10], [1, 0, 1, 1]),
+      ),
+    ]);
+    expect(result.reported).toEqual([]);
+    expect(result.draws[0].rect).toEqual([10, 10, 20, 20]);
+    expect(result.draws[0].data).toEqual([255, 255, 255, 128]);
+  });
+
+  it('keeps the GDI rendering of a dual file whose EMF+ part is not implemented', () => {
+    const gdiPolygon = [
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)),
+      record(EMR.POLYGON16, (w) => w.i32(0).i32(0).i32(10).i32(10).u32(3).i16(0).i16(0).i16(10).i16(0).i16(0).i16(10)),
+    ];
+    // FillRects (0x400A) is not implemented: the GDI alternative is played.
+    const dual = run([comment(header(true), plusRecord(0x400a, 0, u32(0)))], gdiPolygon);
+    expect(dual.styles.fill).toEqual(['#000000']);
+    expect(dual.draws).toHaveLength(0);
+    // A dual file whose EMF+ part has no drawing also keeps its GDI drawing.
+    expect(run([comment(header(true), plusRecord(0x401e, 0))], gdiPolygon).styles.fill).toEqual(['#000000']);
+    // Played EMF+ skips GDI records outside an EmfPlusGetDC scope.
+    const plus = run([comment(header(true), attributes(), bitmap(), drawImage([0, 0, 2, 1]))], gdiPolygon);
+    expect(plus.styles.fill).toEqual([]);
+    expect(plus.draws).toHaveLength(1);
+  });
+
+  it('keeps the GDI rendering when implemented EMF+ records would be rejected in playback', () => {
+    const gdiPolygon = [
+      record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)),
+      record(EMR.POLYGON16, (w) => w.i32(0).i32(0).i32(10).i32(10).u32(3).i16(0).i16(0).i16(10).i16(0).i16(0).i16(10)),
+    ];
+    const dual = (...records: Uint8Array[]) => run([comment(header(true), ...records)], gdiPolygon);
+    const expectGdi = (result: ReturnType<typeof run>) => {
+      expect(result.styles.fill).toEqual(['#000000']);
+      expect(result.draws).toHaveLength(0);
+    };
+    // Unsupported page unit (UnitInch).
+    expectGdi(dual(plusRecord(0x4030, 0x0004, f32(1)), attributes(), bitmap(), drawImage([0, 0, 2, 1])));
+    // Rotating and mirroring world transforms.
+    expectGdi(dual(attributes(), bitmap(), plusRecord(0x402f, 0, f32(30)), drawImage([0, 0, 2, 1])));
+    expectGdi(dual(attributes(), bitmap(), plusRecord(0x402e, 0, [...f32(-1), ...f32(1)]), drawImage([0, 0, 2, 1])));
+    // An empty destination and a source reaching outside the image.
+    expectGdi(dual(attributes(), bitmap(), drawImage([0, 0, 0, 1])));
+    expectGdi(dual(attributes(), bitmap(), drawImage([0, 0, 2, 1], [0, 0, 3, 1])));
+    // Missing or invalid image attributes.
+    expectGdi(dual(bitmap(), drawImage([0, 0, 2, 1])));
+    expectGdi(dual(attributes(9), bitmap(), drawImage([0, 0, 2, 1])));
+    expectGdi(dual(attributes(0, 2), bitmap(), drawImage([0, 0, 2, 1])));
+    // An object table entry replaced by another kind is no longer usable.
+    expectGdi(dual(attributes(), plusRecord(0x4008, 0x0400, u32(0)), bitmap(), drawImage([0, 0, 2, 1])));
+    // Restoring a state that was never saved.
+    expectGdi(dual(attributes(), bitmap(), plusRecord(0x4026, 0, u32(7)), drawImage([0, 0, 2, 1])));
+  });
+
+  it('saves and restores the compositing mode with the graphics state', () => {
+    const played = (...records: Uint8Array[]) => run([comment(header(false), attributes(), bitmap(), ...records)]);
+    const clears = (result: ReturnType<typeof run>) => result.calls.filter((c) => c.op === 'clearRect').length;
+    // SourceCopy set after Save is undone by Restore: no clearing blit.
+    expect(clears(played(
+      plusRecord(0x4025, 0, u32(1)),
+      plusRecord(0x4023, 1),
+      plusRecord(0x4026, 0, u32(1)),
+      drawImage([0, 0, 2, 1]),
+    ))).toBe(0);
+    // SourceCopy saved with the state survives a later SourceOver.
+    expect(clears(played(
+      plusRecord(0x4023, 1),
+      plusRecord(0x4025, 0, u32(2)),
+      plusRecord(0x4023, 0),
+      plusRecord(0x4026, 0, u32(2)),
+      drawImage([0, 0, 2, 1]),
+    ))).toBe(1);
+  });
+
+  const gdiPolygon = () => [
+    record(EMR.SELECTOBJECT, (w) => w.u32(0x80000004)),
+    record(EMR.POLYGON16, (w) => w.i32(0).i32(0).i32(10).i32(10).u32(3).i16(0).i16(0).i16(10).i16(0).i16(0).i16(10)),
+  ];
+  const file = (records: Uint8Array[], gdi: Uint8Array[] = gdiPolygon()) =>
+    concat(emfHeader(0, 0, 100, 100), ...gdi, ...records, record(EMR.EOF, () => {}));
+  /** An EMR_COMMENT whose EMF+ payload is written byte for byte. */
+  const rawComment = (dataSize: number, payload: Uint8Array) => record(70, (w) => {
+    w.u32(dataSize).u32(0x2b464d45);
+    for (const byte of payload) w.raw(byte);
+  });
+
+  it('does not play EMF+ over a complete GDI rendering when a later record is truncated', () => {
+    // A valid DrawImage, then 8 bytes: less than one EMF+ record header.
+    const payload = concat(header(true), attributes(), bitmap(), drawImage([0, 0, 2, 1]), new Uint8Array([0x02, 0x40, 0, 0, 12, 0, 0, 0]));
+    const records = [rawComment(4 + payload.length, payload)];
+    expect(scanEmfPlus(file(records))).toEqual({
+      present: true, dual: true, play: false, failures: ['EMF+ record (truncated header)'],
+    });
+    const played = run(records, gdiPolygon());
+    expect(played.draws).toHaveLength(0);
+    expect(played.styles.fill).toEqual(['#000000']);
+    // The dual file's GDI rendering is complete: nothing is reported.
+    expect(played.reported).toEqual([]);
+  });
+
+  it('treats invalid record and comment sizes as validation failures', () => {
+    const valid = concat(header(true), attributes(), bitmap(), drawImage([0, 0, 2, 1]));
+    // A record whose Size runs past its comment.
+    const overrun = concat(valid, new Writer().u16(0x4002).u16(0).u32(64).u32(0).build());
+    expect(scanEmfPlus(file([rawComment(4 + overrun.length, overrun)])).failures)
+      .toEqual(['EMF+ record 0x4002 (invalid Size or DataSize)']);
+    // DataSize larger than Size − 12.
+    const badData = concat(valid, new Writer().u16(0x4002).u16(0).u32(12).u32(4).build());
+    expect(scanEmfPlus(file([rawComment(4 + badData.length, badData)])).failures)
+      .toEqual(['EMF+ record 0x4002 (invalid Size or DataSize)']);
+    // An EMR_COMMENT DataSize that leaves the comment record.
+    expect(scanEmfPlus(file([rawComment(4 + valid.length + 16, valid)]))).toMatchObject({
+      play: false, failures: ['EMF+ comment (invalid DataSize)'],
+    });
+  });
+
+  it('treats an unfinished or interleaved continued object as a validation failure', () => {
+    const data = bitmap().slice(12);
+    const first = plusRecord(0x4008, 0x8501, [...u32(data.length), ...data.slice(0, 10)]);
+    const second = plusRecord(0x4008, 0x8501, [...u32(data.length), ...data.slice(10)]);
+    const unfinished = scanEmfPlus(file([comment(header(true), attributes(), first, drawImage([0, 0, 2, 1]))]));
+    expect(unfinished.play).toBe(false);
+    expect(unfinished.failures).toContain('EMF+ continued object (unfinished)');
+    // A huge declaration with only a small fragment is still unfinished
+    // content, with no assembly allocation. Dual playback keeps GDI fallback.
+    const declaredOnly = plusRecord(0x4008, 0x8501, [...u32(0xffffff00), ...data.slice(0, 10)]);
+    expect(run([comment(header(true), declaredOnly, drawImage([0, 0, 2, 1]))], gdiPolygon()).styles.fill)
+      .toEqual(['#000000']);
+    const interleaved = scanEmfPlus(file([comment(header(true), attributes(), first, plusRecord(0x401e, 0), second, drawImage([0, 0, 2, 1]))]));
+    expect(interleaved.play).toBe(false);
+    expect(interleaved.failures).toContain('EMF+ continued object (unfinished)');
+    // Consecutive fragments remain a valid object.
+    expect(scanEmfPlus(file([comment(header(true), attributes(), first, second, drawImage([0, 0, 2, 1]))])))
+      .toEqual({ present: true, dual: true, play: true, failures: [] });
+  });
+
+  it('reports the failures of an EMF+-only file, which has no GDI alternative, and plays its GDI records as before', () => {
+    const result = run([
+      comment(header(false), plusRecord(0x400a, 0, u32(0)), bitmap(0x0501, 0x00022009), drawImage([0, 0, 2, 1])),
+    ], gdiPolygon());
+    expect(result.draws).toHaveLength(0);
+    expect(result.styles.fill).toEqual(['#000000']);
+    expect(result.reported).toEqual(expect.arrayContaining([
+      'EMF+ record 0x400a',
+      'EMF+ image other than an uncompressed 32-bit bitmap',
+      'EMF+ DrawImage of an unavailable image',
+    ]));
+    // A truncated EMF+-only stream is reported the same way.
+    const payload = concat(header(false), attributes(), bitmap(), drawImage([0, 0, 2, 1]), new Uint8Array([0, 0, 0, 0]));
+    expect(run([rawComment(4 + payload.length, payload)]).reported).toEqual(['EMF+ record (truncated header)']);
+  });
+  it('never admits a non-finite placement, so the GDI alternative is kept', () => {
+    const draw = (...state: Uint8Array[]) => [comment(header(true), attributes(), bitmap(), ...state, drawImage([0, 0, 2, 1]))];
+    const cases = [
+      draw(plusRecord(0x4030, 0x0002, f32(NaN))), // PageScale NaN
+      draw(plusRecord(0x4030, 0x0002, f32(Infinity))), // PageScale infinite
+      draw(plusRecord(0x402a, 0, [1, NaN, 0, 1, 0, 0].flatMap(f32))), // world matrix
+      draw(plusRecord(0x402d, 0, [...f32(Infinity), ...f32(0)])), // translate
+      [comment(header(true), attributes(), bitmap(), drawImage([Infinity, 0, 2, 1]))],
+      [comment(header(true), attributes(), bitmap(), drawImage([0, 0, 2, 1], [NaN, 0, 2, 1]))],
+    ];
+    for (const records of cases) {
+      const scan = scanEmfPlus(file(records));
+      expect(scan.play).toBe(false);
+      expect(scan.failures).toEqual(['EMF+ DrawImage placement (non-finite value)']);
+      const played = run(records, gdiPolygon());
+      expect(played.draws).toHaveLength(0);
+      expect(played.styles.fill).toEqual(['#000000']);
+      expect(played.reported).toEqual([]);
+    }
+  });
+
+  it('throws typed bitmap budget errors in scan, playback and dual-mode playback', async () => {
+    // Valid uncompressed data, so the axis ceiling is the only rejection.
+    const wide = new Uint8Array(28 + 40000 * 4);
+    const v = new DataView(wide.buffer);
+    [0xdbc01002, 1, 40000, 1, 160000, 0x0026200a, 0].forEach((x, i) => v.setUint32(i * 4, x, true));
+    const oversized = plusRecord(0x4008, 0x0501, [...wide]);
+    for (const [object, metric, limit, observed] of [
+      [oversized, 'image-dimension', MAX_RASTER_DIMENSION, 40000],
+    ] as const) {
+      const records = [comment(header(true), attributes(), object, drawImage([0, 0, 2, 1]))];
+      const expected = { code: 'ooxml-decoded-image-limit', metric, limit, observed };
+      expect(() => scanEmfPlus(file(records))).toThrowError(expect.objectContaining(expected));
+      expect(() => playEmf(file(records, gdiPolygon()), makeRecordingCtx().ctx, 100, 100))
+        .toThrowError(expect.objectContaining(expected));
+      const bytes = records[0];
+      const target = {
+        ctx: null, W: 100, H: 100, left: 0, top: 0, boundsW: 100, boundsH: 100,
+        drew: false, unsupported: new Set<string>(),
+      };
+      expect(() => new EmfPlusPlayer(target).playComment(new DataView(bytes.buffer), 0, bytes.length))
+        .toThrowError(expect.objectContaining(expected));
+      expect(target.unsupported.size).toBe(0);
+      vi.stubGlobal('OffscreenCanvas', class {
+        getContext() { return makeRecordingCtx().ctx; }
+      });
+      try {
+        for (const incompleteMetafile of [undefined, 'draw-supported', 'reject'] as const) {
+          await expect(decodeRasterOrMetafile(new Blob([file(records, gdiPolygon()) as Uint8Array<ArrayBuffer>]), {
+            incompleteMetafile,
+          })).rejects.toMatchObject(expected);
+        }
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    }
+  });
+
+  it('reports a bitmap blit that fails at run time instead of dropping it silently', () => {
+    const noHelper = () => vi.stubGlobal('OffscreenCanvas', class { getContext() { return null; } });
+    const records = [comment(header(true), attributes(), bitmap(), drawImage([0, 0, 2, 1]))];
+    // Dual file without GDI drawing (as Excel writes): nothing replaces the image.
+    noHelper();
+    const m = makeRecordingCtx();
+    const reported: string[] = [];
+    const drew = playEmf(file(records, []), m.ctx, 100, 100, { onUnsupported: (r) => reported.push(...r) });
+    vi.unstubAllGlobals();
+    expect(drew).toBe(false);
+    expect(reported).toEqual(['EMF+ DrawImage (the bitmap could not be drawn)']);
+    // Dual file with a GDI rendering: the partial EMF+ drawing is cleared and
+    // the complete GDI alternative plays; the EMF+ failure is still reported.
+    noHelper();
+    const g = makeRecordingCtx();
+    const clears: number[][] = [];
+    (g.ctx as unknown as { clearRect: unknown }).clearRect = (...a: number[]) => clears.push(a);
+    const gdiReported: string[] = [];
+    expect(playEmf(file(records), g.ctx, 100, 100, { onUnsupported: (r) => gdiReported.push(...r) })).toBe(true);
+    vi.unstubAllGlobals();
+    expect(clears).toContainEqual([0, 0, 100, 100]);
+    expect(g.styles.fill).toEqual(['#000000']);
+    expect(gdiReported).toEqual(['EMF+ DrawImage (the bitmap could not be drawn)']);
+    // EMF+-only file: no alternative, the failure is reported.
+    noHelper();
+    const only: string[] = [];
+    playEmf(file([comment(header(false), attributes(), bitmap(), drawImage([0, 0, 2, 1]))], []), makeRecordingCtx().ctx, 100, 100, {
+      onUnsupported: (r) => only.push(...r),
+    });
+    vi.unstubAllGlobals();
+    expect(only).toEqual(['EMF+ DrawImage (the bitmap could not be drawn)']);
+  });
+
+  it('rejects a strict decode whose EMF+ blit fails instead of returning null', async () => {
+    // A dual file: even its GDI rendering does not stand in silently.
+    const bytes = file([comment(header(true), attributes(), bitmap(), drawImage([0, 0, 2, 1]))]);
+    vi.stubGlobal('OffscreenCanvas', class {
+      constructor(public width: number, public height: number) {}
+      // The 2×1 helper surface of the blit is refused; the target is not.
+      getContext() { return this.width === 2 ? null : makeRecordingCtx().ctx; }
+    });
+    vi.stubGlobal('createImageBitmap', async (src: { width: number; height: number }) => ({ width: src.width, height: src.height, close() {} }));
+    try {
+      const outcome = await decodeRasterOrMetafile(new Blob([bytes as Uint8Array<ArrayBuffer>]), {
+        widthPt: 48, heightPt: 36, incompleteMetafile: 'reject',
+      }).then(() => undefined, (error: unknown) => error);
+      expect(isOoxmlIncompleteMetafileError(outcome)).toBe(true);
+      expect(outcome).toMatchObject({ unsupported: ['EMF+ DrawImage (the bitmap could not be drawn)'] });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

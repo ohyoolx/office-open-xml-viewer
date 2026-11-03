@@ -10,7 +10,7 @@ import { dts } from 'rolldown-plugin-dts';
 const require = createRequire(new URL('../package.json', import.meta.url));
 const ts = require('typescript-compiler-api');
 
-const entries = [
+const entries = process.argv.length > 2 ? process.argv.slice(2) : [
   'index',
   'docx',
   'xlsx',
@@ -20,6 +20,7 @@ const entries = [
   'region-map',
   'chart-ex',
   'tiff',
+  'internal-companion',
   'node',
 ];
 const dist = path.resolve(process.cwd(), 'dist');

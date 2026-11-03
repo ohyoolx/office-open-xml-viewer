@@ -1,15 +1,15 @@
 import type { Fill, PathCmd, Stroke } from '../types/common';
-import { drawArrowHead, lineEndRetract, retractLineEndpoint } from './arrow';
-import { buildCustomPath } from './custGeom';
-import { getCustGeomEndpoints } from './custgeom-endpoints';
-import { applyStroke, resolveFill } from './paint';
-import { buildShapePath } from './preset';
-import {
-  buildPresetGeometryFillPath,
-  getConnectorAnchors,
-  hasPreset,
-  renderPresetShape,
-} from './preset-geometry';
+import { resolveArrowPaint, paintResolvedArrowHead } from './arrow';
+import { trackPaintPath, currentStrokeBounds } from './paint-bounds';
+import { appendGeometryPath } from './path-data';
+import { applyResolvedStroke, hexToRgba, resolveFill, usesPathShade } from './paint';
+import type { ResolvedStrokeGeometry } from './stroke-geometry';
+import { resolveDrawingMLGeometry, requireResolvedDrawingMLGeometry, type ResolvedDrawingMLGeometry } from './drawingml-geometry';
+import { pathFillModeOverlay } from './preset-geometry';
+
+// Retained DOCX DrawingML plans use points. The shared pattern bitmap's one
+// point cells therefore need no CSS-pixel conversion in this painter.
+const PATTERN_PT_TO_SHAPE_UNITS = 1;
 
 type DeepReadonly<T> =
   T extends (...args: never[]) => unknown ? T
@@ -28,9 +28,23 @@ export type DrawingMLShapeGeometry =
   | Readonly<{
       kind: 'custom';
       subpaths: readonly (readonly PathCmd[])[];
+      /** ECMA-376 §20.1.9.15 per-path `fill` mode and `stroke` flag,
+       *  parallel to `subpaths`; absent when every path uses the defaults. */
+      paint?: readonly DrawingMLPathPaint[];
     }>;
 
+export type DrawingMLPathPaint = Readonly<{
+  /** Resolved path winding rule; VML uses parity within an end-delimited set. */
+  fillRule?: 'nonzero' | 'evenodd';
+  /** ST_PathFillMode (§20.1.10.37) other than `norm`. */
+  fill?: 'none' | 'lighten' | 'lightenLess' | 'darken' | 'darkenLess';
+  /** Present only when the path is not stroked. */
+  stroke?: false;
+}>;
+
 export interface DrawingMLShapePaintPlan {
+  /** DOCX acquisition always supplies this; ordinary core callers may resolve through the compatibility adapter. */
+  readonly resolvedGeometry?: ResolvedDrawingMLGeometry;
   readonly rect: Readonly<{ x: number; y: number; w: number; h: number }>;
   readonly geometry: DrawingMLShapeGeometry;
   readonly fill: DrawingMLShapeFill | null;
@@ -65,61 +79,42 @@ export function withDrawingMLShapeTransform(
   }
 }
 
-/** Clip the current canvas state to the exact DrawingML shape silhouette.
- * The caller owns save/restore and should enter the shape transform first. */
+/** Append the same fill-bearing silhouette for clipping and path shading. */
+function appendDrawingMLShapeOutline(
+  ctx: CanvasRenderingContext2D,
+  plan: DrawingMLShapePaintPlan,
+  x: number, y: number, w: number, h: number,
+): void {
+  const geometry = plan.resolvedGeometry
+    ? requireResolvedDrawingMLGeometry(plan, plan.resolvedGeometry.scale)
+    : resolveDrawingMLGeometry(plan, 1);
+  if (w !== geometry.width || h !== geometry.height) throw new RangeError('Retained DrawingML silhouette frame mismatch');
+  appendGeometryPath(ctx, geometry.fillSilhouette, x - geometry.originX, y - geometry.originY);
+}
+
+/** Clip the current state; the caller owns save/restore and the shape transform. */
 export function clipDrawingMLShape(
   ctx: CanvasRenderingContext2D,
   plan: DrawingMLShapePaintPlan,
 ): void {
   const { x, y, w, h } = plan.rect;
   ctx.beginPath();
-  if (plan.geometry.kind === 'preset') {
-    const adjustments = [...plan.geometry.adjustments];
-    if (!buildPresetGeometryFillPath(
-      ctx, plan.geometry.name, x, y, w, h, adjustments,
-    )) {
-      buildShapePath(
-        ctx, plan.geometry.name, x, y, w, h,
-        adjustments[0], adjustments[1], adjustments[2], adjustments[3],
-      );
-    }
-  } else {
-    buildCustomPath(ctx, plan.geometry.subpaths as PathCmd[][], x, y, w, h);
-  }
+  appendDrawingMLShapeOutline(ctx, plan, x, y, w, h);
   // Use Canvas's nonzero rule, matching normal DrawingML shape fill and PPTX
   // picture clipping. `evenodd` would turn overlapping silhouette subpaths into
   // XOR holes that do not exist in the authored geometry.
   ctx.clip();
 }
 
-const CONNECTOR_GEOMETRIES = new Set([
-  'line', 'straightconnector1',
-  'bentconnector2', 'bentconnector3', 'bentconnector4', 'bentconnector5',
-  'curvedconnector2', 'curvedconnector3', 'curvedconnector4', 'curvedconnector5',
-]);
-
-const CALLOUT_GEOMETRIES = new Set([
-  'callout1', 'callout2', 'callout3',
-  'bordercallout1', 'bordercallout2', 'bordercallout3',
-  'accentcallout1', 'accentcallout2', 'accentcallout3',
-  'accentbordercallout1', 'accentbordercallout2', 'accentbordercallout3',
-]);
-
-function retractableLeader(geometry: string): boolean {
-  return CALLOUT_GEOMETRIES.has(geometry)
-    || geometry === 'line'
-    || geometry === 'straightconnector1'
-    || geometry.startsWith('bentconnector');
-}
-
 function applyDrawingMLStroke(
   ctx: CanvasRenderingContext2D,
   stroke: Stroke,
-  unitToDevice: number,
+  geometry: ResolvedStrokeGeometry,
   rect: DrawingMLShapePaintPlan['rect'],
   rotationDeg: number,
 ): void {
-  applyStroke(ctx, stroke, unitToDevice);
+  ctx.strokeStyle = hexToRgba(stroke.color);
+  applyResolvedStroke(ctx, geometry);
   if (stroke.fill) {
     const paint = resolveFill(
       stroke.fill as Fill,
@@ -129,200 +124,50 @@ function applyDrawingMLStroke(
       rect.w,
       rect.h,
       rotationDeg,
+      PATTERN_PT_TO_SHAPE_UNITS,
+      undefined, undefined, currentStrokeBounds(ctx),
     );
     if (paint) ctx.strokeStyle = paint;
   }
 }
 
-function paintConnectorEnds(
-  ctx: CanvasRenderingContext2D,
-  plan: DrawingMLShapePaintPlan,
-  geometry: string,
-  unitToDevice: number,
-): void {
-  const stroke = plan.stroke as Stroke | null;
-  if (!stroke || (!CONNECTOR_GEOMETRIES.has(geometry) && !CALLOUT_GEOMETRIES.has(geometry))) {
-    return;
-  }
-  const { x, y, w, h } = plan.rect;
-  const effectivePaint = stroke.fill
-    ? resolveFill(
-        stroke.fill as Fill,
-        ctx,
-        x,
-        y,
-        w,
-        h,
-        plan.transform.rotationDeg,
-      ) ?? undefined
-    : undefined;
-  const adjustments = plan.geometry.kind === 'preset' ? plan.geometry.adjustments : [];
-  const anchors = getConnectorAnchors(geometry, x, y, w, h, [...adjustments]);
-  if (!anchors) return;
-  if (retractableLeader(geometry)
-    && anchors.vertices.length >= 2
-    && (stroke.headEnd || stroke.tailEnd)) {
-    const points = anchors.vertices.map((vertex) => ({ x: vertex.x, y: vertex.y }));
-    if (stroke.tailEnd) {
-      points[points.length - 1] = retractLineEndpoint(
-        points[points.length - 1],
-        points[points.length - 2],
-        lineEndRetract(stroke.tailEnd, stroke, unitToDevice),
-      );
-    }
-    if (stroke.headEnd) {
-      points[0] = retractLineEndpoint(
-        points[0],
-        points[1],
-        lineEndRetract(stroke.headEnd, stroke, unitToDevice),
-      );
-    }
-    applyDrawingMLStroke(ctx, stroke, unitToDevice, plan.rect, plan.transform.rotationDeg);
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    for (let index = 1; index < points.length; index++) {
-      ctx.lineTo(points[index].x, points[index].y);
-    }
-    ctx.stroke();
-  }
-  if (stroke.tailEnd) {
-    drawArrowHead(
-      ctx, anchors.end.x, anchors.end.y, anchors.end.angle,
-      stroke.tailEnd, stroke, unitToDevice,
-      effectivePaint,
-    );
-  }
-  if (stroke.headEnd) {
-    drawArrowHead(
-      ctx, anchors.start.x, anchors.start.y, anchors.start.angle,
-      stroke.headEnd, stroke, unitToDevice,
-      effectivePaint,
-    );
-  }
-}
-
-function paintCustomEnds(
-  ctx: CanvasRenderingContext2D,
-  plan: DrawingMLShapePaintPlan,
-  unitToDevice: number,
-): void {
-  if (plan.geometry.kind !== 'custom') return;
-  const stroke = plan.stroke as Stroke | null;
-  if (!stroke || (!stroke.headEnd && !stroke.tailEnd)) return;
-  const endpoints = getCustGeomEndpoints(plan.geometry.subpaths as PathCmd[][]);
-  const { x, y, w, h } = plan.rect;
-  const effectivePaint = stroke.fill
-    ? resolveFill(
-        stroke.fill as Fill,
-        ctx,
-        x,
-        y,
-        w,
-        h,
-        plan.transform.rotationDeg,
-      ) ?? undefined
-    : undefined;
-  if (endpoints.start && stroke.headEnd) {
-    drawArrowHead(
-      ctx,
-      x + endpoints.start.x * w,
-      y + endpoints.start.y * h,
-      Math.atan2(endpoints.start.dy * h, endpoints.start.dx * w),
-      stroke.headEnd,
-      stroke,
-      unitToDevice,
-      effectivePaint,
-    );
-  }
-  if (endpoints.end && stroke.tailEnd) {
-    drawArrowHead(
-      ctx,
-      x + endpoints.end.x * w,
-      y + endpoints.end.y * h,
-      Math.atan2(endpoints.end.dy * h, endpoints.end.dx * w),
-      stroke.tailEnd,
-      stroke,
-      unitToDevice,
-      effectivePaint,
-    );
-  }
-}
-
+/** Replay the shared immutable geometry using the existing brush frames. */
 export function paintDrawingMLShape(
-  ctx: CanvasRenderingContext2D,
-  plan: DrawingMLShapePaintPlan,
-  unitToDevice: number,
+  ctx: CanvasRenderingContext2D, plan: DrawingMLShapePaintPlan, unitToDevice: number,
 ): void {
+  const geometry = plan.resolvedGeometry
+    ? requireResolvedDrawingMLGeometry(plan, unitToDevice)
+    : resolveDrawingMLGeometry(plan, unitToDevice);
+  const retainedPlan = plan.resolvedGeometry ? plan : { ...plan, resolvedGeometry: geometry };
+  if (usesPathShade(plan.stroke?.fill)) ctx = trackPaintPath(ctx);
   const { x, y, w, h } = plan.rect;
   withDrawingMLShapeTransform(ctx, plan, () => {
-    // Shared fill resolution is observational; retained plans keep gradient
-    // stops readonly so layout snapshots cannot be mutated by a painter.
-    const fillStyle = resolveFill(
-      plan.fill as Fill | null,
-      ctx,
-      x,
-      y,
-      w,
-      h,
-      plan.transform.rotationDeg,
-    );
+    const fillStyle = resolveFill(plan.fill as Fill | null, ctx, x, y, w, h,
+      plan.transform.rotationDeg, PATTERN_PT_TO_SHAPE_UNITS, undefined,
+      (target, bx, by, bw, bh) => appendDrawingMLShapeOutline(target, retainedPlan, bx, by, bw, bh));
     const stroke = plan.stroke as Stroke | null;
-    const applyAndStroke = stroke
-      ? () => {
-          applyDrawingMLStroke(
-            ctx,
-            stroke,
-            unitToDevice,
-            plan.rect,
-            plan.transform.rotationDeg,
-          );
-          ctx.stroke();
-        }
-      : null;
-    if (plan.geometry.kind === 'preset') {
-      const geometry = plan.geometry.name.toLowerCase();
-      const adjustments = [...plan.geometry.adjustments];
-      const hasDecoratedRetractableLeader = retractableLeader(geometry)
-        && !!(stroke?.headEnd || stroke?.tailEnd);
-      const painted = hasPreset(geometry) && renderPresetShape(
-        ctx,
-        geometry,
-        x,
-        y,
-        w,
-        h,
-        adjustments,
-        fillStyle,
-        applyAndStroke,
-        () => {},
-        hasDecoratedRetractableLeader ? { skipTrailingStroke: true } : undefined,
-      );
-      if (!painted) {
-        ctx.beginPath();
-        buildShapePath(
-          ctx, geometry, x, y, w, h,
-          adjustments[0], adjustments[1], adjustments[2], adjustments[3],
-        );
-        if (fillStyle && geometry !== 'arc') {
-          ctx.fillStyle = fillStyle;
-          if (geometry === 'donut' || geometry === 'smileyface' || geometry === 'frame') {
-            ctx.fill('evenodd');
-          } else {
-            ctx.fill();
-          }
-        }
-        if (applyAndStroke) applyAndStroke();
-      }
-      paintConnectorEnds(ctx, plan, geometry, unitToDevice);
-    } else {
+    for (const path of geometry.paths) {
       ctx.beginPath();
-      buildCustomPath(ctx, plan.geometry.subpaths as PathCmd[][], x, y, w, h);
-      if (fillStyle) {
-        ctx.fillStyle = fillStyle;
-        ctx.fill();
+      appendGeometryPath(ctx, path.path, x - geometry.originX, y - geometry.originY);
+      if (fillStyle && path.fill !== 'none') {
+        ctx.save();
+        try {
+          ctx.fillStyle = fillStyle;
+          if (path.fillRule === 'evenodd') ctx.fill('evenodd'); else ctx.fill();
+          const overlay = pathFillModeOverlay(path.fill);
+          if (overlay) { ctx.fillStyle = overlay; if (path.fillRule === 'evenodd') ctx.fill('evenodd'); else ctx.fill(); }
+        } finally { ctx.restore(); }
       }
-      if (applyAndStroke) applyAndStroke();
-      paintCustomEnds(ctx, plan, unitToDevice);
+      if (stroke && path.stroke) {
+        applyDrawingMLStroke(ctx, stroke, path.stroke, plan.rect, plan.transform.rotationDeg);
+        ctx.stroke();
+      }
+    }
+    if (stroke) for (const arrow of geometry.arrows) {
+      const tipX = x - geometry.originX + arrow.tipX, tipY = y - geometry.originY + arrow.tipY;
+      paintResolvedArrowHead(ctx, tipX, tipY, arrow.angle, arrow.geometry, stroke,
+        resolveArrowPaint(ctx, stroke, unitToDevice, PATTERN_PT_TO_SHAPE_UNITS, tipX, tipY, arrow.angle, arrow.end,
+          plan.rect, plan.transform.rotationDeg, PATTERN_PT_TO_SHAPE_UNITS));
     }
   });
 }

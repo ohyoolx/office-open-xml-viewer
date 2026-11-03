@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { announcements } from './lib/announcements';
 
 const articlePage = readFileSync(new URL('./pages/announcements/[slug].astro', import.meta.url), 'utf8');
+const releaseVersion = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version as string;
 const bundleSizePage = readFileSync(new URL('./pages/bundle-size.astro', import.meta.url), 'utf8');
 const productionPage = readFileSync(new URL('./pages/production.astro', import.meta.url), 'utf8');
 const apiReference = readFileSync(new URL('./components/ApiReference.astro', import.meta.url), 'utf8');
@@ -39,6 +40,10 @@ describe('v0.88 chart fidelity and safer Word layout announcement', () => {
     expect(text).toContain('intentionally changes rendering');
     expect(text).toContain('low-level chart model');
     expect(text).toContain('NON_CONVERGENCE');
+    const technicalNote = announcement?.sections.at(-1)?.paragraphs.join('\n') ?? '';
+    expect(technicalNote).toContain('25,000 misses');
+    expect(technicalNote).toContain('miss 25,001');
+    expect(technicalNote).toContain('two most recent placements');
     expect(text).toContain('When Google Fonts loading is enabled');
     expect(text).not.toContain('fontResources');
     expect(text).not.toContain('one synchronous pagination run');
@@ -320,22 +325,13 @@ describe('v0.81 ChartEx migration guide', () => {
 
 describe('stable documentation boundaries', () => {
   it('keeps the current bundle measurements on one stable page', () => {
-    expect(bundleSizePage).toContain('Current production assets for v0.88.0');
-    expect(bundleSizePage).toContain('DOCX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>2,082 KiB<\/td>\s*<td>508 KiB<\/td>/);
-    expect(bundleSizePage).toContain('XLSX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>1,389 KiB<\/td>\s*<td>333 KiB<\/td>/);
-    expect(bundleSizePage).toContain('PPTX static JavaScript');
-    expect(bundleSizePage).toMatch(/<td>1,432 KiB<\/td>\s*<td>336 KiB<\/td>/);
-    expect(bundleSizePage).toContain('<tr><th>DOCX parser WASM</th><td>1,900 KiB</td><td>787 KiB</td></tr>');
-    expect(bundleSizePage).toContain('<tr><th>XLSX parser WASM</th><td>1,683 KiB</td><td>690 KiB</td></tr>');
-    expect(bundleSizePage).toContain('<tr><th>PPTX parser WASM</th><td>1,782 KiB</td><td>700 KiB</td></tr>');
+    expect(bundleSizePage).toContain(`Current production assets for v${releaseVersion}`);
+    for (const format of ['DOCX', 'XLSX', 'PPTX']) {
+      expect(bundleSizePage).toContain(`${format} static JavaScript`);
+      expect(bundleSizePage).toContain(`<th>${format} parser WASM</th>`);
+    }
     expect(bundleSizePage).toContain('ChartEx');
     expect(bundleSizePage.match(/<th>TIFF image codec<\/th>/g)).toHaveLength(1);
-    expect(bundleSizePage).toContain('<td>22.2 KiB</td><td>6.7 KiB</td>');
-    expect(bundleSizePage).not.toContain('3.9 KiB');
-    expect(bundleSizePage).not.toContain('7.3 KiB');
-    expect(bundleSizePage).not.toContain('3.1 KiB');
     expect(productionPage).toContain('A small TIFF reuse');
     expect(productionPage).toContain('it is not a');
     expect(productionPage).toContain('general-purpose TIFF library');

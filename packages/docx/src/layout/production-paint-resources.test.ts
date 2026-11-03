@@ -68,11 +68,13 @@ function documentModel(): DocxDocumentModel {
     }, {
       type: 'shape', widthPt: 50, heightPt: 30, anchorXPt: 0, anchorYPt: 0,
       anchorXFromMargin: false, anchorYFromPara: false, zOrder: 0, subpaths: [],
+      rotation: 30, flipH: true,
       fill: {
         fillType: 'image', imagePath: 'word/media/shape-fill.png', mimeType: 'image/png',
         svgImagePath: 'word/media/shape-fill.svg',
         srcRect: { l: .2, t: 0, r: .1, b: .05 },
         alpha: .6, duotone: { clr1: '112233', clr2: 'DDEEFF' },
+        blipEffects: [{ type: 'blur', radius: 12700, grow: true }],
       }, stroke: null, textBlocks: [{
         text: '', fontSizePt: 10, alignment: 'left', imagePath: 'word/media/textbox.png',
         mimeType: 'image/png', imageWidthPt: 9, imageHeightPt: 5,
@@ -82,6 +84,29 @@ function documentModel(): DocxDocumentModel {
 }
 
 describe('production paint resources', () => {
+  it('preserves picture-bullet carrier transforms without changing its explicit box', () => {
+    const owner = paragraph([]);
+    const transform = {
+      srcRect: { l: .25, t: .125, r: 0, b: .25 },
+      rotation: 90, flipH: true, flipV: false,
+    };
+    owner.numbering!.picBulletTransform = transform;
+    const doc = { section, headers: {}, footers: {}, body: [owner] } as DocxDocumentModel;
+    const registry = layoutSourceStore(doc).paintResources;
+    const key = imageResourceKey(
+      { story: 'body', storyInstance: 'body', path: [0] }, 'word/media/bullet.gif',
+    );
+    expect(registry.resolve(key, 'picture-bullet')).toMatchObject({
+      intrinsicSize: { widthPt: 6, heightPt: 7 },
+      srcRect: { l: .25, t: .125, r: 0, b: .25 },
+      rotation: 90, flipH: true, flipV: false,
+    });
+    transform.srcRect.l = .5;
+    expect(registry.resolve(key, 'picture-bullet')).toMatchObject({
+      srcRect: { l: .25 },
+    });
+  });
+
   it('builds clone-safe descriptors with the same structural keys as retained layout', () => {
     const registry = layoutSourceStore(documentModel()).paintResources;
     const body = { story: 'body' as const, storyInstance: 'body', path: [0] };
@@ -119,7 +144,12 @@ describe('production paint resources', () => {
       svgImagePath: 'word/media/shape-fill.svg',
       srcRect: { l: .2, t: 0, r: .1, b: .05 },
       alpha: .6, duotone: { clr1: '112233', clr2: 'DDEEFF' },
+      blipEffects: [{ type: 'blur', radius: 12700, grow: true }],
+      // The fill image is unrotated, but its page-fixed effects are evaluated
+      // against the host shape's orientation (§20.1.8.45/.49).
+      effectHost: { rotation: 30, flipH: true },
     });
+    expect(registry.resolve(shapeFillKey, 'image')).not.toHaveProperty('rotation');
     expect(registry.resolve(bulletKey, 'picture-bullet')).toMatchObject({
       partPath: 'word/media/bullet.gif', intrinsicSize: { widthPt: 6, heightPt: 7 },
     });

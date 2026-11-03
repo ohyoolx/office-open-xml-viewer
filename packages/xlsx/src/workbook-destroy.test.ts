@@ -9,7 +9,7 @@ import {
   type FontPreloadEntry,
   type OffscreenFactory,
 } from '@silurus/ooxml-core';
-import { XlsxWorkbook, retainXlsxViewerFonts } from './workbook.js';
+import { XlsxWorkbook, acquireXlsxWorksheetPreview, retainXlsxViewerFonts } from './workbook.js';
 
 /**
  * `XlsxWorkbook.destroy()` tears the parser worker down via
@@ -26,7 +26,7 @@ class SilentWorker implements WorkerLike {
   constructor() {
     SilentWorker.instances.push(this);
   }
-  postMessage(): void {}
+  postMessage(_message: unknown): void {}
   addEventListener(): void {}
   removeEventListener(): void {}
   terminated = false;
@@ -68,6 +68,7 @@ interface FakeFace { family: string }
 function installFontFaceSet(): { added: FakeFace[] } {
   const added: FakeFace[] = [];
   class FakeFontFace {
+    status = 'loaded';
     constructor(public family: string, public source: string, public descriptors?: object) {}
     load(): Promise<FakeFontFace> { return Promise.resolve(this); }
   }
@@ -97,9 +98,13 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
     instance.bridge = bridge;
     // Fields destroy() clears after terminate(); undefined would throw.
     instance.sheetCache = new Map();
+    instance.sheetCacheUsage = new Map();
+    instance.sheetLeases = new Map();
+    instance.evictingSheets = new Map();
     instance.sheetLoads = new Map();
     instance.rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
     instance.googleFontNames = [];
+    instance.officeFontRequests = [];
     instance.retainedFontSets = new Map();
     instance.fontsDestroyed = false;
     instance._fetchImage = () => Promise.resolve(new Blob());
@@ -112,6 +117,35 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
     wb.destroy();
     expect(worker.terminated).toBe(true);
     await expect(inFlight).rejects.toThrow(/terminated/i);
+  });
+
+  it('observes the sheet completion when destroyed before a preview is ready', async () => {
+    const { wb, worker } = makeWorkbook();
+    const workbook = wb as XlsxWorkbook;
+    Object.assign(workbook, {
+      parsedWorkbook: { workbook: { sheets: [{ name: 'Sheet1' }] }, sharedStrings: [], styles: {} },
+    });
+    let opened!: () => void;
+    const opening = new Promise<void>((resolve) => { opened = resolve; });
+    vi.spyOn(worker, 'postMessage').mockImplementation((message) => {
+      if ((message as { type?: string }).type === 'openSheetSession') opened();
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const preview = acquireXlsxWorksheetPreview(workbook, 0);
+      // Keep the real WorkerBridge request pending until teardown rejects it.
+      await opening;
+      workbook.destroy();
+      await expect(preview).rejects.toThrow('XLSX workbook has been destroyed');
+      await flush();
+      expect(worker.terminated).toBe(true);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      workbook.destroy();
+    }
   });
 
   it('is safe to call destroy() twice', () => {
@@ -190,10 +224,11 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
 
     const { wb } = makeWorkbook();
     const retainedFontSets = (wb as unknown as {
-      retainedFontSets: Map<FontFaceSet, { refs: number; faces: FontFace[]; loading: Promise<FontFace[]> }>;
+      retainedFontSets: Map<FontFaceSet, { refs: number; loaded: { google: FontFace[]; office: { faces: FontFace[]; routes: Record<string, never> } }; loading: Promise<unknown> }>;
     }).retainedFontSets;
     const fontSet = (G.document as { fonts: FontFaceSet }).fonts;
-    retainedFontSets.set(fontSet, { refs: 1, faces: held, loading: Promise.resolve(held) });
+    const loaded = { google: held, office: { faces: [], routes: {} } };
+    retainedFontSets.set(fontSet, { refs: 1, loaded, loading: Promise.resolve(loaded) });
     wb.destroy();
 
     expect(added).toHaveLength(0);
@@ -203,7 +238,12 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
   it('an in-flight destroy releases once and preserves another workbook holder', async () => {
     const { added } = installFontFaceSet();
     let resolveFetch!: (response: { ok: boolean; text(): Promise<string> }) => void;
-    G.fetch = vi.fn(() => new Promise((resolve) => { resolveFetch = resolve; }));
+    let signalFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>(resolve => { signalFetchStarted = resolve; });
+    G.fetch = vi.fn(() => new Promise((resolve) => {
+      resolveFetch = resolve;
+      signalFetchStarted();
+    }));
     const first = makeWorkbook().wb as unknown as XlsxWorkbook;
     const second = makeWorkbook().wb as unknown as XlsxWorkbook;
     (first as unknown as { googleFontNames: string[] }).googleFontNames = ['Cambria'];
@@ -212,6 +252,9 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
 
     const firstRetain = first[retainXlsxViewerFonts](targetDocument);
     const secondRetain = second[retainXlsxViewerFonts](targetDocument);
+    // Destroy during the actual pending request, independently of whether the
+    // shared loader starts that request synchronously or through its queue.
+    await fetchStarted;
     first.destroy();
     resolveFetch({ ok: true, text: async () => CSS });
     const [releaseFirst] = await Promise.all([firstRetain, secondRetain]);
@@ -219,6 +262,66 @@ describe('XlsxWorkbook.destroy() — rejects in-flight worker requests', () => {
 
     expect(added).toHaveLength(1);
     second.destroy();
+    expect(added).toHaveLength(0);
+  });
+
+  it('retains a sheet-only shape face until its empty-bootstrap workbook closes', async () => {
+    const { added } = installFontFaceSet();
+    const { wb } = makeWorkbook();
+    const workbook = wb as unknown as XlsxWorkbook;
+    const targetDocument = G.document as Document;
+    const internals = workbook as unknown as {
+      retainedFontSets: Map<FontFaceSet, { loaded: { office: { routes: Record<string, unknown> } } }>;
+      retainFontsInSet(set: FontFaceSet): Promise<() => void>;
+      retainWorksheetOfficeFonts(worksheet: object): Promise<void>;
+    };
+    // load() owns the document registry before any worksheet has a request;
+    // the viewer holds a separate reference to that same registry.
+    await internals.retainFontsInSet(targetDocument.fonts);
+    const releaseViewer = await workbook[retainXlsxViewerFonts](targetDocument);
+    expect(added).toHaveLength(0);
+    await internals.retainWorksheetOfficeFonts({
+      rows: [],
+      shapeGroups: [{ shapes: [{ text: {
+        anchor: 't', wrap: 'square', autoFit: 'none',
+        paragraphs: [{ runs: [{ type: 'text', text: 'Heading',
+          fontFace: 'Meiryo UI', fontFaceEa: 'Meiryo UI', bold: true, size: 25 }] }],
+      } }] }],
+    });
+
+    const retained = internals.retainedFontSets.get(targetDocument.fonts);
+    expect(retained?.loaded.office.routes['meiryo ui:700:normal']).toBeDefined();
+    expect(added).toHaveLength(1);
+    releaseViewer();
+    expect(added).toHaveLength(1);
+    wb.destroy();
+    expect(added).toHaveLength(0);
+    expect(internals.retainedFontSets.size).toBe(0);
+  });
+
+  it('releases a worksheet face if its popup closes during the extra tuple load', async () => {
+    const { added } = installFontFaceSet();
+    const { wb } = makeWorkbook();
+    const set = (G.document as { fonts: FontFaceSet }).fonts;
+    const loaded = { google: [], office: { faces: [], routes: {} } };
+    let resolveInitial!: (value: typeof loaded) => void;
+    const loading = new Promise<typeof loaded>((resolve) => { resolveInitial = resolve; });
+    const retained = { refs: 1, loaded: null, loading };
+    const internals = wb as unknown as {
+      retainedFontSets: Map<FontFaceSet, typeof retained>;
+      retainWorksheetOfficeFonts(worksheet: object): Promise<void>;
+    };
+    internals.retainedFontSets.set(set, retained);
+    const load = internals.retainWorksheetOfficeFonts({
+      rows: [{ cells: [{ value: { type: 'text', runs: [
+        { text: 'x', font: { name: 'Calibri', bold: true, italic: false } },
+      ] } }] }],
+    });
+    // The popup closes while the initial font promise still holds the load.
+    retained.refs = 0;
+    internals.retainedFontSets.delete(set);
+    resolveInitial(loaded);
+    await load;
     expect(added).toHaveLength(0);
   });
 });
@@ -240,6 +343,9 @@ describe('XlsxWorkbook.destroy() — drops the shared image caches (GPU-leak gua
     const instance = Object.create(XlsxWorkbook.prototype) as Record<string, unknown>;
     instance.bridge = bridge;
     instance.sheetCache = new Map();
+    instance.sheetCacheUsage = new Map();
+    instance.sheetLeases = new Map();
+    instance.evictingSheets = new Map();
     instance.sheetLoads = new Map();
     instance.rawParts = new BoundedRawPartCache({ maxEntries: 4, maxBytes: 1024 });
     instance.googleFontNames = [];

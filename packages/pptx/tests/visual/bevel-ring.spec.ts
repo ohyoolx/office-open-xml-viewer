@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 /**
- * Acceptance test for the slide-6 sp3d bevel ring (private/sample-4.pptx, the
+ * Acceptance test for the slide-6 sp3d bevel ring (private/pptx/sample-4.pptx, the
  * tilted-ellipse photo with a 15 pt a:ln beige border, bevelT hardEdge,
  * extrusionH and outerShdw under a perspectiveFront camera).
  *
@@ -18,10 +18,12 @@ import { dirname, join } from 'node:path';
  * apex. The defect exists at every scale but its pixel size grows with the
  * render scale, which is why small-canvas verifications kept missing it.
  *
- * Ground truth (sample-4.pdf p6): the ring is a CONTINUOUS pale-beige band of
- * the FULL border width on every apex — a soft outer shadow outside it, then
- * the bevel-lit beige band straddling the silhouette, then the photo, with NO
- * white interruption, no straight cut, and no saturated-white lit lip.
+ * Ground truth (sample-4.pdf p6, Windows PowerPoint export): the ring is a
+ * CONTINUOUS pale-beige band on every apex — a soft outer shadow outside it,
+ * then the bevel-lit beige band straddling the silhouette, then the photo, with
+ * NO white interruption, no straight cut, and no saturated-white lit lip. The
+ * hardEdge profile rises steeply at the silhouette, so a thin darkened outer
+ * edge is part of the band in Office too and is not counted as beige.
  *
  * The .pptx is private (never committed). Like the other private-sample specs
  * this one SKIPS when the fixture is absent so a clean checkout stays green.
@@ -32,7 +34,7 @@ import { dirname, join } from 'node:path';
  * 10 px loss inside the shadow falloff, dpr2 makes it a visible cut.
  */
 
-const SAMPLE = 'private/sample-4';
+const SAMPLE = 'private/pptx/sample-4';
 const SLIDE_INDEX = 5; // PDF p6, 0-based
 
 // EMU geometry of the deck (ppt/presentation.xml sldSz) and the ring border
@@ -83,8 +85,6 @@ test.describe('pptx slide-6 sp3d bevel ring', () => {
           const msg = await page.evaluate(() => document.body.dataset.errorMessage ?? '');
           throw new Error(`Fixture error: ${msg}`);
         }
-        await page.waitForTimeout(200);
-
         // Sample the four apex cross-sections off the live canvas and classify
         // each ray's pixels into page-white / warm-rim / photo. Acceptance
         // contract, per the PDF ground truth:
@@ -103,10 +103,13 @@ test.describe('pptx slide-6 sp3d bevel ring', () => {
         // What this spec locks is the band's WIDTH and CONTINUITY, which is
         // what the offscreen box clip destroyed.
         //
-        // The floor is 0.8 × the border's device-px width: the missing ~0.2
-        // allows the antialiased blend into the outer shadow and the photo.
-        // The pre-fix renders measure ~0.5 × (half the band clipped), so the
-        // floor separates the two states with margin on both sides.
+        // The floor is 0.65 × the border's device-px width, measured on the
+        // Office PDF. With this classifier, sample-4.pdf p6 rasterized at
+        // 1280/1920/2560 px has its shortest apex run at TOP: 14/20, 20/30 and
+        // 27/40 device px (0.67–0.70 ×). The darkened steep outer edge of the
+        // hardEdge lip and the blends into the shadow and the photo take the
+        // rest. The clipped-offscreen defect measured ~0.5 × (half the band
+        // lost), so 0.65 still separates it while accepting Office's own band.
         const result = await page.evaluate(
           ({ slideWEmu, strokeWEmu }) => {
             const canvas = document.querySelector('canvas') as HTMLCanvasElement;
@@ -114,7 +117,7 @@ test.describe('pptx slide-6 sp3d bevel ring', () => {
             const cw = canvas.width;
             const ch = canvas.height;
             const strokePx = (strokeWEmu / slideWEmu) * cw;
-            const minRim = Math.max(8, Math.round(strokePx * 0.8));
+            const minRim = Math.max(8, Math.round(strokePx * 0.65));
             const D = ctx.getImageData(0, 0, cw, ch).data;
             const at = (x: number, y: number): [number, number, number] => {
               const o = (Math.round(y) * cw + Math.round(x)) * 4;

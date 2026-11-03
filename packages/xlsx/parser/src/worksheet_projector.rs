@@ -8,9 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 #[cfg(test)]
 use std::io::Cursor;
-#[cfg(test)]
-use std::io::Read;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::rc::Rc;
 
 use ooxml_common::bounded_xml::{
@@ -47,7 +45,49 @@ use crate::{
 pub(super) struct StreamedSheetData {
     pub(super) shell_xml: String,
     pub(super) rows: Vec<Row>,
-    pub(super) row_heights: BTreeMap<u32, f64>,
+    pub(super) row_geometry: AuthoredRowGeometry,
+}
+
+/// Row-band facts authored on `<row>` elements (ECMA-376 §18.3.1.73), recorded
+/// while `sheetData` streams so the shell parse can resolve sheet-level rules
+/// (`sheetFormatPr@zeroHeight`, §18.3.1.81) after the rows themselves have been
+/// emitted and dropped. Both the bounded row projector and the lexical
+/// worksheet preview record through [`AuthoredRowGeometry::record`] with a
+/// height from [`authored_row_height`], so the two paths cannot diverge.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct AuthoredRowGeometry {
+    /// Hidden rows (zero) and rows with a valid `@ht`, last authored row wins.
+    pub(super) heights: BTreeMap<u32, f64>,
+    /// Visible rows without a valid `@ht`, as inclusive index runs in
+    /// document order. Contiguous authored rows collapse into one run, so this
+    /// stays small for ordinary data and never exceeds the row count.
+    pub(super) unspecified_visible: Vec<(u32, u32)>,
+}
+
+impl AuthoredRowGeometry {
+    pub(super) fn record(&mut self, index: u32, height: Option<f64>) {
+        match height {
+            Some(height) => {
+                self.heights.insert(index, height);
+            }
+            None => match self.unspecified_visible.last_mut() {
+                Some((_, last)) if last.checked_add(1) == Some(index) => *last = index,
+                _ => self.unspecified_visible.push((index, index)),
+            },
+        }
+    }
+}
+
+/// Authored band of one row. `hidden` (already read as an XML boolean) forces
+/// a zero band; otherwise `@ht` is the height in points when it is a finite,
+/// nonnegative number. `customHeight` records how the height was set and does
+/// not gate the value. `None` means the sheet default applies.
+pub(super) fn authored_row_height(hidden: bool, ht: Option<&str>) -> Option<f64> {
+    if hidden {
+        return Some(0.0);
+    }
+    ht.and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// Hidden safety ceiling for one lexical XML event. `quick_xml` otherwise keeps
@@ -76,6 +116,7 @@ const STREAMED_XML_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
 pub(super) enum WorksheetProjectorLimitKind {
     XmlEventBytes,
     XmlContextBytes,
+    XmlNamespaceDeclarations,
     XmlDepth,
     RowProjectionBytes,
     WorksheetShellBytes,
@@ -86,6 +127,7 @@ impl WorksheetProjectorLimitKind {
         match self {
             Self::XmlEventBytes => "xml-event-bytes",
             Self::XmlContextBytes => "xml-context-bytes",
+            Self::XmlNamespaceDeclarations => "xml-namespace-declarations",
             Self::XmlDepth => "xml-depth",
             Self::RowProjectionBytes => "row-projection-bytes",
             Self::WorksheetShellBytes => "worksheet-shell-bytes",
@@ -189,6 +231,9 @@ fn report_projector_limit(
     let common_kind = match kind {
         WorksheetProjectorLimitKind::XmlEventBytes => HardResourceLimitKind::XmlEventBytes,
         WorksheetProjectorLimitKind::XmlContextBytes => HardResourceLimitKind::XmlContextBytes,
+        WorksheetProjectorLimitKind::XmlNamespaceDeclarations => {
+            HardResourceLimitKind::XmlNamespaceDeclarations
+        }
         WorksheetProjectorLimitKind::XmlDepth => HardResourceLimitKind::XmlNestingDepth,
         WorksheetProjectorLimitKind::RowProjectionBytes => {
             HardResourceLimitKind::WorksheetRowProjectionBytes
@@ -441,8 +486,9 @@ fn flush_streamed_rows(
                     && is_x_ns(node.tag_name().namespace())
             })
             .ok_or_else(|| "streamed worksheet row lost its SpreadsheetML namespace".to_string())?;
+        let row = parse_row_node(&row_node, prev_row_idx, shared_strings, theme_colors)?;
         rows.push(ProjectedWorksheetRow {
-            row: parse_row_node(&row_node, prev_row_idx, shared_strings, theme_colors)?,
+            row,
             projected_bytes: source.projected_arena_bytes(),
         });
     }
@@ -474,14 +520,7 @@ fn parse_row_node(
     let row_idx = resolve_implicit_ordinal(explicit_row, prev_row_idx, SpreadsheetOrdinal::Row)?;
     let hidden = attr_bool(node, "hidden").unwrap_or(false);
     // ECMA-376 §18.3.1.73 `<row>@ht` is the row height in points.
-    // `customHeight` describes how it was set and does not gate the value.
-    let height = if hidden {
-        Some(0.0)
-    } else {
-        node.attribute("ht")
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value >= 0.0)
-    };
+    let height = authored_row_height(hidden, node.attribute("ht"));
     let custom_height = attr_bool(node, "customHeight").unwrap_or(false);
     let outline_level = node
         .attribute("outlineLevel")
@@ -832,7 +871,12 @@ struct StreamedRowBatch {
     max_row_arena_bytes: usize,
     max_single_row_projection_bytes: usize,
     previous_index: u32,
-    heights: BTreeMap<u32, f64>,
+    geometry: AuthoredRowGeometry,
+}
+
+struct RowProjectionInputs<'a> {
+    shared_strings: &'a [SharedString],
+    theme_colors: &'a [String],
 }
 
 impl StreamedRowBatch {
@@ -875,9 +919,7 @@ impl StreamedRowBatch {
             shared_strings,
             theme_colors,
         )? {
-            if let Some(height) = row.row.height {
-                self.heights.insert(row.row.index, height);
-            }
+            self.geometry.record(row.row.index, row.row.height);
             ready_rows.push_back(row);
         }
         self.pending_bytes = 0;
@@ -889,8 +931,7 @@ impl StreamedRowBatch {
         row: PendingStreamedRow,
         row_projection_limit: usize,
         part: Option<&str>,
-        shared_strings: &[SharedString],
-        theme_colors: &[String],
+        inputs: RowProjectionInputs<'_>,
         ready_rows: &mut VecDeque<ProjectedWorksheetRow>,
     ) -> Result<(), WorksheetProjectorError> {
         let projected_bytes = row.projected_arena_bytes();
@@ -907,11 +948,11 @@ impl StreamedRowBatch {
         // batch-arena ceiling. A single row may exceed that batching target but
         // has already passed the separate hard row-projection invariant above.
         if self.would_exceed_byte_ceiling(&row) {
-            self.dispatch(shared_strings, theme_colors, ready_rows)?;
+            self.dispatch(inputs.shared_strings, inputs.theme_colors, ready_rows)?;
         }
         self.push(row);
         if self.should_dispatch() {
-            self.dispatch(shared_strings, theme_colors, ready_rows)?;
+            self.dispatch(inputs.shared_strings, inputs.theme_colors, ready_rows)?;
         }
         Ok(())
     }
@@ -920,7 +961,7 @@ impl StreamedRowBatch {
 #[derive(Debug)]
 pub(super) struct StreamedWorksheetRows {
     pub(super) shell_xml: String,
-    pub(super) row_heights: BTreeMap<u32, f64>,
+    pub(super) row_geometry: AuthoredRowGeometry,
     #[cfg(test)]
     max_row_arena_bytes: usize,
     #[cfg(test)]
@@ -1088,14 +1129,18 @@ where
             row,
             self.row_projection_limit,
             self.part.as_deref(),
-            self.shared_strings
-                .as_ref()
-                .expect("active projector owns shared strings")
-                .as_ref(),
-            self.theme_colors
-                .as_ref()
-                .expect("active projector owns theme colors")
-                .as_ref(),
+            RowProjectionInputs {
+                shared_strings: self
+                    .shared_strings
+                    .as_ref()
+                    .expect("active projector owns shared strings")
+                    .as_ref(),
+                theme_colors: self
+                    .theme_colors
+                    .as_ref()
+                    .expect("active projector owns theme colors")
+                    .as_ref(),
+            },
             &mut self.ready_rows,
         )
     }
@@ -1114,6 +1159,14 @@ where
                 }
                 return Err(worksheet_projector_limit(
                     WorksheetProjectorLimitKind::XmlEventBytes,
+                    self.part.as_deref(),
+                    limit,
+                    observed,
+                ));
+            }
+            Err(BoundedXmlReadError::NamespaceDeclarationLimit { limit, observed }) => {
+                return Err(worksheet_projector_limit(
+                    WorksheetProjectorLimitKind::XmlNamespaceDeclarations,
                     self.part.as_deref(),
                     limit,
                     observed,
@@ -1512,7 +1565,7 @@ where
         let max_single_row_projection_bytes = self.row_batch.max_single_row_projection_bytes;
         self.finished_tail = Some(StreamedWorksheetRows {
             shell_xml,
-            row_heights: std::mem::take(&mut self.row_batch.heights),
+            row_geometry: std::mem::take(&mut self.row_batch.geometry),
             #[cfg(test)]
             max_row_arena_bytes,
             #[cfg(test)]
@@ -1646,6 +1699,31 @@ where
     }
 }
 
+impl<S, T> WorksheetRowProjector<BufReader<Box<dyn Read>>, S, T>
+where
+    S: AsRef<[SharedString]>,
+    T: AsRef<[String]>,
+{
+    pub(super) fn from_owned_reader(
+        source: Box<dyn Read>,
+        part: String,
+        reporter: PackageLimitReporter,
+        shared_strings: S,
+        theme_colors: T,
+    ) -> Self {
+        Self::with_limits_and_reporter(
+            BufReader::new(source),
+            shared_strings,
+            theme_colors,
+            STREAMED_XML_EVENT_BYTES,
+            STREAMED_ROW_PROJECTION_BYTES,
+            STREAMED_WORKSHEET_SHELL_BYTES,
+            Some(part),
+            Some(reporter),
+        )
+    }
+}
+
 /// Stream the MCE-processed `CT_SheetData` rows through a bounded batch parser.
 ///
 /// ECMA-376 Part 3 §§9.2–9.4 define the processed infoset against which the
@@ -1723,7 +1801,7 @@ pub(super) fn stream_sheet_data(
     Ok(StreamedSheetData {
         shell_xml: streamed.shell_xml,
         rows,
-        row_heights: streamed.row_heights,
+        row_geometry: streamed.row_geometry,
     })
 }
 #[cfg(test)]
@@ -1748,7 +1826,7 @@ mod worksheet_streaming_tests {
                     return Ok(StreamedSheetData {
                         shell_xml: tail.shell_xml,
                         rows,
-                        row_heights: tail.row_heights,
+                        row_geometry: tail.row_geometry,
                     });
                 }
             }
@@ -1795,10 +1873,10 @@ mod worksheet_streaming_tests {
         xml: &str,
         shared_strings: &[SharedString],
         theme_colors: &[String],
-    ) -> (Vec<Row>, BTreeMap<u32, f64>) {
+    ) -> (Vec<Row>, AuthoredRowGeometry) {
         let doc = parse_guarded(xml).expect("legacy full worksheet DOM parses");
         let mut previous_row = 0;
-        let mut heights = BTreeMap::new();
+        let mut heights = AuthoredRowGeometry::default();
         let rows = doc
             .descendants()
             .filter(|node| {
@@ -1809,9 +1887,7 @@ mod worksheet_streaming_tests {
             .map(|node| {
                 let row = parse_row_node(&node, &mut previous_row, shared_strings, theme_colors)
                     .expect("reference worksheet row parses");
-                if let Some(height) = row.height {
-                    heights.insert(row.index, height);
-                }
+                heights.record(row.index, row.height);
                 row
             })
             .collect();
@@ -1825,7 +1901,7 @@ mod worksheet_streaming_tests {
             serde_json::to_value(&streamed.rows).expect("streamed rows serialize"),
             serde_json::to_value(&dom_rows).expect("DOM rows serialize")
         );
-        assert_eq!(streamed.row_heights, dom_heights);
+        assert_eq!(streamed.row_geometry, dom_heights);
         let shell = parse_guarded(&streamed.shell_xml).expect("worksheet shell stays valid");
         assert!(!shell
             .descendants()
@@ -1867,7 +1943,7 @@ mod worksheet_streaming_tests {
             serde_json::to_value(actual.rows).unwrap(),
             serde_json::to_value(expected.rows).unwrap()
         );
-        assert_eq!(actual.row_heights, expected.row_heights);
+        assert_eq!(actual.row_geometry, expected.row_geometry);
         assert_eq!(actual.shell_xml, expected.shell_xml);
     }
 
@@ -1950,6 +2026,35 @@ mod worksheet_streaming_tests {
             }
         );
         assert_eq!(projector.max_event_bytes(), STREAMED_XML_EVENT_BYTES);
+    }
+
+    #[test]
+    fn namespace_count_limit_is_typed_and_latched() {
+        use ooxml_common::resource::{OoxmlFormat, ResourceGovernor};
+        let declarations = (0..257)
+            .map(|n| format!(r#" xmlns:n{n}="urn:{n}""#))
+            .collect::<String>();
+        let xml = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"{declarations}><sheetData/></worksheet>"#
+        );
+        let governor = ResourceGovernor::from_wasm(OoxmlFormat::Xlsx, None, None, None);
+        let scope = governor.scope("parse");
+        let mut projector = WorksheetRowProjector::new(Cursor::new(xml.as_bytes()), &[], &[]);
+        let error = projector.next_item().unwrap_err().to_string();
+        let payload: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("OOXML_RESOURCE_LIMIT:")
+                .expect("typed namespace limit"),
+        )
+        .unwrap();
+        assert_eq!(payload["details"]["violation"]["resource"], "xml-context");
+        assert_eq!(payload["details"]["violation"]["metric"], "declarations");
+        assert_eq!(payload["details"]["violation"]["limit"], 256);
+        assert_eq!(payload["details"]["violation"]["observed"], 257);
+        assert_eq!(
+            scope.resource_limit_error().as_deref(),
+            Some(error.as_str())
+        );
     }
 
     #[test]
@@ -2209,8 +2314,10 @@ mod worksheet_streaming_tests {
                 },
                 row_limit,
                 None,
-                &[],
-                &[],
+                RowProjectionInputs {
+                    shared_strings: &[],
+                    theme_colors: &[],
+                },
                 &mut VecDeque::new(),
             )
             .expect_err("row batch independently enforces the row cap");
@@ -2426,7 +2533,7 @@ mod worksheet_streaming_tests {
         assert!(projector.active_row.is_none());
         assert!(projector.shell_xml.is_empty());
         assert!(projector.row_batch.pending.is_empty());
-        assert!(projector.row_batch.heights.is_empty());
+        assert_eq!(projector.row_batch.geometry, AuthoredRowGeometry::default());
         assert!(projector.ready_rows.is_empty());
         assert!(projector.finished_tail.is_none());
         assert!(shared_weak.upgrade().is_none());

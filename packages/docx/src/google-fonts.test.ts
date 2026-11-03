@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { FontPreloadEntry } from '@silurus/ooxml-core';
-import { DOCX_GOOGLE_FONTS, docxFontPreloadNames } from './google-fonts.js';
+import {
+  DOCX_GOOGLE_FONTS,
+  docxFontPreloadNames,
+  docxGoogleFontPlan,
+  docxOfficeFontFallbackRequests,
+} from './google-fonts.js';
 import type { DocxDocumentModel } from './types.js';
 
 // Verbatim snapshot of the DOCX Office-font substitute map BEFORE the shared
@@ -75,6 +80,114 @@ describe('docxFontPreloadNames — script-aware preload', () => {
   });
 });
 
+it('collects the distinct authored font tuples used by rendered text', () => {
+  const doc = docWith('body', 'Aptos', 'Aptos');
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'regular', fontFamily: 'Calibri', bold: false, italic: false },
+    { type: 'text', text: 'emphasis', fontFamily: 'calibri', bold: true, italic: true },
+    { type: 'text', text: 'light', fontFamily: 'Calibri Light', bold: false, italic: false },
+  ];
+  const requests = docxOfficeFontFallbackRequests(doc);
+  expect(requests).toContainEqual({ family: 'Calibri', weight: 400, style: 'normal' });
+  expect(requests).toContainEqual({ family: 'calibri', weight: 700, style: 'italic' });
+  expect(requests).toContainEqual({ family: 'Calibri Light', weight: 400, style: 'normal' });
+  expect(requests.filter((request) => request.family.toLowerCase() === 'calibri' && !request.presenceOnly))
+    .toHaveLength(2);
+  // One family presence probe per authored family, independent of its tuples.
+  expect(requests.filter((request) => request.presenceOnly).map((request) => request.family))
+    .toEqual(['Aptos', 'Calibri', 'Calibri Light']);
+});
+
+it('also requests the catalogued regular face of a styled tuple the catalog lacks', () => {
+  // LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY: main and worker share this list,
+  // so both load the regular face a synthesized bold run is compared with.
+  const doc = docWith('body', 'Arial', 'Arial');
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: '見出し', fontFamily: 'MS Mincho', bold: true, italic: false },
+  ];
+  const requests = docxOfficeFontFallbackRequests(doc);
+  expect(requests).toContainEqual({ family: 'MS Mincho', weight: 700, style: 'normal' });
+  expect(requests).toContainEqual({ family: 'MS Mincho', weight: 400, style: 'normal' });
+});
+
+it('preloads every registered rendered family without theme names and omits unregistered ones', () => {
+  const doc = docWith('body');
+  doc.majorFont = undefined;
+  doc.minorFont = undefined;
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'a', fontFamily: 'Ubuntu' },
+    { type: 'text', text: 'b', fontFamily: 'Arial', fontFamilyEastAsia: 'Roboto' },
+    { type: 'text', text: 'c', fontFamily: 'Arial', fontFamilyCs: 'Franklin Gothic Book' },
+  ];
+  expect(docxFontPreloadNames(doc)).toEqual([
+    undefined, undefined, 'Ubuntu', 'Roboto', 'Franklin Gothic Book',
+  ]);
+});
+
+it('checks substitute family presence independent of the styles used', () => {
+  const doc = docWith('body');
+  doc.majorFont = undefined;
+  doc.minorFont = undefined;
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'Bold only', fontFamily: 'Franklin Gothic Book', bold: true },
+  ];
+  // The bold tuple, plus the catalogued regular face the uncatalogued bold
+  // is compared with (LIBRARY_SYNTHESIZED_FACE_LINE_GEOMETRY), are style
+  // requests; presence is asked for the family.
+  const requests = docxOfficeFontFallbackRequests(doc, { useGoogleFonts: true });
+  expect(requests.filter((request) => request.family === 'Franklin Gothic Book')).toEqual([
+    { family: 'Franklin Gothic Book', weight: 700, style: 'normal' },
+    { family: 'Franklin Gothic Book', weight: 400, style: 'normal' },
+    { family: 'Franklin Gothic Book', presenceOnly: true },
+  ]);
+  // Without web fonts the family is still probed once (layout's installed
+  // families), so presence never depends on the styles the document uses.
+  expect(docxOfficeFontFallbackRequests(doc).filter((request) => request.presenceOnly))
+    .toEqual([{ family: 'Franklin Gothic Book', presenceOnly: true }]);
+
+  for (const officeFonts of [
+    { routes: {}, installed: ['franklin gothic book'] },
+    { routes: { 'franklin gothic book:700:normal': {} } },
+  ]) {
+    const plan = docxGoogleFontPlan(doc, undefined, officeFonts);
+    expect(plan.names).not.toContain('Franklin Gothic Book');
+    expect(plan.installedSubstituteFamilies).toEqual(['franklin gothic book']);
+  }
+  expect(docxGoogleFontPlan(doc, undefined, { routes: {} }).names).toContain('Franklin Gothic Book');
+});
+
+it('loads the themed bold face when a run inherits its family', () => {
+  const doc = docWith('body');
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'heading', bold: true },
+  ];
+  expect(docxOfficeFontFallbackRequests(doc)).toContainEqual({
+    family: 'Calibri', weight: 700, style: 'normal',
+  });
+});
+
+it('loads the inherited Latin face when only an East Asian face is authored', () => {
+  const doc = docWith('Latin text', 'Aptos', 'Calibri');
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'Latin text', fontFamilyEastAsia: 'Meiryo', bold: true },
+  ];
+  const requests = docxOfficeFontFallbackRequests(doc);
+  expect(requests).toContainEqual({ family: 'Calibri', weight: 400, style: 'normal' });
+  expect(requests).toContainEqual({ family: 'Calibri', weight: 700, style: 'normal' });
+  expect(requests).toContainEqual({ family: 'Meiryo', weight: 700, style: 'normal' });
+});
+
+it('does not load the theme face for an explicitly authored Latin face', () => {
+  const doc = docWith('Latin text', 'Aptos', 'Calibri');
+  (doc.body[0] as { runs: object[] }).runs = [
+    { type: 'text', text: 'Latin text', fontFamily: 'Arial', fontFamilyEastAsia: 'Meiryo', bold: true },
+  ];
+  const requests = docxOfficeFontFallbackRequests(doc);
+  expect(requests).not.toContainEqual({ family: 'Calibri', weight: 700, style: 'normal' });
+  expect(requests).toContainEqual({ family: 'Arial', weight: 700, style: 'normal' });
+  expect(requests).toContainEqual({ family: 'Meiryo', weight: 700, style: 'normal' });
+});
+
 describe('DOCX_GOOGLE_FONTS — theme typeface coverage', () => {
   // Templates whose theme minorFont is Ubuntu (e.g. sample-11) emit runs with
   // family "Ubuntu". Without an explicit mapping the preloader skips the name
@@ -99,30 +212,31 @@ describe('DOCX_GOOGLE_FONTS — theme typeface coverage', () => {
 });
 
 describe('DOCX_GOOGLE_FONTS — shared registry consolidation (oracle)', () => {
-  it('preserves every pre-consolidation entry byte-for-byte', () => {
+  it('preserves complete loading entries with explicit Arabic scope metadata', () => {
     for (const [key, entry] of Object.entries(DOCX_GOOGLE_FONTS_OLD)) {
-      expect(DOCX_GOOGLE_FONTS[key], `entry "${key}"`).toEqual(entry);
+      // Loading entries remain the frozen oracle; only these five authored
+      // visual alternatives carry the explicitly expected Arabic scope tag.
+      const scoped = new Set(['sakkal majalla', 'traditional arabic', 'simplified arabic',
+        'arabic typesetting', 'univers next arabic']);
+      expect(DOCX_GOOGLE_FONTS[key], `entry "${key}"`)
+        .toEqual(scoped.has(key) ? { ...entry, script: 'arabic' } : entry);
     }
   });
 
-  it('adds only the safe, documented Office-face keys', () => {
+  it('adds only supported text-face alternatives', () => {
     // Consolidating everything into the shared GOOGLE_FONT_SUBSTITUTES pulls the
-    // Office face names into docx too. Calibri Light and Cambria Math reduce to
-    // the same metric substitute as their base family; the two Franklin Gothic
-    // faces share Libre Franklin. A docx that happens to request any of them
-    // now avoids a wider system fallback.
+    // The Franklin Gothic faces share Libre Franklin. Calibri Light needs a
+    // distinct light face, and Cambria Math needs mathematical font support.
     const oldScriptKeys = new Set(Object.keys(DOCX_GOOGLE_FONTS_OLD));
     const added = Object.keys(DOCX_GOOGLE_FONTS).filter(
       (k) => !oldScriptKeys.has(k) && !k.startsWith('noto '),
     );
     expect(new Set(added)).toEqual(new Set([
-      'calibri light',
-      'cambria math',
       'franklin gothic book',
       'franklin gothic medium',
     ]));
-    expect(DOCX_GOOGLE_FONTS['calibri light']).toEqual(DOCX_GOOGLE_FONTS['calibri']);
-    expect(DOCX_GOOGLE_FONTS['cambria math']).toEqual(DOCX_GOOGLE_FONTS['cambria']);
+    expect(DOCX_GOOGLE_FONTS['calibri light']).toBeUndefined();
+    expect(DOCX_GOOGLE_FONTS['cambria math']).toBeUndefined();
     expect(DOCX_GOOGLE_FONTS['franklin gothic medium']).toMatchObject({
       loadFamily: 'Libre Franklin',
     });
@@ -153,4 +267,15 @@ it('preloads the explicit Chinese region even when the same run contains kana', 
   Object.assign((doc.body[0] as { runs: object[] }).runs[0], { langEastAsia: 'zh-CN' });
   expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans SC');
   expect(docxFontPreloadNames(doc, 'tc')).toContain('Noto Sans JP');
+});
+
+it('keeps default native preflight at its existing slot projection', () => {
+  const doc = docWith('body');
+  (doc.body[0] as { runs: object[] }).runs = [{ type: 'text', text: 'body',
+    fontFamily: 'Arial', fontSlots: { direct: { ascii: 'Arial', highAnsi: 'Cambria',
+      eastAsia: 'Arial', complexScript: 'Arial' }, themePresent: {} } }];
+  expect(docxOfficeFontFallbackRequests(doc).some((request) => request.family === 'Cambria')).toBe(false);
+  expect(docxOfficeFontFallbackRequests(doc, { useGoogleFonts: true }))
+    .toContainEqual({ family: 'Cambria', weight: 400, style: 'normal' });
+  expect(docxFontPreloadNames(doc)).toContain('Cambria');
 });

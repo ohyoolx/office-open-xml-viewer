@@ -1,11 +1,11 @@
 import {
   normalizeLoadResourceOptions,
   OoxmlResourceMetricsSession,
-  parseResourceLimitError,
+  parseTypedParserError,
   resourcePolicyForWasm,
 } from '@silurus/ooxml-core/worker';
 import {
-  WasmRuntimeGenerationHost,
+  wasmRuntimeSingleton,
   type WasmArchiveHandle,
   type WasmModuleRuntime,
 } from '@silurus/ooxml-core/internal/wasm-runtime-generation';
@@ -14,6 +14,9 @@ import type { PptxSlideCursorArchive } from '../slide-cursor-operation.js';
 import type { PresentationBootstrap } from '../worker-protocol.js';
 // @ts-ignore wasm-pack generated module has no declaration entry
 import * as pptxWasm from '../wasm/pptx_parser.js';
+import { createAbortError, throwIfAborted } from '@silurus/ooxml-core/internal/abort';
+
+const ABORT_MESSAGE = 'PPTX presentation session was aborted';
 
 export interface PptxNodeAcquisitionOptions {
   readonly resourceLimits?: import('@silurus/ooxml-core').OoxmlResourceLimits;
@@ -41,21 +44,10 @@ interface PptxArchiveConstructor {
   ): PptxNodeArchive;
 }
 
-let runtimeModule: WebAssembly.Module | undefined;
-let runtimeHost: WasmRuntimeGenerationHost<PptxNodeArchive> | undefined;
-
-function formatRuntime(module: WebAssembly.Module): WasmRuntimeGenerationHost<PptxNodeArchive> {
-  if (!runtimeHost) {
-    runtimeModule = module;
-    runtimeHost = new WasmRuntimeGenerationHost(
-      pptxWasm as unknown as WasmModuleRuntime,
-      module,
-    );
-  } else if (runtimeModule !== module) {
-    throw new Error('PPTX runtime was already initialized with another WebAssembly.Module');
-  }
-  return runtimeHost;
-}
+const formatRuntime = wasmRuntimeSingleton<PptxNodeArchive>(
+  pptxWasm as unknown as WasmModuleRuntime,
+  'PPTX',
+);
 
 export interface PptxNodeAcquisition {
   readonly archive: PptxNodeArchive;
@@ -67,7 +59,7 @@ export interface PptxNodeAcquisition {
 /** Format-owned archive acquisition and bootstrap projection for Node. */
 export async function acquirePptxNodeSession(
   bytes: Uint8Array,
-  module: WebAssembly.Module,
+  wasmModule: WebAssembly.Module,
   options: PptxNodeAcquisitionOptions = {},
 ): Promise<PptxNodeAcquisition> {
   const resourceOptions = normalizeLoadResourceOptions(options);
@@ -83,18 +75,18 @@ export async function acquirePptxNodeSession(
   metrics.setSourceBytes(bytes.byteLength);
   let handle: WasmArchiveHandle<PptxNodeArchive> | undefined;
   try {
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(resourceOptions.policy);
     const Archive = (pptxWasm as unknown as { PptxArchive: PptxArchiveConstructor }).PptxArchive;
-    handle = await formatRuntime(module).open(
+    handle = await formatRuntime(wasmModule).open(
       () => new Archive(bytes, maxEntry, maxTotal, maxEntries),
       {
         signal: options.signal,
-        abortError: createAbortError,
+        abortError: () => createAbortError(ABORT_MESSAGE),
         disposeOnAbort: (archive) => archive.free(),
       },
     );
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, ABORT_MESSAGE);
     const archive = handle.proxy;
     const bootstrap = normalizePresentationBootstrap(JSON.parse(
       new TextDecoder().decode(archive.presentation_bootstrap()),
@@ -108,19 +100,8 @@ export async function acquirePptxNodeSession(
     };
   } catch (error) {
     try { handle?.close((archive: PptxNodeArchive) => archive.free()); } catch {}
-    const normalized = parseResourceLimitError(error) ?? error;
+    const normalized = parseTypedParserError(error) ?? error;
     metrics.fail(normalized);
     throw normalized;
   }
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (!signal?.aborted) return;
-  throw createAbortError();
-}
-
-function createAbortError(): Error {
-  const error = new Error('PPTX presentation session was aborted');
-  error.name = 'AbortError';
-  return error;
 }

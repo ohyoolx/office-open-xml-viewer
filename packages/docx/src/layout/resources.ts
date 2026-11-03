@@ -3,7 +3,6 @@ import { stableFingerprint } from './fingerprint.js';
 import type { BodyElement, DocParagraph, DocxDocumentModel } from '../types.js';
 import type { BodyAcquisitionInputProjections } from './acquisition-input-projections.js';
 import type { MathNode } from '@silurus/ooxml-core';
-import { rasterExceedsBudget, sniffRasterDimensions } from '@silurus/ooxml-core';
 import { mathResourceKey } from './source-key.js';
 import { projectDocumentSnapshotResources } from './production-paint-resources.js';
 
@@ -103,25 +102,6 @@ export function createImageMetadataService(records: readonly ImageMetadataRecord
   });
 }
 
-export function rasterImageMetadataRecord(
-  resourceKey: string,
-  bytes: Uint8Array,
-  mimeType: string,
-  dpi: number,
-): ImageMetadataRecord {
-  const dimensions = sniffRasterDimensions(bytes);
-  if (!dimensions || rasterExceedsBudget(dimensions)) {
-    throw new Error(`Raster dimensions are unavailable or unsafe for ${resourceKey}`);
-  }
-  if (!Number.isFinite(dpi) || dpi <= 0) throw new RangeError('dpi must be positive');
-  return {
-    resourceKey,
-    widthPt: dimensions.width * 72 / dpi,
-    heightPt: dimensions.height * 72 / dpi,
-    mimeType,
-  };
-}
-
 export function createMathMetadataService(records: readonly MathLayoutResource[]): MathMetadataService {
   const snapshot = [...records]
     .map((record) => Object.freeze({
@@ -160,4 +140,19 @@ export function documentImageMetadataRecords(
     [],
     resolvePictureBulletSize,
   ).imageMetadata];
+}
+
+/** Atomic upright OMML in a quarter-turn text frame. Library layout policy:
+ * §22.1.2.77 keeps the math zone intact; the rendered height advances along
+ * the column, and rendered width reserves its cross extent. Paint already
+ * counter-rotates resources and swaps these retained logical axes back. */
+export function quarterTurnMathMetadataService(math: MathMetadataService): MathMetadataService {
+  return Object.freeze({
+    fingerprint: stableFingerprint('quarter-turn-math', math.fingerprint),
+    resolve(resourceKey: string): DeepReadonly<MathLayoutResource> {
+      const resource = math.resolve(resourceKey);
+      return Object.freeze({ ...resource, widthEm: resource.ascentEm + resource.descentEm,
+        ascentEm: resource.widthEm / 2, descentEm: resource.widthEm / 2 });
+    },
+  });
 }

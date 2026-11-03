@@ -4,8 +4,14 @@ import type {
 } from './types';
 import { createLayoutServices } from './layout-runtime.js';
 import { layoutDocument } from './document-layout.js';
-import type { DeepReadonly, DocumentLayout, TextPlacement } from './layout/types.js';
+import type { DeepReadonly, DocumentLayout, PaintNode, TextPlacement } from './layout/types.js';
 import { WORD_TRACK_CHANGE_AUTHOR_COLORS } from './layout/paint-compatibility.js';
+import {
+  bodyLayoutKernelOf,
+  createFieldAcquisitionServicesView,
+  createParagraphAcquisitionCacheServicesView,
+  layoutSourceStoreOf,
+} from './layout/runtime-state.js';
 
 // ECMA-376 §17.13.5 markup view rendering (`word-track-change-decoration` +
 // `word-track-change-author-palette` + `word-track-change-bar`): insertions
@@ -113,11 +119,100 @@ function placementByText(layout: DeepReadonly<DocumentLayout>, text: string): De
 
 const [ALICE_COLOR, BOB_COLOR] = WORD_TRACK_CHANGE_AUTHOR_COLORS;
 
+function storyRevisionDoc(story: 'header' | 'footer'): DocxDocumentModel {
+  const model = doc([
+    para(textRun('first page')),
+    { type: 'pageBreak' } as BodyElement,
+    para(textRun('second page')),
+  ]);
+  model[story === 'header' ? 'headers' : 'footers'].default = {
+    body: [
+      para(textRun('Alice', { kind: 'insertion', author: 'Alice' })),
+      para({
+        ...textRun('', { kind: 'insertion', author: 'Bob' }),
+        type: 'field', fieldType: 'numPages', instruction: 'NUMPAGES', fallbackText: '1',
+      } as DocRun),
+    ],
+  };
+  return model;
+}
+
+function revisionUnderlines(nodes: readonly DeepReadonly<PaintNode>[]) {
+  return nodes.flatMap(node => node.kind === 'paragraph'
+    ? node.lines.flatMap(line => line.placements.flatMap(placement => placement.kind === 'text'
+      ? [{ text: placement.text, decorations: placement.decorations.map(({ kind, color }) => ({ kind, color })) }]
+      : []))
+    : []);
+}
+
+describe('story revision colours across paragraph acquisition passes', () => {
+  it('registers the text-only header author again when a fresh session resolves NUMPAGES 1 → 2', () => {
+    const model = storyRevisionDoc('header');
+    const services = createParagraphAcquisitionCacheServicesView(
+      createLayoutServices(model, { measureContext: makeCtx() }),
+    );
+    const section = layoutSourceStoreOf(services)!.bodyLayoutInput.initialSection.context;
+    const bounds = { xPt: 20, yPt: 0, widthPt: 560, heightPt: 400 };
+    const atTotal = (totalPages: number) => {
+      const view = createFieldAcquisitionServicesView(services, { totalPages });
+      const session = bodyLayoutKernelOf(view)!.openBodyLayoutSession({
+        source: { story: 'body', storyInstance: 'body', path: [] },
+        section,
+        initialLocation: {
+          pageIndex: 0, columnIndex: 0, flowDomainId: 'body:page:0:column:0',
+          section, cursorPt: { xPt: 20, yPt: 20 }, availableBounds: bounds,
+        },
+      }, view, { currentDateMs: 0, showTrackedChanges: true });
+      return session.layoutStory!({
+        source: { story: 'header', storyInstance: 'default', path: [] },
+        pageIndex: 0, section,
+        container: { id: 'header:default:page:0', kind: 'header', bounds },
+      });
+    };
+
+    // Both authors live outside the resolver's eager main-story walk. The
+    // first paragraph must register Alice even though only Bob reads NUMPAGES.
+    expect(revisionUnderlines(atTotal(1).blocks)).toEqual([
+      { text: 'Alice', decorations: [{ kind: 'underline', color: ALICE_COLOR }] },
+      { text: '1', decorations: [{ kind: 'underline', color: BOB_COLOR }] },
+    ]);
+    expect(revisionUnderlines(atTotal(2).blocks)).toEqual([
+      { text: 'Alice', decorations: [{ kind: 'underline', color: ALICE_COLOR }] },
+      { text: '2', decorations: [{ kind: 'underline', color: BOB_COLOR }] },
+    ]);
+  });
+
+  it('keeps footer author underlines stable through full two-page field convergence', () => {
+    const layout = layoutOf(storyRevisionDoc('footer'), true);
+    expect(layout.pages).toHaveLength(2);
+    for (const page of layout.pages) {
+      expect(revisionUnderlines(page.layers.footer)).toEqual([
+        { text: 'Alice', decorations: [{ kind: 'underline', color: ALICE_COLOR }] },
+        { text: '2', decorations: [{ kind: 'underline', color: BOB_COLOR }] },
+      ]);
+    }
+  });
+});
+
 describe('markup-view revision decorations (§17.13.5)', () => {
   it('underlines insertions and moveTo, strikes deletions and moveFrom, in first-appearance author colours', () => {
     const layout = layoutOf(revisionDoc(), true);
-    const decorationsOf = (text: string) =>
-      placementByText(layout, text).decorations.map(({ kind, color }) => ({ kind, color }));
+    const revisionParagraph = layout.pages[0]?.layers.body.find((node) => node.kind === 'paragraph');
+    if (!revisionParagraph || revisionParagraph.kind !== 'paragraph') throw new Error('missing revision paragraph');
+    const placements = revisionParagraph.lines.flatMap((line) =>
+      line.placements.filter((placement) => placement.kind === 'text'));
+    const decorationsOf = (text: string) => {
+      const runIndex = ['kept ', 'added', 'gone', 'moved-away', 'moved-in'].indexOf(text);
+      const fragments = placements.filter((placement) =>
+        placement.sourceRunIndex === runIndex);
+      // A legal hyphen can acquire separate placements. Revision ownership
+      // must survive each fragment, regardless of how a run is partitioned.
+      expect(fragments.map((placement) => placement.text).join('')).toBe(text);
+      const decorations = fragments.map((placement) =>
+        placement.decorations.map(({ kind, color }) => ({ kind, color })));
+      for (const value of decorations) expect(value).toEqual(decorations[0]);
+      return decorations[0];
+    };
     expect(decorationsOf('added')).toEqual([{ kind: 'underline', color: ALICE_COLOR }]);
     expect(decorationsOf('gone')).toEqual([{ kind: 'strikethrough', color: BOB_COLOR }]);
     expect(decorationsOf('moved-away')).toEqual([{ kind: 'strikethrough', color: BOB_COLOR }]);
@@ -145,27 +240,23 @@ describe('markup-view margin change bars (word-track-change-bar)', () => {
     const layout = layoutOf(revisionDoc(), true);
     const page = layout.pages[0]!;
     const bars = page.changeBars ?? [];
-    // The revision paragraph occupies one line; the plain paragraph none.
-    expect(bars).toHaveLength(1);
-    const bar = bars[0]!;
-    // Centered in the 20pt left margin at the fixed 0.75pt convention width.
-    expect(bar.bounds.widthPt).toBeCloseTo(0.75, 6);
-    expect(bar.bounds.xPt).toBeCloseTo(20 / 2 - 0.75 / 2, 6);
-    // Spans the revision line's vertical extent.
-    const revisionLineBounds = (() => {
-      for (const node of page.layers.body) {
-        if (node.kind !== 'paragraph') continue;
-        for (const line of node.lines) {
-          if (line.placements.some((placement) =>
-            placement.kind === 'text' && placement.revision !== undefined)) {
-            return line.bounds;
-          }
-        }
-      }
-      throw new Error('No revision line');
-    })();
-    expect(bar.bounds.yPt).toBeCloseTo(revisionLineBounds.yPt, 6);
-    expect(bar.bounds.heightPt).toBeCloseTo(revisionLineBounds.heightPt, 6);
+    // Every actual revision line owns one bar. Legal ordinary-hyphen
+    // wrapping may split the paragraph; the plain paragraph owns no bar.
+    const revisionLines = page.layers.body.flatMap((node) => node.kind === 'paragraph'
+      ? node.lines.filter((line) => line.placements.some((placement) =>
+        placement.kind === 'text' && placement.decorations.some((decoration) =>
+          decoration.color === ALICE_COLOR || decoration.color === BOB_COLOR)))
+      : []);
+    expect(bars).toHaveLength(revisionLines.length);
+    expect(revisionLines.length).toBeGreaterThan(0);
+    for (const [index, bar] of bars.entries()) {
+      // Centered in the 20pt left margin at the fixed 0.75pt convention width.
+      expect(bar.bounds.widthPt).toBeCloseTo(0.75, 6);
+      expect(bar.bounds.xPt).toBeCloseTo(20 / 2 - 0.75 / 2, 6);
+      // Every bar spans its own revision line, including a wrapped tail.
+      expect(bar.bounds.yPt).toBeCloseTo(revisionLines[index]!.bounds.yPt, 6);
+      expect(bar.bounds.heightPt).toBeCloseTo(revisionLines[index]!.bounds.heightPt, 6);
+    }
   });
 
   it('the default final view attaches no change bars', () => {

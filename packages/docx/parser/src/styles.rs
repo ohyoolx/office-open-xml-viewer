@@ -159,10 +159,11 @@ pub struct RunFmt {
     /// ECMA-376 §17.3.2.19 `<w:kern w:val>` — the SMALLEST font size (threshold)
     /// that has automatic font kerning applied; a run whose `sz` is below this
     /// value is not kerned. Stored in POINTS (source is ST_HpsMeasure =
-    /// half-points). Presence itself enables kerning (subject to the threshold);
+    /// half-points). Positive presence enables kerning (subject to the threshold);
     /// `None` = inherit, and "never set in the hierarchy" ⇒ no kerning at all
     /// (Word's default is OFF, unlike Canvas's default `fontKerning='auto'`).
-    /// `Some(0.0)` = kern at every size.
+    /// `Some(0.0)` preserves an explicit override: DOCX layout applies the
+    /// WORD_KERN_THRESHOLD_AUTHORITY zero-disables compatibility extension.
     pub kerning: Option<f64>,
     /// ECMA-376 §17.3.2.10 `<w:eastAsianLayout w:vert>` — "Horizontal in Vertical
     /// (Rotate Text)" (縦中横 / tate-chū-yoko). When `Some(true)`, in a VERTICAL
@@ -205,6 +206,10 @@ pub struct ParaFmt {
     pub indent_first: Option<f64>, // pt
     pub space_before: Option<f64>, // pt
     pub space_after: Option<f64>,  // pt
+    /// ECMA-376 §17.3.1.33: per-side automatic margin toggles inherit independently;
+    /// an explicit false clears an inherited true without discarding stored twips.
+    pub before_autospacing: Option<bool>,
+    pub after_autospacing: Option<bool>,
     pub line_spacing_val: Option<f64>,
     pub line_spacing_rule: Option<String>,
     /// True when `w:spacing/@w:line` was declared on the paragraph's own pPr
@@ -218,6 +223,11 @@ pub struct ParaFmt {
     pub num_level: Option<u32>,
     /// Explicit tab stops (pos_pt, alignment, leader). None = inherit from parent style chain.
     pub tab_stops: Option<Vec<(f64, String, String)>>,
+    /// Positions a merged layer cleared (`w:tab w:val="clear"`) and no later
+    /// layer set again. `merge_tab_stops` drops clears from `tab_stops`; a
+    /// numbering level's tabs entering beneath this chain must still honour
+    /// them (§17.7.2 precedence, §17.9.6 level pPr).
+    pub tab_clears: Vec<f64>,
     /// merged run defaults from pPr/rPr
     pub run: RunFmt,
     /// Paragraph background hex color (w:shd fill on paragraph)
@@ -237,6 +247,11 @@ pub struct ParaFmt {
     /// applied when the resolved paragraph is built so style/direct `false`
     /// remains distinguishable from omission during the cascade.
     pub overflow_punct: Option<bool>,
+    /// ECMA-376 §17.3.1.2 w:autoSpaceDE / §17.3.1.3 w:autoSpaceDN — automatic
+    /// spacing between East Asian text and Latin text / numbers. Omission
+    /// inherits; the final default (`true`) is applied on the resolved paragraph.
+    pub auto_space_de: Option<bool>,
+    pub auto_space_dn: Option<bool>,
     /// ECMA-376 §17.3.1.1 w:adjustRightInd — allow the consumer to adjust the
     /// effective right indent when a document grid is active. Retained as an
     /// Option through the style cascade because omission inherits and the final
@@ -263,9 +278,111 @@ pub struct ParaFmt {
     /// compact natural line height rather than the 18 pt grid pitch.
     pub snap_to_grid: Option<bool>,
     /// ECMA-376 §17.3.1.11 w:framePr — text-frame / drop-cap properties.
-    /// Resolved through the style chain like other pPr; `Some` ⇒ this paragraph
-    /// is part of a text frame. Boxed to match `DocParagraph::frame_pr`.
-    pub frame_pr: Option<Box<crate::types::FramePr>>,
+    /// Each attribute is inherited independently through the style chain (see
+    /// [`FramePrFacts`]); `Some` ⇒ this paragraph is part of a text frame.
+    /// [`FramePrFacts::resolve`] applies the defaults once the cascade is done.
+    pub frame_pr: Option<Box<FramePrFacts>>,
+}
+
+/// The authored attributes of one `<w:framePr>` level, every one optional so
+/// that the style hierarchy can layer them attribute by attribute.
+///
+/// Inheritance (observed Word behavior; ECMA-376 §17.3.1.11 is silent): Word
+/// keeps each frame attribute as an independent paragraph property. A Windows
+/// Word export of a paragraph whose direct `<w:framePr w:wrap="notBeside"/>`
+/// overrides a styled frame (`w`, `xAlign="center"`, `hAnchor="page"`,
+/// `vAnchor="text"`) lays the paragraph out with the style's width, centering
+/// and anchors. A level therefore replaces only the attributes it names.
+///
+/// Defaults are applied by [`FramePrFacts::resolve`] after the whole cascade,
+/// using Word's documented values where they differ from ECMA-376
+/// ([MS-OI29500] 2.1.43 §17.3.1.11 d-g): hAnchor and vAnchor default to
+/// `text`, `h="0"` means automatic height, and hRule defaults to `atLeast`
+/// when a nonzero `h` is present.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FramePrFacts {
+    pub anchor_lock: Option<bool>,
+    pub drop_cap: Option<String>,
+    pub lines: Option<u32>,
+    pub wrap: Option<String>,
+    pub h_anchor: Option<String>,
+    pub v_anchor: Option<String>,
+    pub h_rule: Option<String>,
+    pub h_space: Option<f64>,
+    pub v_space: Option<f64>,
+    pub w: Option<f64>,
+    pub h: Option<f64>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub x_align: Option<String>,
+    pub y_align: Option<String>,
+}
+
+impl FramePrFacts {
+    /// Layer `src` (a later style-hierarchy level) over `self`.
+    pub(crate) fn layer(&mut self, src: &FramePrFacts) {
+        macro_rules! take {
+            ($($field:ident),*) => {
+                $(if src.$field.is_some() { self.$field = src.$field.clone(); })*
+            };
+        }
+        take!(
+            anchor_lock,
+            drop_cap,
+            lines,
+            wrap,
+            h_anchor,
+            v_anchor,
+            h_rule,
+            h_space,
+            v_space,
+            w,
+            h,
+            x,
+            y,
+            x_align,
+            y_align
+        );
+    }
+
+    /// The effective frame after the cascade, with defaults applied.
+    pub fn resolve(&self) -> crate::types::FramePr {
+        // [MS-OI29500] 2.1.43 d: Word treats h="0" as automatic height.
+        let h = self.h.filter(|value| *value != 0.0);
+        crate::types::FramePr {
+            // CT_FramePr identity includes anchorLock. Retain it on the private
+            // wire without widening the stable public FramePr projection.
+            anchor_lock: self.anchor_lock.unwrap_or(false),
+            // ST_DropCap default "none" (§17.18.20).
+            drop_cap: self.drop_cap.clone().unwrap_or_else(|| "none".to_string()),
+            // §17.3.1.11 lines default 1.
+            lines: self.lines.unwrap_or(1),
+            // ST_Wrap default "around" (§17.3.1.11 / §17.18.104).
+            wrap: self.wrap.clone().unwrap_or_else(|| "around".to_string()),
+            // [MS-OI29500] 2.1.43 e/g: Word's hAnchor/vAnchor default is
+            // "text" (ECMA-376 states "page").
+            h_anchor: self.h_anchor.clone().unwrap_or_else(|| "text".to_string()),
+            v_anchor: self.v_anchor.clone().unwrap_or_else(|| "text".to_string()),
+            // [MS-OI29500] 2.1.43 d/f: atLeast when a nonzero h is present,
+            // otherwise auto; an explicit rule with h="0" sizes automatically.
+            h_rule: match h {
+                None => "auto".to_string(),
+                Some(_) => self.h_rule.clone().unwrap_or_else(|| "atLeast".to_string()),
+            },
+            // hSpace / vSpace default 0 (§17.3.1.11).
+            h_space: self.h_space.unwrap_or(0.0),
+            v_space: self.v_space.unwrap_or(0.0),
+            // w/h/x/y are kept Option so the renderer can tell "auto" (absent)
+            // from an explicit 0; §17.3.1.11 assumes 0 when consumed.
+            w: self.w,
+            h,
+            x: self.x,
+            y: self.y,
+            // ST_XAlign / ST_YAlign — supersede x/y when present (§17.3.1.11).
+            x_align: self.x_align.clone(),
+            y_align: self.y_align.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -295,12 +412,18 @@ pub struct RawTblBorders {
     pub right: Option<EdgeBorder>,
     pub inside_h: Option<EdgeBorder>,
     pub inside_v: Option<EdgeBorder>,
+    /// §17.4.73 / §17.4.79 cell diagonals, meaningful only in a style's
+    /// `w:tcPr/w:tcBorders` (CT_TblBorders has no diagonal).
+    pub tl2br: Option<EdgeBorder>,
+    pub tr2bl: Option<EdgeBorder>,
 }
 
 /// Conditional formatting block (`w:tblStylePr`) — the subset we resolve.
 #[derive(Debug, Default, Clone)]
 pub struct CondFmt {
     pub shd: Option<String>,
+    /// ECMA-376 17.4.29, including explicit false to clear a base style.
+    pub no_wrap: Option<bool>,
     pub borders: RawTblBorders,
     /// ECMA-376 §17.7.6: the conditional block's `<w:rPr>` — run defaults that
     /// apply to runs in cells covered by this condition (e.g. Calendar 3's
@@ -339,6 +462,9 @@ pub fn merge_cond_layers(layers: &[&CondFmt]) -> CondFmt {
         if layer.shd.is_some() {
             out.shd = layer.shd.clone();
         }
+        if layer.no_wrap.is_some() {
+            out.no_wrap = layer.no_wrap;
+        }
         merge_raw_borders(&mut out.borders, &layer.borders);
         if let Some(r) = &layer.run {
             apply_run(out.run.get_or_insert_with(RunFmt::default), r);
@@ -366,6 +492,7 @@ pub struct TableStyleDef {
     pub based_on: Option<String>,
     pub borders: RawTblBorders,
     pub cell_shd: Option<String>,
+    pub cell_no_wrap: Option<bool>,
     pub cell_valign: Option<String>,
     /// ECMA-376 §17.7.6: the table style's whole-table `<w:rPr>` — run defaults
     /// applied to every cell (e.g. Calendar 3's `<w:color w:val="7F7F7F"/>`
@@ -440,6 +567,68 @@ pub struct StyleMap {
     default_table_style_id: Option<String>,
 }
 
+/// Library resource policy, not an ECMA-376 rule: §17.7.4.3 `basedOn` chains
+/// have no normative length limit, but every paragraph, run and table
+/// resolves its whole chain, so a long chain multiplies parse work by the
+/// number of resolutions. Word-authored documents in the private corpus stay
+/// at five or fewer levels; 64 leaves ample headroom while bounding each
+/// resolution. A longer chain fails closed with a typed resource error.
+pub(crate) const MAX_STYLE_INHERITANCE_DEPTH: usize = 64;
+
+/// The largest number of distinct styles any one `basedOn` chain applies,
+/// counted exactly as [`StyleMap::apply_style_chain`] and
+/// [`StyleMap::resolve_table_style`] walk it (a cycle stops at the first
+/// revisited style; a missing parent ends the chain). `styles` maps each style
+/// id to its `basedOn`; each style is resolved once, so this is linear.
+/// The walk stops as soon as a chain is proven longer than `limit`, so its
+/// per-walk state never grows past `limit + 1` entries.
+fn max_style_inheritance_depth(styles: &HashMap<&str, Option<&str>>, limit: usize) -> usize {
+    let mut depth: HashMap<&str, usize> = HashMap::with_capacity(styles.len());
+    let mut deepest = 0;
+    let mut path: Vec<&str> = Vec::new();
+    let mut on_path: HashMap<&str, usize> = HashMap::new();
+    for &start in styles.keys() {
+        path.clear();
+        on_path.clear();
+        let mut current = Some(start);
+        // Depth of the style that ends the walk's unresolved suffix.
+        let mut tail = 0;
+        while let Some(id) = current {
+            if let Some(&known) = depth.get(id) {
+                tail = known;
+                break;
+            }
+            if path.len() > limit {
+                return path.len();
+            }
+            let Some(&based_on) = styles.get(id) else {
+                break;
+            };
+            if let Some(&cycle_start) = on_path.get(id) {
+                // Every style on the cycle walks the whole cycle once.
+                let cycle_len = path.len() - cycle_start;
+                for member in path.drain(cycle_start..) {
+                    depth.insert(member, cycle_len);
+                }
+                tail = cycle_len;
+                break;
+            }
+            on_path.insert(id, path.len());
+            path.push(id);
+            current = based_on;
+        }
+        for member in path.drain(..).rev() {
+            tail += 1;
+            depth.insert(member, tail);
+        }
+        if tail > limit {
+            return tail;
+        }
+        deepest = deepest.max(tail);
+    }
+    deepest
+}
+
 impl StyleMap {
     /// Style ID of the paragraph style marked `w:default="1"` in styles.xml.
     /// International templates may use non-English IDs (e.g. "a", "標準").
@@ -469,9 +658,18 @@ impl StyleMap {
         self.table_styles.contains_key(style_id)
     }
 
+    #[cfg(test)]
     pub fn parse(xml: &str) -> Self {
+        Self::parse_part(xml, "word/styles.xml")
+    }
+
+    /// [`StyleMap::parse`] for the styles part at `part` (the document
+    /// relationship target), which a resource-limit error names.
+    pub fn parse_part(xml: &str, part: &str) -> Self {
         let doc = match parse_guarded(xml) {
             Ok(d) => d,
+            // Malformed optional styles may degrade. A depth crossing has
+            // already poisoned the package operation in parse_guarded.
             Err(_) => return Self::empty(),
         };
         let root = doc.root_element();
@@ -578,6 +776,33 @@ impl StyleMap {
             );
         }
 
+        // Table styles resolve through their own map (`resolve_table_style`),
+        // which a later same-id paragraph/character declaration does not
+        // overwrite, so both inheritance graphs are bounded.
+        let style_graph: HashMap<&str, Option<&str>> = styles
+            .iter()
+            .map(|(id, def)| (id.as_str(), def.based_on.as_deref()))
+            .collect();
+        let table_graph: HashMap<&str, Option<&str>> = table_styles
+            .iter()
+            .map(|(id, def)| (id.as_str(), def.based_on.as_deref()))
+            .collect();
+        let depth = max_style_inheritance_depth(&style_graph, MAX_STYLE_INHERITANCE_DEPTH).max(
+            max_style_inheritance_depth(&table_graph, MAX_STYLE_INHERITANCE_DEPTH),
+        );
+        drop((style_graph, table_graph));
+        if depth > MAX_STYLE_INHERITANCE_DEPTH {
+            // Latches the typed resource error for the package operation; the
+            // unbounded cascade is never resolved.
+            let _ = ooxml_common::resource::observe_hard_limit(
+                ooxml_common::resource::HardResourceLimitKind::DocxStyleInheritanceDepth,
+                Some(part),
+                MAX_STYLE_INHERITANCE_DEPTH as u64,
+                depth as u64,
+            );
+            return Self::empty();
+        }
+
         StyleMap {
             styles,
             normal_para_style_id: normal_name_para_style_id.or(normal_id_para_style_id),
@@ -623,6 +848,9 @@ impl StyleMap {
             merge_raw_borders(&mut out.borders, &def.borders);
             if def.cell_shd.is_some() {
                 out.cell_shd = def.cell_shd.clone();
+            }
+            if def.cell_no_wrap.is_some() {
+                out.cell_no_wrap = def.cell_no_wrap;
             }
             if def.cell_valign.is_some() {
                 out.cell_valign = def.cell_valign.clone();
@@ -676,6 +904,9 @@ impl StyleMap {
                 let slot = out.cond.entry(k.clone()).or_default();
                 if v.shd.is_some() {
                     slot.shd = v.shd.clone();
+                }
+                if v.no_wrap.is_some() {
+                    slot.no_wrap = v.no_wrap;
                 }
                 merge_raw_borders(&mut slot.borders, &v.borders);
                 if let Some(r) = &v.run {
@@ -732,6 +963,25 @@ impl StyleMap {
     /// properties need this provenance because §17.7.2 places style-origin
     /// numbering below the paragraph style, while direct `numPr` and its
     /// associated properties are applied in the final direct-formatting layer.
+    /// The paragraph layers beneath the paragraph style (§17.7.2): document
+    /// defaults, the whole-table style and its conditional formatting.
+    pub(crate) fn resolve_para_below_style(
+        &self,
+        table_style_id: Option<&str>,
+        cond: Option<&CondFmt>,
+    ) -> ParaFmt {
+        let mut para = ParaFmt::default();
+        let mut run = RunFmt::default();
+        apply_para(&mut para, &self.defaults_para);
+        if let Some(tid) = table_style_id {
+            self.apply_style_chain(tid, &mut para, &mut run);
+        }
+        if let Some(p) = cond.and_then(|c| c.para.as_ref()) {
+            apply_para(&mut para, p);
+        }
+        para
+    }
+
     pub(crate) fn resolve_paragraph_style_layer(&self, style_id: Option<&str>) -> ParaFmt {
         let mut paragraph = ParaFmt::default();
         let mut run = RunFmt::default();
@@ -964,6 +1214,12 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.space_after.is_some() {
         dst.space_after = src.space_after;
     }
+    if src.before_autospacing.is_some() {
+        dst.before_autospacing = src.before_autospacing;
+    }
+    if src.after_autospacing.is_some() {
+        dst.after_autospacing = src.after_autospacing;
+    }
     if src.line_spacing_val.is_some() {
         dst.line_spacing_val = src.line_spacing_val;
     }
@@ -985,6 +1241,13 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
         // TOC leader tab). `dst` empty ⇒ merge is just the sorted src.
         let base = dst.tab_stops.take().unwrap_or_default();
         dst.tab_stops = Some(merge_tab_stops(&base, src_tabs));
+        for (pos, val, _) in src_tabs {
+            dst.tab_clears
+                .retain(|cleared| (cleared - pos).abs() > 0.05);
+            if val == "clear" {
+                dst.tab_clears.push(*pos);
+            }
+        }
     }
     if src.shading.is_some() {
         dst.shading = src.shading.clone();
@@ -1010,6 +1273,12 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.overflow_punct.is_some() {
         dst.overflow_punct = src.overflow_punct;
     }
+    if src.auto_space_de.is_some() {
+        dst.auto_space_de = src.auto_space_de;
+    }
+    if src.auto_space_dn.is_some() {
+        dst.auto_space_dn = src.auto_space_dn;
+    }
     if src.adjust_right_ind.is_some() {
         dst.adjust_right_ind = src.adjust_right_ind;
     }
@@ -1020,8 +1289,8 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
         // omitted ... its value is determined by the setting previously set at any
         // level of the style hierarchy". So merge edge-by-edge over the inherited
         // box rather than replacing it wholesale: a level that names only
-        // `<w:bottom>` keeps the inherited top/left/right/between. (Contrast
-        // `frame_pr` below, §17.3.1.11 — one grouped element, replaced wholesale.)
+        // `<w:bottom>` keeps the inherited top/left/right/between. (`frame_pr`
+        // below, §17.3.1.11, layers attribute by attribute in the same way.)
         // An EXPLICIT `<w:bottom w:val="nil"/>` is a present "cleared" edge (style
         // "none", emitted by parse_edge — distinct from an OMITTED edge which is
         // `None` and inherits), so it overrides here and removes the inherited edge.
@@ -1073,11 +1342,13 @@ pub(crate) fn apply_para(dst: &mut ParaFmt, src: &ParaFmt) {
     if src.snap_to_grid.is_some() {
         dst.snap_to_grid = src.snap_to_grid;
     }
-    // §17.3.1.11: framePr is a single grouped element — a later level that
-    // specifies it replaces the whole frame definition (Word does not merge
-    // individual frame attributes across the style chain).
-    if src.frame_pr.is_some() {
-        dst.frame_pr = src.frame_pr.clone();
+    // §17.3.1.11 framePr: each attribute inherits independently (see
+    // FramePrFacts); a level naming only `wrap` keeps the inherited anchors,
+    // width and alignment.
+    if let Some(src_frame) = &src.frame_pr {
+        dst.frame_pr
+            .get_or_insert_with(Default::default)
+            .layer(src_frame);
     }
 }
 
@@ -1313,8 +1584,13 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         fmt.alignment = attr_w(jc, "val");
     }
 
-    // Spacing
+    // Spacing. §17.3.1.33 gives an active automatic flag priority over both
+    // absolute and line-unit margins. Inactive beforeLines/afterLines spacing
+    // remains unsupported: retain the existing absolute-value fallback instead
+    // of guessing a line-height conversion here.
     if let Some(sp) = child_w(ppr, "spacing") {
+        fmt.before_autospacing = on_off_attr(sp, "beforeAutospacing");
+        fmt.after_autospacing = on_off_attr(sp, "afterAutospacing");
         if let Some(v) = attr_w(sp, "before") {
             fmt.space_before = Some(twips_to_pt(&v));
         }
@@ -1323,7 +1599,11 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         }
         if let Some(v) = attr_w(sp, "line") {
             let rule = attr_w(sp, "lineRule").unwrap_or_else(|| "auto".to_string());
-            let raw: f64 = v.parse().unwrap_or(240.0);
+            // §17.3.1.33: w:line is ST_SignedTwipsMeasure. A value outside
+            // its lexical union (e.g. an exponent or NaN) keeps the historical
+            // single-spacing fallback instead of reaching layout. Converting
+            // from the authored unit keeps every valid lexeme finite.
+            let measure = signed_twips_measure(&v).unwrap_or(SignedTwipsMeasure::Twips(240.0));
             // OOXML encodes line spacing as:
             //   auto      → raw / 240   = multiplier (1.0 = single, 1.5 = 1½, 2.0 = double)
             //   atLeast   → raw / 20    = pt (minimum line height)
@@ -1335,9 +1615,9 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
             // the section enables a line grid, which is where those oversized
             // values are actually authored.
             let (val, effective_rule) = match rule.as_str() {
-                "exact" => (raw / 20.0, "exact".to_string()),
-                "atLeast" => (raw / 20.0, "atLeast".to_string()),
-                _ => (raw / 240.0, "auto".to_string()),
+                "exact" => (measure.to_pt(), "exact".to_string()),
+                "atLeast" => (measure.to_pt(), "atLeast".to_string()),
+                _ => (measure.to_240ths(), "auto".to_string()),
             };
             fmt.line_spacing_val = Some(val);
             fmt.line_spacing_rule = Some(effective_rule);
@@ -1376,7 +1656,8 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
         // ilvl defaults to 0 when absent
         fmt.num_level = child_w(pnpr, "ilvl")
             .and_then(|n| attr_w(n, "val"))
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| crate::numbering::parse_word_ilvl(&v).ok())
+            .map(u32::from)
             .or(Some(0));
         if let Some(nid) = child_w(pnpr, "numId") {
             fmt.num_id = attr_w(nid, "val").and_then(|v| v.parse().ok());
@@ -1415,11 +1696,7 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
 
     // Paragraph shading
     if let Some(shd) = child_w(ppr, "shd") {
-        if let Some(fill) = attr_w(shd, "fill") {
-            if fill != "auto" && fill.len() == 6 {
-                fmt.shading = Some(fill.to_lowercase());
-            }
-        }
+        fmt.shading = shading_fill(shd);
     }
 
     // Page break before paragraph
@@ -1442,6 +1719,10 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
     // ECMA-376 §17.3.1.21 defines omission as true; retain Option here so an
     // explicit style/direct false participates correctly in the cascade.
     fmt.overflow_punct = bool_prop(ppr, "overflowPunct");
+
+    // autoSpaceDE / autoSpaceDN — ECMA-376 §17.3.1.2-3; same cascade contract.
+    fmt.auto_space_de = bool_prop(ppr, "autoSpaceDE");
+    fmt.auto_space_dn = bool_prop(ppr, "autoSpaceDN");
 
     // adjustRightInd — ECMA-376 §17.3.1.1. The setting participates in the
     // paragraph-style hierarchy and omission ultimately defaults to true.
@@ -1566,38 +1847,24 @@ pub fn parse_para_fmt(ppr: roxmltree::Node) -> ParaFmt {
     }
 
     // Text frame / drop cap (ECMA-376 §17.3.1.11 w:framePr). Presence makes the
-    // paragraph part of a text frame; all attributes are optional with the
-    // spec-defined defaults applied here so the renderer never re-derives them.
+    // paragraph part of a text frame. Only the authored attributes are kept;
+    // FramePrFacts::resolve applies the defaults after the style cascade.
     if let Some(fp) = child_w(ppr, "framePr") {
-        use crate::types::FramePr;
         let twips = |name: &str| attr_w(fp, name).map(|s| twips_to_pt(&s));
-        fmt.frame_pr = Some(Box::new(FramePr {
-            // CT_FramePr identity includes anchorLock. Retain it on the private
-            // wire without widening the stable public FramePr projection.
-            anchor_lock: on_off_attr(fp, "anchorLock").unwrap_or(false),
-            // ST_DropCap default "none" (§17.18.20).
-            drop_cap: attr_w(fp, "dropCap").unwrap_or_else(|| "none".to_string()),
-            // §17.3.1.11 lines default 1.
-            lines: attr_w(fp, "lines")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1),
-            // ST_Wrap default "around" (§17.3.1.11 / §17.18.104).
-            wrap: attr_w(fp, "wrap").unwrap_or_else(|| "around".to_string()),
-            // ST_HAnchor / ST_VAnchor default "page" (§17.3.1.11).
-            h_anchor: attr_w(fp, "hAnchor").unwrap_or_else(|| "page".to_string()),
-            v_anchor: attr_w(fp, "vAnchor").unwrap_or_else(|| "page".to_string()),
-            // ST_HeightRule default "auto" (§17.18.37).
-            h_rule: attr_w(fp, "hRule").unwrap_or_else(|| "auto".to_string()),
-            // hSpace / vSpace default 0 (§17.3.1.11).
-            h_space: twips("hSpace").unwrap_or(0.0),
-            v_space: twips("vSpace").unwrap_or(0.0),
-            // w/h/x/y are kept Option so the renderer can tell "auto" (absent)
-            // from an explicit 0; §17.3.1.11 assumes 0 when consumed.
+        fmt.frame_pr = Some(Box::new(FramePrFacts {
+            anchor_lock: on_off_attr(fp, "anchorLock"),
+            drop_cap: attr_w(fp, "dropCap"),
+            lines: attr_w(fp, "lines").and_then(|v| v.parse().ok()),
+            wrap: attr_w(fp, "wrap"),
+            h_anchor: attr_w(fp, "hAnchor"),
+            v_anchor: attr_w(fp, "vAnchor"),
+            h_rule: attr_w(fp, "hRule"),
+            h_space: twips("hSpace"),
+            v_space: twips("vSpace"),
             w: twips("w"),
             h: twips("h"),
             x: twips("x"),
             y: twips("y"),
-            // ST_XAlign / ST_YAlign — supersede x/y when present (§17.3.1.11).
             x_align: attr_w(fp, "xAlign"),
             y_align: attr_w(fp, "yAlign"),
         }));
@@ -1630,11 +1897,7 @@ fn normalized_string_attr(
 }
 
 fn parse_on_off_lexical(value: &str) -> Option<bool> {
-    match value.trim() {
-        "1" | "true" | "on" => Some(true),
-        "0" | "false" | "off" => Some(false),
-        _ => None,
-    }
+    ooxml_common::xml_node::parse_st_on_off(value.trim())
 }
 
 fn on_off_value(node: roxmltree::Node, name: &str) -> crate::types::TypographyValueWire<bool> {
@@ -2082,16 +2345,13 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
             .or_else(|| fmt.font_family_cs_direct.clone());
     }
 
-    // Run shading (ECMA-376 §17.3.2.32 w:shd). We adopt `@w:fill` only; `@w:val`
-    // (the pattern) and `@w:color` are not modeled. `val="clear"` (inverse
-    // video) is exact since only the fill is visible, but `val="solid"` etc.
-    // drop information by ignoring the pattern foreground.
+    // ECMA-376 §17.3.2.32 / §17.18.78 names percentage shading patterns.
+    // Word for Mac PDF output paints run-level pct15/pct20/pct25 as a uniform
+    // foreground/fill blend, including explicit red and automatic-black
+    // foregrounds over white and blue fills. Keep this Office-observed rule
+    // local to runs; paragraph/cell/shape patterns have different paint paths.
     if let Some(shd) = child_w(rpr, "shd") {
-        if let Some(fill) = attr_w(shd, "fill") {
-            if fill != "auto" && fill.len() == 6 {
-                fmt.background = Some(fill.to_lowercase());
-            }
-        }
+        fmt.background = shading_fill(shd);
     }
 
     // Vertical alignment (superscript / subscript)
@@ -2220,9 +2480,10 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
     }
 
     // Font kerning threshold (ECMA-376 §17.3.2.19 `<w:kern w:val>`). ST_HpsMeasure
-    // (half-points) — the SMALLEST font size that has kerning applied. The mere
-    // presence of the element turns kerning on (subject to the threshold); Word's
-    // hierarchy default is OFF. `w:val="0"` = kern at all sizes. Stored in points.
+    // (half-points) — the SMALLEST font size that has kerning applied. A
+    // positive threshold enables kerning when size qualifies; absence inherits.
+    // Preserve zero, which overrides inheritance; layout owns its compatibility
+    // interpretation (WORD_KERN_THRESHOLD_AUTHORITY). Stored in points.
     if let Some(kern) = child_w(rpr, "kern") {
         if let Some(v) = attr_w(kern, "val") {
             fmt.kerning = half_pt_to_pt(&v);
@@ -2254,11 +2515,83 @@ pub fn parse_run_fmt(rpr: roxmltree::Node) -> RunFmt {
 
 // ===== Table style parsing =====
 
+/// Table-style cell shading: the same ECMA-376 `w:shd` semantics as
+/// paragraph/run shading, so percentage patterns blend identically.
 fn shd_fill(node: roxmltree::Node) -> Option<String> {
-    child_w(node, "shd")
-        .and_then(|s| attr_w(s, "fill"))
-        .filter(|f| f != "auto" && f.len() == 6)
-        .map(|f| f.to_lowercase())
+    child_w(node, "shd").and_then(shading_fill)
+}
+
+fn shd_fill_color(shd: roxmltree::Node) -> Option<String> {
+    let fill = attr_w(shd, "fill")?;
+    if fill != "auto" && fill.len() == 6 && fill.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(fill.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/// ECMA-376 `w:shd` (paragraph §17.3.1.31, run §17.3.2.32, table cell and
+/// table-style cell §17.4.32/§17.4.33) as one displayed fill. The element has
+/// the same semantics in every location: ST_Shd `pctN` (§17.18.78) is an N%
+/// `w:color` pattern over `w:fill`, which Word paints as one solid color (its
+/// PDF of a `pct15` run with an automatic pattern color over white is
+/// #D9D9D9). Other patterns keep the fill-only projection.
+pub(crate) fn shading_fill(shd: roxmltree::Node) -> Option<String> {
+    let fill = shd_fill_color(shd)?;
+    // ST_Shd's pct12/pct37/pct62/pct87 mean 12.5/37.5/62.5/87.5%,
+    // respectively (§17.18.78), not the integer encoded in their names.
+    // Represent every legal percentage shade in tenths of a percent so the
+    // Office-observed 8-bit coverage conversion below stays exact.
+    let Some(percent_tenths): Option<u16> =
+        attr_w(shd, "val").as_deref().and_then(|value| match value {
+            "pct5" => Some(50),
+            "pct10" => Some(100),
+            "pct12" => Some(125),
+            "pct15" => Some(150),
+            "pct20" => Some(200),
+            "pct25" => Some(250),
+            "pct30" => Some(300),
+            "pct35" => Some(350),
+            "pct37" => Some(375),
+            "pct40" => Some(400),
+            "pct45" => Some(450),
+            "pct50" => Some(500),
+            "pct55" => Some(550),
+            "pct60" => Some(600),
+            "pct62" => Some(625),
+            "pct65" => Some(650),
+            "pct70" => Some(700),
+            "pct75" => Some(750),
+            "pct80" => Some(800),
+            "pct85" => Some(850),
+            "pct87" => Some(875),
+            "pct90" => Some(900),
+            "pct95" => Some(950),
+            _ => None,
+        })
+    else {
+        return Some(fill);
+    };
+    let foreground = match attr_w(shd, "color") {
+        None => "000000".to_string(),
+        Some(color) if color == "auto" => "000000".to_string(),
+        Some(color) if color.len() == 6 && color.chars().all(|c| c.is_ascii_hexdigit()) => color,
+        _ => return Some(fill),
+    };
+    // PDF color operands reveal an 8-bit foreground coverage before mixing:
+    // pct50 over white is 127/255 (not the 128 from a direct 50% gray round).
+    let alpha = ((u32::from(percent_tenths) * 255 + 500) / 1000) as u16;
+    let blend = |index: usize| -> Option<u8> {
+        let bg = u8::from_str_radix(fill.get(index..index + 2)?, 16).ok()?;
+        let fg = u8::from_str_radix(foreground.get(index..index + 2)?, 16).ok()?;
+        Some(((u16::from(bg) * (255 - alpha) + u16::from(fg) * alpha + 127) / 255) as u8)
+    };
+    Some(format!(
+        "{:02x}{:02x}{:02x}",
+        blend(0)?,
+        blend(2)?,
+        blend(4)?
+    ))
 }
 
 fn parse_edge_border(node: roxmltree::Node) -> EdgeBorder {
@@ -2293,6 +2626,8 @@ fn parse_raw_tbl_borders(node: roxmltree::Node) -> RawTblBorders {
             "right" | "end" => b.right = Some(e),
             "insideH" => b.inside_h = Some(e),
             "insideV" => b.inside_v = Some(e),
+            "tl2br" => b.tl2br = Some(e),
+            "tr2bl" => b.tr2bl = Some(e),
             _ => {}
         }
     }
@@ -2317,6 +2652,12 @@ fn merge_raw_borders(dst: &mut RawTblBorders, src: &RawTblBorders) {
     }
     if src.inside_v.is_some() {
         dst.inside_v = src.inside_v.clone();
+    }
+    if src.tl2br.is_some() {
+        dst.tl2br = src.tl2br.clone();
+    }
+    if src.tr2bl.is_some() {
+        dst.tr2bl = src.tr2bl.clone();
     }
 }
 
@@ -2411,6 +2752,7 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
     }
     if let Some(tc_pr) = child_w(style_node, "tcPr") {
         def.cell_shd = shd_fill(tc_pr);
+        def.cell_no_wrap = bool_prop(tc_pr, "noWrap");
         def.cell_valign = child_w(tc_pr, "vAlign").and_then(|v| attr_w(v, "val"));
     }
     if let Some(tr_pr) = child_w(style_node, "trPr") {
@@ -2437,6 +2779,7 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
         let mut cf = CondFmt::default();
         if let Some(tc_pr) = child_w(sp, "tcPr") {
             cf.shd = shd_fill(tc_pr);
+            cf.no_wrap = bool_prop(tc_pr, "noWrap");
             if let Some(borders) = child_w(tc_pr, "tcBorders") {
                 cf.borders = parse_raw_tbl_borders(borders);
             }
@@ -2468,6 +2811,46 @@ fn parse_tbl_style_def(style_node: roxmltree::Node, based_on: Option<String>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_margin_child_inherits_whole_table_border_carrier() {
+        // ECMA-376 CT_Style/CT_TblPrBase: whole-table borders are authored
+        // in tblPr/tblBorders; a child's margin must not reset those sides.
+        let xml = r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:style w:type="table" w:styleId="PublicBase">
+            <w:name w:val="Public Base"/>
+            <w:tblPr><w:tblBorders>
+              <w:top w:val="single" w:sz="8" w:color="C00000"/>
+              <w:left w:val="single" w:sz="8" w:color="C00000"/>
+              <w:bottom w:val="single" w:sz="8" w:color="C00000"/>
+              <w:right w:val="single" w:sz="8" w:color="C00000"/>
+              <w:insideH w:val="single" w:sz="8" w:color="C00000"/>
+              <w:insideV w:val="single" w:sz="8" w:color="C00000"/>
+            </w:tblBorders></w:tblPr>
+          </w:style>
+          <w:style w:type="table" w:styleId="PublicChild">
+            <w:name w:val="Public Child"/><w:basedOn w:val="PublicBase"/>
+            <w:tblPr><w:tblCellMar><w:left w:w="180" w:type="dxa"/></w:tblCellMar></w:tblPr>
+          </w:style>
+        </w:styles>"#;
+        let styles = StyleMap::parse(xml);
+        let inherited = styles.resolve_table_style("PublicChild");
+        for edge in [
+            &inherited.borders.top,
+            &inherited.borders.left,
+            &inherited.borders.bottom,
+            &inherited.borders.right,
+            &inherited.borders.inside_h,
+            &inherited.borders.inside_v,
+        ] {
+            let edge = edge.as_ref().expect("inherited base border");
+            assert_eq!(edge.style, "single");
+            assert_eq!(edge.color.as_deref(), Some("c00000"));
+            assert_eq!(edge.width, 1.0);
+        }
+        assert_eq!(inherited.cell_margin_left, Some(9.0));
+    }
+
     use roxmltree::Document as XmlDoc;
 
     fn stop(pos: f64, al: &str, ldr: &str) -> (f64, String, String) {
@@ -2512,6 +2895,28 @@ mod tests {
         let direct = vec![stop(100.0, "clear", "none")];
         let merged = merge_tab_stops(&style, &direct);
         assert_eq!(merged, vec![stop(200.0, "right", "dot")]);
+    }
+
+    #[test]
+    fn auto_space_flags_participate_in_paragraph_style_cascade() {
+        let parse = |inner: &str| {
+            let xml = format!(
+                r#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{inner}</w:pPr>"#
+            );
+            let document = XmlDoc::parse(&xml).unwrap();
+            parse_para_fmt(document.root_element())
+        };
+        let mut inherited = parse(r#"<w:autoSpaceDE w:val="0"/><w:autoSpaceDN w:val="0"/>"#);
+        apply_para(&mut inherited, &parse("<w:keepNext/>"));
+        assert_eq!(
+            (inherited.auto_space_de, inherited.auto_space_dn),
+            (Some(false), Some(false))
+        );
+        apply_para(&mut inherited, &parse("<w:autoSpaceDE/>"));
+        assert_eq!(
+            (inherited.auto_space_de, inherited.auto_space_dn),
+            (Some(true), Some(false))
+        );
     }
 
     #[test]
@@ -2697,7 +3102,8 @@ mod tests {
         // layout acquisition under an explicitly private wire name.
         let locked = para_fmt_from(r#"<w:framePr w:anchorLock="on"/>"#)
             .frame_pr
-            .expect("framePr parses");
+            .expect("framePr parses")
+            .resolve();
         assert!(locked.anchor_lock);
         let locked_wire = serde_json::to_value(&locked).expect("framePr serializes");
         assert_eq!(locked_wire["__anchorLock"], serde_json::json!(true));
@@ -2705,25 +3111,60 @@ mod tests {
 
         let unlocked = para_fmt_from(r#"<w:framePr/>"#)
             .frame_pr
-            .expect("framePr parses");
+            .expect("framePr parses")
+            .resolve();
         assert!(!unlocked.anchor_lock);
         let unlocked_wire = serde_json::to_value(&unlocked).expect("framePr serializes");
         assert!(unlocked_wire.get("__anchorLock").is_none());
     }
 
-    // ── RB2 neutralization: a pathologically deep styles.xml is rejected by the
-    //    depth pre-check in `parse_guarded` BEFORE roxmltree's recursive tree
-    //    builder runs, so `StyleMap::parse` returns gracefully instead of trapping
-    //    the whole parse on a stack overflow. This test runs on the DEFAULT
-    //    (small) test-thread stack ON PURPOSE — if `StyleMap::parse` handed the
-    //    5 000-deep XML straight to roxmltree it would overflow and abort the
-    //    process here. That it returns at all is the guarantee. §17.7 (styles).
+    #[test]
+    fn frame_pr_attributes_inherit_independently_with_word_defaults() {
+        // A direct framePr naming only `wrap` keeps the style's width,
+        // alignment and anchors (Word lays such a paragraph out in the
+        // styled frame), and the defaults apply only after the cascade.
+        let mut cascade = para_fmt_from(
+            r#"<w:framePr w:w="9360" w:vSpace="187" w:wrap="around" w:vAnchor="text" w:hAnchor="page" w:xAlign="center" w:y="1" w:anchorLock="1"/>"#,
+        );
+        apply_para(
+            &mut cascade,
+            &para_fmt_from(r#"<w:framePr w:wrap="notBeside"/>"#),
+        );
+        let frame = cascade.frame_pr.expect("framePr inherits").resolve();
+        assert_eq!(frame.wrap, "notBeside");
+        assert_eq!(frame.w, Some(468.0));
+        assert_eq!(frame.x_align.as_deref(), Some("center"));
+        assert_eq!(
+            (frame.h_anchor.as_str(), frame.v_anchor.as_str()),
+            ("page", "text")
+        );
+        assert_eq!((frame.y, frame.v_space), (Some(0.05), 9.35));
+        assert!(frame.anchor_lock);
+
+        // [MS-OI29500] 2.1.43 d-g: Word's anchors default to text, h="0" is
+        // automatic, and a nonzero h defaults to atLeast.
+        let bare = para_fmt_from(r#"<w:framePr w:h="0" w:hRule="exact"/>"#)
+            .frame_pr
+            .unwrap()
+            .resolve();
+        assert_eq!(
+            (bare.h_anchor.as_str(), bare.v_anchor.as_str()),
+            ("text", "text")
+        );
+        assert_eq!((bare.h, bare.h_rule.as_str()), (None, "auto"));
+        let sized = para_fmt_from(r#"<w:framePr w:h="720"/>"#)
+            .frame_pr
+            .unwrap()
+            .resolve();
+        assert_eq!((sized.h, sized.h_rule.as_str()), (Some(36.0), "atLeast"));
+    }
+
+    // Extreme XML depth is rejected before retaining a DOM or entering the
+    // recursive OOXML walker. Streaming validation fits the default test stack.
     #[test]
     fn deeply_nested_styles_xml_is_rejected_not_trapped() {
         let mut xml = format!(r#"<w:styles xmlns:w="{ns}">"#, ns = W_NS);
-        // 5 000 levels — ~20× MAX_XML_DEPTH and well past roxmltree's ~1 000-deep
-        // small-stack overflow threshold. Nest an arbitrary element (styles.xml is
-        // shallow in the wild, so this can only be an attack).
+        // Approximately twenty times the production XML depth ceiling.
         for _ in 0..5_000 {
             xml.push_str("<w:x>");
         }
@@ -2733,13 +3174,16 @@ mod tests {
         }
         xml.push_str("</w:styles>");
 
-        // Must return (not trap). The rejected part yields an empty style map —
-        // the "skip the part, keep the document" degradation contract.
-        let map = StyleMap::parse(&xml);
-        assert!(
-            map.styles.is_empty(),
-            "an over-deep styles.xml must be rejected, yielding no styles"
+        let governor = ooxml_common::resource::ResourceGovernor::from_wasm(
+            ooxml_common::resource::OoxmlFormat::Docx,
+            None,
+            None,
+            None,
         );
+        let _scope = governor.scope("styles-test");
+        let _provisional = StyleMap::parse(&xml);
+        let error = governor.first_error().expect("styles must fail closed");
+        assert!(error.starts_with("OOXML_RESOURCE_LIMIT:"), "{error}");
     }
 
     #[test]
@@ -2937,6 +3381,35 @@ mod tests {
         // Regression guard for the inverse-video case (black fill).
         let fmt = run_fmt_from(r#"<w:shd w:val="clear" w:color="auto" w:fill="000000"/>"#);
         assert_eq!(fmt.background.as_deref(), Some("000000"));
+    }
+
+    #[test]
+    fn percentage_run_shading_uses_office_pdf_blend() {
+        // Word for Mac PDF: percentage run shading is a uniform blend, not
+        // the dotted bitmap illustrated by the ST_Shd enum examples.
+        for (value, color, fill, expected) in [
+            ("pct15", "auto", "FFFFFF", "d9d9d9"),
+            ("pct20", "auto", "FFFFFF", "cccccc"),
+            ("pct25", "auto", "FFFFFF", "bfbfbf"),
+            ("pct5", "auto", "FFFFFF", "f2f2f2"),
+            ("pct12", "auto", "FFFFFF", "dfdfdf"),
+            ("pct37", "auto", "FFFFFF", "9f9f9f"),
+            ("pct50", "auto", "FFFFFF", "7f7f7f"),
+            ("pct62", "auto", "FFFFFF", "606060"),
+            ("pct87", "auto", "FFFFFF", "202020"),
+            ("pct15", "FF0000", "FFFFFF", "ffd9d9"),
+            ("pct15", "auto", "0000FF", "0000d9"),
+        ] {
+            let fmt = run_fmt_from(&format!(
+                r#"<w:shd w:val="{value}" w:color="{color}" w:fill="{fill}"/>"#
+            ));
+            assert_eq!(fmt.background.as_deref(), Some(expected));
+        }
+        let mut inherited =
+            run_fmt_from(r#"<w:shd w:val="pct15" w:color="auto" w:fill="FFFFFF"/>"#);
+        let clear = run_fmt_from(r#"<w:shd w:val="clear" w:fill="EEEEEE"/>"#);
+        apply_run(&mut inherited, &clear);
+        assert_eq!(inherited.background.as_deref(), Some("eeeeee"));
     }
 
     #[test]
@@ -3408,7 +3881,61 @@ mod tests {
         assert_eq!(fr.shd.as_deref(), Some("cccccc"));
     }
 
+    #[test]
+    fn table_style_cell_percentage_shading_blends_like_run_shading() {
+        let xml = format!(
+            r#"<w:styles xmlns:w="{ns}">
+              <w:style w:type="table" w:styleId="Pct">
+                <w:name w:val="Pct"/>
+                <w:tcPr><w:shd w:val="pct15" w:color="auto" w:fill="FFFFFF"/></w:tcPr>
+                <w:tblStylePr w:type="firstRow">
+                  <w:tcPr><w:shd w:val="pct25" w:color="00FF00" w:fill="FFFFFF"/></w:tcPr>
+                </w:tblStylePr>
+              </w:style>
+            </w:styles>"#,
+            ns = W_NS
+        );
+        let def = StyleMap::parse(&xml).resolve_table_style("Pct");
+        assert_eq!(def.cell_shd.as_deref(), Some("d9d9d9"));
+        assert_eq!(
+            def.cond.get("firstRow").unwrap().shd.as_deref(),
+            Some("bfffbf")
+        );
+    }
+
     // ── WD4: run-level character metrics (§17.3.2.35 / .43 / .24 / .19) ──────
+
+    #[test]
+    fn spacing_line_accepts_only_signed_twips_measure_lexemes() {
+        // §17.3.1.33: w:line is ST_SignedTwipsMeasure (§17.18.81).
+        let f = para_fmt_from(r#"<w:spacing w:line="20" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(1.0));
+        let f = para_fmt_from(r#"<w:spacing w:line="12pt" w:lineRule="exact"/>"#);
+        assert_eq!(f.line_spacing_val, Some(12.0));
+        // Exponents, decimals and non-finite values are outside the union and
+        // keep the single-spacing fallback rather than a sub-ulp line pitch.
+        for invalid in ["2e-13", "0.5", "NaN", "inf"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="{invalid}" w:lineRule="exact"/>"#
+            ));
+            assert_eq!(f.line_spacing_val, Some(12.0), "{invalid:?}");
+        }
+        // A valid, representable universal measure stays finite.
+        let f = para_fmt_from(&format!(
+            r#"<w:spacing w:line="1{}pt" w:lineRule="exact"/>"#,
+            "0".repeat(307)
+        ));
+        assert_eq!(f.line_spacing_val, Some(1e307));
+        // A valid unit-bearing lexeme beyond binary64 saturates, as bare
+        // integers do, instead of falling back to single spacing.
+        for unit in ["pt", "in", "mm", "cm", "pc", "pi"] {
+            let f = para_fmt_from(&format!(
+                r#"<w:spacing w:line="1{}{unit}" w:lineRule="exact"/>"#,
+                "0".repeat(400)
+            ));
+            assert_eq!(f.line_spacing_val, Some(f64::MAX), "{unit}");
+        }
+    }
 
     #[test]
     fn char_spacing_parses_signed_twips_to_pt() {
@@ -3455,6 +3982,36 @@ mod tests {
             base.fit_text.and_then(|fit_text| fit_text.id).is_none(),
             "a direct fitText WITHOUT w:id must clear the inherited id"
         );
+    }
+
+    #[test]
+    fn percentage_run_shading_is_one_blended_fill() {
+        // Word PDF evidence: pct15, automatic pattern color over white = D9D9D9.
+        for (shd, expected) in [
+            (
+                r#"<w:shd w:val="pct15" w:color="auto" w:fill="FFFFFF"/>"#,
+                Some("d9d9d9"),
+            ),
+            (r#"<w:shd w:val="pct15" w:fill="FFFFFF"/>"#, Some("d9d9d9")),
+            (
+                r#"<w:shd w:val="pct25" w:color="00FF00" w:fill="FFFFFF"/>"#,
+                Some("bfffbf"),
+            ),
+            (
+                r#"<w:shd w:val="clear" w:color="auto" w:fill="DDDDDD"/>"#,
+                Some("dddddd"),
+            ),
+            (
+                r#"<w:shd w:val="horzStripe" w:color="FF0000" w:fill="00FF00"/>"#,
+                Some("00ff00"),
+            ),
+            (
+                r#"<w:shd w:val="pct15" w:color="auto" w:fill="auto"/>"#,
+                None,
+            ),
+        ] {
+            assert_eq!(run_fmt_from(shd).background.as_deref(), expected, "{shd}");
+        }
     }
 
     #[test]
@@ -3576,8 +4133,7 @@ mod tests {
         // size that gets kerning. Spec example `<w:kern w:val="28"/>` == 14 pt.
         let f = run_fmt_from(r#"<w:kern w:val="28"/>"#);
         assert_eq!(f.kerning, Some(14.0));
-        // val="0" (common in Word documents) = kern at every size — presence,
-        // not absence, so it must be Some(0.0) to keep kerning enabled.
+        // Explicit zero must survive parsing to override an inherited threshold.
         let f = run_fmt_from(r#"<w:kern w:val="0"/>"#);
         assert_eq!(f.kerning, Some(0.0));
         let f = run_fmt_from(r#"<w:kern w:val="12pt"/>"#);

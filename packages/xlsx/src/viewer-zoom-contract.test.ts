@@ -1,6 +1,8 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { XlsxViewer } from './viewer.js';
+import { zoomPosToScale, zoomScaleToPos } from './internal/viewer/zoom-control.js';
 import { worksheetContentBounds } from './internal/worksheet-content-bounds.js';
+import { GridGeometry } from './internal/grid-geometry.js';
 import { installDom, makeContainer } from './viewer-destroy-test-dom.js';
 import { HEADER_W, HEADER_H, colWidthToPx, rowHeightToPx, getMdwForWorksheet } from './renderer.js';
 import type { Worksheet } from './types.js';
@@ -54,18 +56,22 @@ interface Priv {
   currentWorksheet: Worksheet | null;
   canvasArea: { clientWidth: number; clientHeight: number; getBoundingClientRect(): DOMRect };
   scrollHost: FakeScrollHost;
-  navPrev: { parentElement: { style: { width: string } } | null };
-  tabBar: { style: { flexDirection: string } };
-  tabStrip: {
-    style: { marginLeft: string; marginRight: string };
-    scrollLeft: number;
-    clientWidth: number;
-    scrollWidth: number;
+  spacer: { style: { width: string; height: string } };
+  sheetTabs: {
+    navPrev: { parentElement: { style: { width: string } } | null };
+    tabBar: { style: { flexDirection: string } };
+    tabStrip: {
+      style: { marginLeft: string; marginRight: string };
+      scrollLeft: number;
+      clientWidth: number;
+      scrollWidth: number;
+    };
+    tabList: { style: { flexDirection: string; minWidth: string; width: string } };
+    tabs: Array<{ offsetLeft: number; offsetWidth: number }>;
+    scrollTabs(direction: -1 | 1): void;
   };
-  tabList: { style: { flexDirection: string; minWidth: string; width: string } };
-  tabs: Array<{ offsetLeft: number; offsetWidth: number }>;
   updateFooterDirection(): void;
-  scrollTabs(direction: -1 | 1): void;
+  updateSpacerSize(ws: Worksheet): void;
   _pendingZoomAnchor: { x: number; y: number } | null;
 }
 
@@ -120,6 +126,60 @@ describe('XlsxViewer IX9 zoom contract', () => {
       chart: {} as never,
     }];
     expect(worksheetContentBounds(ws)).toEqual({ maxRow: 114, maxCol: 26 });
+    expect(worksheetContentBounds(ws, { minRows: 0, minCols: 0 }))
+      .toEqual({ maxRow: 114, maxCol: 18 });
+  });
+
+  it('allows the configured minimum to expose only the actual content bounds', () => {
+    const ws = makeSheet();
+    expect(worksheetContentBounds(ws, { minRows: 0, minCols: 0 }))
+      .toEqual({ maxRow: 5, maxCol: 8 });
+
+    ws.freezeRows = 12;
+    ws.freezeCols = 10;
+    expect(worksheetContentBounds(ws, { minRows: 0, minCols: 0 }))
+      .toEqual({ maxRow: 12, maxCol: 10 });
+  });
+
+  it('configures grid minimums and trailing margins independently', () => {
+    installDom();
+    const ws = makeSheet();
+    const { priv } = mount(ws, {
+      minRows: 6,
+      minCols: 9,
+      marginRows: 2,
+      marginCols: 3,
+    });
+
+    priv.updateSpacerSize(ws);
+
+    const geometry = GridGeometry.forWorksheet(ws, getMdwForWorksheet(ws));
+    const expected = geometry.roundedContentExtent(8, 12, 1, HEADER_W, HEADER_H);
+    expect(priv.spacer.style.width).toBe(`${expected.width}px`);
+    expect(priv.spacer.style.height).toBe(`${expected.height}px`);
+  });
+
+  it('preserves the historical 80-row by 36-column default grid extent', () => {
+    installDom();
+    const ws = makeSheet();
+    const { priv } = mount(ws);
+
+    priv.updateSpacerSize(ws);
+
+    const geometry = GridGeometry.forWorksheet(ws, getMdwForWorksheet(ws));
+    const expected = geometry.roundedContentExtent(80, 36, 1, HEADER_W, HEADER_H);
+    expect(priv.spacer.style.width).toBe(`${expected.width}px`);
+    expect(priv.spacer.style.height).toBe(`${expected.height}px`);
+  });
+
+  it('rejects fractional or negative grid extent options', () => {
+    installDom();
+    expect(() => mount(makeSheet(), { minRows: -1 })).toThrow(
+      'minRows must be a non-negative safe integer',
+    );
+    expect(() => mount(makeSheet(), { marginCols: 1.5 })).toThrow(
+      'marginCols must be a non-negative safe integer',
+    );
   });
 
   it('getScale() is 1 (100%) by default and reflects the cellScale option', () => {
@@ -162,9 +222,9 @@ describe('XlsxViewer IX9 zoom contract', () => {
     // The footer is viewer chrome, not sheet content. Its two navigation
     // buttons therefore keep the row-header width at 100%, even when the
     // workbook is initially opened or subsequently rendered at another zoom.
-    expect(priv.navPrev.parentElement?.style.width).toBe(`${HEADER_W}px`);
+    expect(priv.sheetTabs.navPrev.parentElement?.style.width).toBe(`${HEADER_W}px`);
     v.setScale(0.5);
-    expect(priv.navPrev.parentElement?.style.width).toBe(`${HEADER_W}px`);
+    expect(priv.sheetTabs.navPrev.parentElement?.style.width).toBe(`${HEADER_W}px`);
   });
 
   it('mirrors footer control order for an RTL worksheet', () => {
@@ -174,42 +234,42 @@ describe('XlsxViewer IX9 zoom contract', () => {
 
     priv.updateFooterDirection();
 
-    expect(priv.tabBar.style.flexDirection).toBe('row-reverse');
-    expect(priv.tabStrip.style.marginLeft).toBe('0');
-    expect(priv.tabStrip.style.marginRight).toBe('1px');
-    expect(priv.tabList.style.flexDirection).toBe('row-reverse');
-    expect(priv.tabList.style.minWidth).toBe('100%');
-    expect(priv.tabList.style.width).toBe('max-content');
+    expect(priv.sheetTabs.tabBar.style.flexDirection).toBe('row-reverse');
+    expect(priv.sheetTabs.tabStrip.style.marginLeft).toBe('0');
+    expect(priv.sheetTabs.tabStrip.style.marginRight).toBe('1px');
+    expect(priv.sheetTabs.tabList.style.flexDirection).toBe('row-reverse');
+    expect(priv.sheetTabs.tabList.style.minWidth).toBe('100%');
+    expect(priv.sheetTabs.tabList.style.width).toBe('max-content');
 
     priv.currentWorksheet = makeSheet();
     priv.updateFooterDirection();
 
-    expect(priv.tabBar.style.flexDirection).toBe('row');
-    expect(priv.tabStrip.style.marginLeft).toBe('1px');
-    expect(priv.tabStrip.style.marginRight).toBe('0');
-    expect(priv.tabList.style.flexDirection).toBe('row');
+    expect(priv.sheetTabs.tabBar.style.flexDirection).toBe('row');
+    expect(priv.sheetTabs.tabStrip.style.marginLeft).toBe('1px');
+    expect(priv.sheetTabs.tabStrip.style.marginRight).toBe('0');
+    expect(priv.sheetTabs.tabList.style.flexDirection).toBe('row');
   });
 
   it('scrolls to the nearest clipped tab by geometry regardless of visual order', () => {
     installDom();
     const { priv } = mount(makeSheet());
-    priv.tabStrip.clientWidth = 100;
-    priv.tabStrip.scrollWidth = 200;
+    priv.sheetTabs.tabStrip.clientWidth = 100;
+    priv.sheetTabs.tabStrip.scrollWidth = 200;
     // Visual RTL order: the first logical tab has the greatest offset.
-    priv.tabs = [
+    priv.sheetTabs.tabs = [
       { offsetLeft: 150, offsetWidth: 50 },
       { offsetLeft: 100, offsetWidth: 50 },
       { offsetLeft: 50, offsetWidth: 50 },
       { offsetLeft: 0, offsetWidth: 50 },
     ];
 
-    priv.tabStrip.scrollLeft = 0;
-    priv.scrollTabs(1);
-    expect(priv.tabStrip.scrollLeft).toBe(50);
+    priv.sheetTabs.tabStrip.scrollLeft = 0;
+    priv.sheetTabs.scrollTabs(1);
+    expect(priv.sheetTabs.tabStrip.scrollLeft).toBe(50);
 
-    priv.tabStrip.scrollLeft = 100;
-    priv.scrollTabs(-1);
-    expect(priv.tabStrip.scrollLeft).toBe(50);
+    priv.sheetTabs.tabStrip.scrollLeft = 100;
+    priv.sheetTabs.scrollTabs(-1);
+    expect(priv.sheetTabs.tabStrip.scrollLeft).toBe(50);
   });
 
   it('zoomIn / zoomOut walk the shared ladder', () => {
@@ -243,6 +303,24 @@ describe('XlsxViewer IX9 zoom contract', () => {
     // fitScale = cw / width, then snapped to whole percent by setScale.
     const expected = Math.round((cw / width) * 100) / 100;
     expect(v.getScale()).toBe(expected);
+  });
+
+  it('fitWidth uses configured minimums without including trailing margins', () => {
+    installDom();
+    const ws = makeSheet();
+    const { width } = naturalExtent(ws);
+    const contentWidth = GridGeometry.forWorksheet(ws, getMdwForWorksheet(ws))
+      .logicalContentExtent(5, 8, HEADER_W, HEADER_H).width;
+    expect(contentWidth).toBeLessThan(width);
+
+    const { v } = mount(ws, {
+      minRows: 0,
+      minCols: 0,
+      marginRows: 100,
+      marginCols: 100,
+    }, { cw: 400, ch: 300 });
+    v.fitWidth();
+    expect(v.getScale()).toBe(Math.round((400 / contentWidth) * 100) / 100);
   });
 
   it('fitPage takes the tighter of the width/height fit', () => {
@@ -503,17 +581,11 @@ describe('XlsxViewer built-in +/- buttons follow the shared ladder (issue #842)'
  */
 describe('XlsxViewer zoom slider', () => {
   it('slider position 50 maps to 100% for any bounds', () => {
-    installDom();
-    const { v } = mount(makeSheet());
-    const priv = v as unknown as {
-      zoomPosToScale(p: number, min: number, max: number): number;
-      zoomScaleToPos(s: number, min: number, max: number): number;
-    };
-    expect(priv.zoomPosToScale(50, 0.1, 4)).toBeCloseTo(1, 10);
-    expect(priv.zoomScaleToPos(1, 0.1, 4)).toBeCloseTo(50, 10);
+    expect(zoomPosToScale(50, 0.1, 4)).toBeCloseTo(1, 10);
+    expect(zoomScaleToPos(1, 0.1, 4)).toBeCloseTo(50, 10);
     // Each half is its own linear segment.
-    expect(priv.zoomPosToScale(0, 0.1, 4)).toBeCloseTo(0.1, 10);
-    expect(priv.zoomPosToScale(100, 0.1, 4)).toBeCloseTo(4, 10);
+    expect(zoomPosToScale(0, 0.1, 4)).toBeCloseTo(0.1, 10);
+    expect(zoomPosToScale(100, 0.1, 4)).toBeCloseTo(4, 10);
   });
 
   it('magnetically snaps the thumb to 100% while dragged near the center', () => {

@@ -1,9 +1,11 @@
 import type { Glow, Reflection, Shadow, SoftEdge } from '../types/common.js';
 import type { ChartExElementStyle } from '../types/chart.js';
 import { MAX_CANVAS_AREA } from '../canvas/clamp.js';
-import { hexToRgba } from '../shape/paint.js';
+import { hexToRgba, withInheritedPatternScope } from '../shape/paint.js';
 import {
   applyInnerShadow,
+  createRasterCoveragePaint,
+  rasterEffectCoverageBounds,
   applyOuterShadow,
   applyReflection,
   applySoftEdge,
@@ -11,8 +13,7 @@ import {
   type PaintShape,
 } from '../shape/effects.js';
 import { compactStyleIndex } from './sparse-style-index.js';
-
-const EMU_PER_PT = 12_700;
+import { EMU_PER_PT } from '../units.js';
 
 /**
  * One chart render may rasterize at most one maximum-size Canvas worth of
@@ -20,7 +21,7 @@ const EMU_PER_PT = 12_700;
  * chart can contain 10,000 points; an aggregate budget prevents a validly
  * bounded point list from multiplying auxiliary-canvas work without bound.
  */
-export const MAX_CHART_EFFECT_RASTER_PIXELS = MAX_CANVAS_AREA;
+const MAX_CHART_EFFECT_RASTER_PIXELS = MAX_CANVAS_AREA;
 
 interface Matrix2D {
   a: number;
@@ -157,8 +158,8 @@ function rasterCost(
   margin: number,
   surfaces: number,
 ): number {
-  const width = Math.max(1, Math.ceil(bbox.w + margin * 2));
-  const height = Math.max(1, Math.ceil(bbox.h + margin * 2));
+  const width = Math.max(1, Math.ceil(bbox.x + bbox.w + margin) - Math.floor(bbox.x - margin));
+  const height = Math.max(1, Math.ceil(bbox.y + bbox.h + margin) - Math.floor(bbox.y - margin));
   const cost = width * height * surfaces;
   return Number.isSafeInteger(cost) ? cost : Number.POSITIVE_INFINITY;
 }
@@ -184,10 +185,15 @@ export function chartEffectRasterWorkUpperBound(
       ) + 2
     : 0;
   const reflectionCost = effects.reflection ? deviceW * deviceH : 0;
+  const coverageBounds = rasterEffectCoverageBounds(bbox, effects, effectScale, deviceW, deviceH);
   return reflectionCost
     + (effects.shadow ? rasterCost(bbox, outerReach, 1) : 0)
-    + (effects.softEdge ? rasterCost(bbox, softReach, 2) : 0)
-    + (effects.innerShadow ? rasterCost(bbox, innerReach, 2) : 0);
+    + (effects.softEdge ? rasterCost(bbox, softReach, 3) : 0)
+    + (effects.innerShadow ? rasterCost(bbox, innerReach, 2) : 0)
+    // One shared geometric mask plus its transient readback buffer. Charge the
+    // complete effect-source domain (already padded by the consumer), not
+    // just the mark's geometry; outlines and joins may extend past that box.
+    + (effects.softEdge || effects.innerShadow ? rasterCost(coverageBounds, 0, 2) : 0);
 }
 
 function nativeShadow(
@@ -289,8 +295,10 @@ export function paintChartStyleEffects(
   const [deviceW, deviceH] = canvasExtent(ctx);
   const haveDeviceCanvas = deviceW > 0 && deviceH > 0;
   const devicePaint: PaintShape = target => {
-    target.setTransform(transform as DOMMatrix2DInit);
-    paintBody(target as CanvasRenderingContext2D);
+    withInheritedPatternScope(ctx, target as CanvasRenderingContext2D, () => {
+      target.setTransform(transform as DOMMatrix2DInit);
+      paintBody(target as CanvasRenderingContext2D);
+    });
   };
   const resetToDevice = () => ctx.setTransform(1, 0, 0, 1, 0, 0);
 
@@ -301,6 +309,13 @@ export function paintChartStyleEffects(
   const rasterAllowed = haveDeviceCanvas
     && Number.isSafeInteger(requiredRasterWork)
     && requiredRasterWork <= (budget?.perConsumerMaximum ?? 0);
+
+  // Marks can be translucent too. Use the same geometric coverage boundary
+  // as shapes/pictures rather than treating a colored body as an effect mask.
+  const coverage = rasterAllowed && (effects.softEdge || effects.innerShadow)
+    ? createRasterCoveragePaint(devicePaint, rasterEffectCoverageBounds(
+        transformedBBox, effects, effectScale, deviceW, deviceH,
+      )) : null;
 
   let shadowRasterized = false;
   if (rasterAllowed && effects.shadow) {
@@ -348,7 +363,7 @@ export function paintChartStyleEffects(
   // attach that native effect to the already-composited soft-edge bitmap, so
   // keep the visible outer effect and omit softEdge for this uncommon combined
   // recipe rather than silently losing the style's shadow.
-  if (!nativeEffect && rasterAllowed && effects.softEdge) {
+  if (!nativeEffect && rasterAllowed && effects.softEdge && coverage) {
       ctx.save();
       resetToDevice();
       applySoftEdge(
@@ -359,6 +374,7 @@ export function paintChartStyleEffects(
         effectScale,
         deviceW,
         deviceH,
+        coverage,
       );
       ctx.restore();
       bodyPainted = true;
@@ -373,12 +389,12 @@ export function paintChartStyleEffects(
     ctx.restore();
   }
 
-  if (rasterAllowed && effects.innerShadow) {
+  if (rasterAllowed && effects.innerShadow && coverage) {
       ctx.save();
       resetToDevice();
       applyInnerShadow(
         ctx as never,
-        devicePaint,
+        coverage,
         transformedBBox,
         effects.innerShadow,
         effectScale,

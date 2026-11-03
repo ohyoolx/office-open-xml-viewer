@@ -1,5 +1,5 @@
 import type { ParsedWorkbook, Row, Worksheet } from '@silurus/ooxml-xlsx';
-import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
+import type { ModelSource, OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   decodeOoxmlResourceUsage,
   parseResourceLimitError,
@@ -10,12 +10,16 @@ import {
 // The Node facade consumes the format-owned coordinator through its explicit
 // internal entry point rather than reconstructing XLSX orchestration here.
 import {
+  DEFAULT_XLSX_WORKSHEET_POLICY,
+  normalizeXlsxWorksheetPolicy,
+  type NormalizedXlsxWorksheetPolicy,
   acquireXlsxNodeSession,
   addWorksheetCacheUsage,
   addWorksheetUsage,
   assertWorksheetCacheUsage,
   assertWorksheetJsonBytes,
   assertWorksheetModelUsage,
+  bindWorksheetPolicy,
   completeWorksheetUsage,
   measureRows,
   XlsxWorksheetPullClient,
@@ -50,7 +54,16 @@ export interface MaterializedXlsxWorkbook {
 }
 
 /** Options for the bounded Node workbook session. */
-export type OpenXlsxWorkbookOptions = OoxmlNodeSessionOptions;
+export type OpenXlsxWorkbookOptions = OoxmlNodeSessionOptions & {
+  /**
+   * Opt-in model source for workbook input that is not an OOXML package (a
+   * `ModelSource<'xlsx'>`). When its `claim()` accepts the bytes, it opens them
+   * in this realm; otherwise the ordinary OOXML path runs unchanged.
+   */
+  readonly legacyXls?: ModelSource<'xlsx'>;
+  /** Canvas for a selected model source's Normal-font measurement. */
+  readonly factory?: import('./render.ts').NodeCanvasFactory;
+};
 
 export type XlsxWorksheetRowChunk =
   | {
@@ -93,15 +106,26 @@ export async function openXlsxWorkbook(
   buffer: ArrayBuffer | Uint8Array,
   options: OpenXlsxWorkbookOptions = {},
 ): Promise<XlsxWorkbookSession> {
+  const policy = normalizeXlsxWorksheetPolicy(options);
+  // Rebind the local parameter to an immutable policy capture so later caller
+  // mutation cannot affect this session, while keeping the canonical
+  // `options.legacyXls !== undefined` branch shape recognized by the
+  // source-boundary gate.
+  options = { ...options, xlsxWorksheetLimits: policy.worksheet };
+  if (__OOXML_MODEL_SOURCES__ && options.legacyXls !== undefined) {
+    const { openXlsxSource } = await import('./xlsx-model-source.ts');
+    return openXlsxSource(buffer, options, getXlsxWasmModule);
+  }
   const bytes = toUint8(buffer);
   const acquired = await acquireXlsxNodeSession(bytes, getXlsxWasmModule(), options);
   return new XlsxWorkbookSessionImpl(
     acquired.closeArchive,
-    acquired.archive,
+    acquired.archive as XlsxNodeArchive,
     acquired.workbookIndex,
     acquired.metrics,
     acquired.usage,
     options.signal,
+    acquired.worksheetPolicy,
   );
 }
 
@@ -109,12 +133,19 @@ type ActiveWorksheetOperation = {
   cleanupPromise?: Promise<void>;
 };
 
-class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
+/** Realm-local, non-public per-session normalized worksheet policy binding. */
+const sessionWorksheetPolicies = new WeakMap<object, NormalizedXlsxWorksheetPolicy>();
+
+function sessionWorksheetPolicy(session: object): NormalizedXlsxWorksheetPolicy {
+  return sessionWorksheetPolicies.get(session) ?? DEFAULT_XLSX_WORKSHEET_POLICY;
+}
+
+export class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
   readonly workbookIndex: ReadonlyParsedWorkbook;
   readonly sheetCount: number;
   readonly sheetNames: ReadonlyArray<string>;
 
-  private readonly pull: WorksheetPullWorker;
+  protected pull: Pick<WorksheetPullWorker, 'dispatchSafely' | 'open' | 'reserveOpen' | 'reset'>;
   private readonly transport: InProcessPullTransport<PullSessionResponse<ArrayBuffer, number>>;
   private readonly worksheetPullClient: XlsxWorksheetPullClient;
   private active: ActiveWorksheetOperation | undefined;
@@ -132,7 +163,9 @@ class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
     private readonly metrics: OoxmlResourceMetricsSession,
     usage: OoxmlResourceUsageSnapshot | undefined,
     private readonly signal?: AbortSignal,
+    policy: NormalizedXlsxWorksheetPolicy = DEFAULT_XLSX_WORKSHEET_POLICY,
   ) {
+    sessionWorksheetPolicies.set(this, policy);
     this.workbookIndex = freezeRecursively(workbook);
     this.sheetNames = Object.freeze(this.workbookIndex.workbook.sheets.map((sheet) => sheet.name));
     this.sheetCount = this.sheetNames.length;
@@ -194,6 +227,9 @@ class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
         this.signal,
       )) {
         if (this.closed) throw new Error('XLSX workbook session is closed');
+        // Browser viewers may paint from this provisional shell. The Node row
+        // stream keeps its established rows-then-terminal contract.
+        if (unit.kind === 'preview') continue;
         if (unit.kind === 'rows') {
           this.rowBatches += 1;
           this.emittedRows += unit.rows.length;
@@ -206,6 +242,7 @@ class XlsxWorkbookSessionImpl implements XlsxWorkbookSession {
           };
           continue;
         }
+        bindWorksheetPolicy(unit.worksheet, sessionWorksheetPolicy(this));
         yield {
           kind: 'finished',
           worksheet: unit.worksheet,
@@ -331,18 +368,20 @@ export async function materializeXlsxWorkbook(
   return usingOwnedSession(
     () => openXlsxWorkbook(buffer, options),
     async (session) => {
+      const policy = sessionWorksheetPolicy(session);
       const worksheets: Worksheet[] = [];
       let retainedUsage: WorksheetCacheUsage = {
         rows: 0, cells: 0, ownedUtf8Bytes: 0, jsonBytes: 0,
       };
       for (let sheetIndex = 0; sheetIndex < session.sheetCount; sheetIndex += 1) {
         const materialized = await materializeWorksheetFromSession(session, sheetIndex);
-        const nextUsage = addWorksheetCacheUsage(retainedUsage, materialized.usage);
+        const nextUsage = addWorksheetCacheUsage(retainedUsage, materialized.usage, {}, policy);
         assertWorksheetCacheUsage(
           nextUsage,
           'materialize-workbook',
           undefined,
           materialized.resourceUsage,
+          policy,
         );
         retainedUsage = nextUsage;
         worksheets.push(materialized.worksheet);
@@ -363,6 +402,7 @@ async function materializeWorksheetFromSession(
   usage: WorksheetModelUsage & { jsonBytes: number };
   resourceUsage?: OoxmlResourceUsageSnapshot;
 }> {
+  const policy = sessionWorksheetPolicy(session);
   const rows: Row[] = [];
   let modelUsage: WorksheetModelUsage = { rows: 0, cells: 0, ownedUtf8Bytes: 0 };
   let retainedUsage: (WorksheetModelUsage & { jsonBytes: number }) | undefined;
@@ -371,35 +411,40 @@ async function materializeWorksheetFromSession(
   for await (const chunk of session.worksheetRows(sheetIndex)) {
     resourceUsage = chunk.usage ?? resourceUsage;
     if (chunk.kind === 'rows') {
-      const nextUsage = addWorksheetUsage(modelUsage, measureRows(chunk.rows));
+      const nextUsage = addWorksheetUsage(modelUsage, measureRows(chunk.rows, policy), policy);
       assertWorksheetModelUsage(
         nextUsage,
         'materialize-worksheet',
         undefined,
         resourceUsage,
+        policy,
       );
       rows.push(...chunk.rows);
       modelUsage = nextUsage;
     } else {
       terminal = chunk.worksheet;
+      bindWorksheetPolicy(terminal, policy);
       terminal.rows = terminal.parseError ? [] : rows;
       const measured = completeWorksheetUsage(
         terminal,
         terminal.parseError
           ? { rows: 0, cells: 0, ownedUtf8Bytes: 0 }
           : modelUsage,
+        policy,
       );
       assertWorksheetModelUsage(
         measured,
         'materialize-worksheet',
         undefined,
         resourceUsage,
+        policy,
       );
       assertWorksheetJsonBytes(
         measured.jsonBytes,
         'materialize-worksheet',
         undefined,
         resourceUsage,
+        policy,
       );
       modelUsage = measured;
       retainedUsage = measured;
@@ -439,3 +484,4 @@ function decodeUsage(bytes: Uint8Array): OoxmlResourceUsageSnapshot | undefined 
 function toUint8(buffer: ArrayBuffer | Uint8Array): Uint8Array {
   return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer as ArrayBuffer);
 }
+declare const __OOXML_MODEL_SOURCES__: boolean;

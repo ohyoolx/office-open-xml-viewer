@@ -2,6 +2,7 @@ import {
   OoxmlError,
   OoxmlResourceLimitError,
   type OoxmlErrorCode,
+  type OoxmlUnsupportedContentDetails,
   type OoxmlErrorStage,
   type OoxmlFormat,
   type OoxmlResourceLimitErrorDetails,
@@ -22,6 +23,9 @@ import {
 } from './pull-credit-error.js';
 
 const RESOURCE_LIMIT_PREFIX = 'OOXML_RESOURCE_LIMIT:';
+/** Rust `ooxml_common::opc::NOT_OOXML_PREFIX`: the input is not a readable ZIP,
+ * not an OPC package, or lacks the format's main part (ECMA-376 Part 2). */
+const NOT_OOXML_PREFIX = 'OOXML_NOT_OOXML:';
 const MAX_IDENTIFIER_LENGTH = 128;
 const MAX_OPERATION_LENGTH = 256;
 const MAX_PART_LENGTH = 4_096;
@@ -32,6 +36,7 @@ export interface WorkerErrorPayload {
   errorName?: string;
   code?: string;
   resourceLimit?: OoxmlResourceLimitErrorDetails;
+  unsupportedContent?: OoxmlUnsupportedContentDetails;
   insufficientCredit?: PullSessionInsufficientCreditDetails;
   decodedImage?: {
     metric: OoxmlDecodedImageLimitMetric;
@@ -128,9 +133,20 @@ const KNOWN_PAIR_RULES = new Map<string, KnownPairRule>([
   ['archive:distinct-inflated-bytes', { stage: 'decompression', part: 'required' }],
   ['xml-event:bytes', { stage: 'parsing', part: 'optional', configurable: false }],
   ['xml-context:bytes', { stage: 'parsing', part: 'optional', configurable: false }],
+  ['image-effect:work', { stage: 'parsing', part: 'forbidden', configurable: false }],
+  ['chartex-allocation:elements', { stage: 'parsing', part: 'forbidden', configurable: false }],
+  ['chartex-allocation:bytes', { stage: 'parsing', part: 'forbidden', configurable: false }],
+  ['chart-cache:points', { stage: 'parsing', part: 'forbidden', configurable: false }],
+  ['numbering-marker:bytes', { stage: 'parsing', part: 'forbidden', configurable: false }],
+  ['chart-style-formats:entries', { stage: 'parsing', part: 'required', configurable: false }],
+  ['chart-custom-number-formats:entries', { stage: 'parsing', part: 'required', configurable: false }],
+  ['chart-number-format-bytes:bytes', { stage: 'parsing', part: 'required', configurable: false }],
   ['xml-tree:depth', { stage: 'parsing', part: 'optional', configurable: false }],
   ['worksheet-row:projected-bytes', { stage: 'parsing', part: 'optional', configurable: false }],
   ['worksheet-shell:projected-bytes', { stage: 'parsing', part: 'optional', configurable: false }],
+  ['theme-style-reparse:bytes', { stage: 'parsing', part: 'forbidden', configurable: false }],
+  ['style-inheritance:depth', { stage: 'parsing', part: 'required', configurable: false }],
+  ['complex-field:depth', { stage: 'parsing', part: 'forbidden', configurable: false }],
 ]);
 const KNOWN_RESOURCES = new Set(
   [...KNOWN_PAIR_RULES.keys()].map((pair) => pair.slice(0, pair.indexOf(':'))),
@@ -213,10 +229,15 @@ function detailsForWire(
   return isResourceLimitDetails(candidate) ? candidate : undefined;
 }
 
-function resourceLimitMessage(details: OoxmlResourceLimitErrorDetails): string {
+/** Library quota diagnostics identify the resource and stage: the associated
+ * part alone does not distinguish a part-size limit from a model-size limit. */
+export function resourceLimitMessage(details: {
+  readonly stage: OoxmlErrorStage;
+  readonly violation: Pick<OoxmlResourceViolation, 'part' | 'resource' | 'metric' | 'observed' | 'limit'>;
+}): string {
   const violation = details.violation;
   const location = violation.part ? ` for ${violation.part}` : '';
-  return `OOXML resource limit exceeded${location}: ${violation.metric} ${violation.observed} > ${violation.limit}`;
+  return `OOXML resource limit exceeded${location} (${violation.resource}, ${details.stage}): ${violation.metric} ${violation.observed} > ${violation.limit}`;
 }
 
 /** Parse only an exact Rust resource-limit envelope, never a wrapped substring. */
@@ -235,6 +256,67 @@ export function parseResourceLimitError(error: unknown): OoxmlResourceLimitError
     return undefined;
   }
   return new OoxmlResourceLimitError(resourceLimitMessage(data.details), data.details);
+}
+
+/**
+ * WASM returns resource violations as strings. Normalize at the invocation
+ * boundary, before an optional font/image/codec catch can classify the failure
+ * as recoverable. This is library resource policy, not an OOXML recovery rule;
+ * preserve typed errors and unrelated failures (including traps) by identity.
+ * WASM archive methods are synchronous; async orchestration awaits their caller.
+ */
+export function withWasmResourceErrors<T>(operation: () => T): T {
+  try {
+    return operation();
+  } catch (error) {
+    if (error instanceof OoxmlResourceLimitError
+      || (typeof error !== 'string' && !(error instanceof Error))) throw error;
+    throw parseResourceLimitError(error) ?? error;
+  }
+}
+
+/** Parse only an exact Rust not-OOXML envelope into `OoxmlError('not-ooxml')`. */
+function parseNotOoxmlError(error: unknown): OoxmlError | undefined {
+  const text = error instanceof Error ? error.message : String(error);
+  if (!text.startsWith(NOT_OOXML_PREFIX)) return undefined;
+  const detail = text.slice(NOT_OOXML_PREFIX.length);
+  return new OoxmlError('not-ooxml', `This file is not an Office Open XML document: ${detail}`);
+}
+
+/** v2 model-source protocol signal. Deliberately canonicalize the message and
+ * copy only validated fields: source modules may carry untrusted diagnostics. */
+function unsupportedContentDetails(value: unknown): OoxmlUnsupportedContentDetails | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const candidate = value as Partial<OoxmlUnsupportedContentDetails>;
+  const format = candidate.format;
+  const reason = candidate.reason;
+  if (!isIdentifier(format) || reason !== 'source-subset') return undefined;
+  return { format, reason };
+}
+
+function unsupportedContentError(details: OoxmlUnsupportedContentDetails): OoxmlError {
+  return new OoxmlError('unsupported-content',
+    'Input is outside the source’s supported subset.', details);
+}
+
+function parseSourceRejection(error: unknown): OoxmlError | undefined {
+  const text = typeof error === 'string' ? error : error instanceof Error ? error.message : '';
+  const prefix = 'MODEL_SOURCE_UNSUPPORTED:';
+  if (!text.startsWith(prefix) || text.length > 1024) return undefined;
+  try {
+    const details = unsupportedContentDetails(JSON.parse(text.slice(prefix.length)) as unknown);
+    return details ? unsupportedContentError(details) : undefined;
+  } catch { return undefined; }
+}
+
+/** Reconstruct the typed error carried by a Rust parser envelope, if any. */
+export function parseTypedParserError(
+  error: unknown,
+): OoxmlResourceLimitError | OoxmlError | undefined {
+  if (error === 'OOXML_SOURCE_UNSUPPORTED_ENCRYPTION' || error instanceof Error && error.message === 'OOXML_SOURCE_UNSUPPORTED_ENCRYPTION') {
+    return new OoxmlError('unsupported-encryption', 'The configured source cannot decrypt this input.');
+  }
+  return parseSourceRejection(error) ?? parseResourceLimitError(error) ?? parseNotOoxmlError(error);
 }
 
 function serializeWorkerErrorUnchecked(error: unknown): WorkerErrorPayload {
@@ -275,9 +357,12 @@ function serializeWorkerErrorUnchecked(error: unknown): WorkerErrorPayload {
   const typed =
     error instanceof OoxmlError || error instanceof OoxmlResourceLimitError
       ? error
-      : parseResourceLimitError(error);
-  if (typed instanceof OoxmlResourceLimitError) {
-    const resourceLimit = detailsForWire(typed.details);
+      : parseTypedParserError(error);
+  const source = typed ?? error;
+  if (typed instanceof OoxmlResourceLimitError || (source && typeof source === 'object'
+    && (source as { code?: unknown }).code === 'ooxml-resource-limit')) {
+    const candidate = source as { details?: unknown; message?: unknown };
+    const resourceLimit = detailsForWire(candidate.details);
     if (!resourceLimit) {
       return {
         message: 'Invalid OOXML resource-limit error payload',
@@ -285,12 +370,21 @@ function serializeWorkerErrorUnchecked(error: unknown): WorkerErrorPayload {
       };
     }
     return {
-      message: typeof typed.message === 'string' ? typed.message : resourceLimitMessage(resourceLimit),
+      message: typeof candidate.message === 'string' ? candidate.message : resourceLimitMessage(resourceLimit),
       errorName: 'OoxmlResourceLimitError',
       code: 'ooxml-resource-limit',
       resourceLimit,
     };
   }
+  // URL-loaded source/owner modules can bundle another copy of the error class.
+  // Validate the declared code and metadata, never rely on constructor identity
+  // or forward their diagnostic message across this boundary.
+  if (source && typeof source === 'object' && (source as { code?: unknown }).code === 'unsupported-content') {
+    const details = unsupportedContentDetails((source as { details?: unknown }).details);
+    if (!details) return { message: 'Invalid unsupported-content error payload', errorName: 'Error' };
+    return { message: unsupportedContentError(details).message, code: 'unsupported-content', unsupportedContent: details };
+  }
+
   if (typed instanceof OoxmlError) {
     return {
       message: typeof typed.message === 'string' ? typed.message : String(typed.message),
@@ -334,12 +428,22 @@ const OOXML_ERROR_CODES = new Set<OoxmlErrorCode>([
   'unsupported-encryption',
   'legacy-binary-format',
   'not-ooxml',
+  'invalid-numbering',
+  'unsupported-image-effect',
 ]);
 
 const DECODED_IMAGE_LIMIT_METRICS = {
   'image-dimension': true,
   'image-pixels': true,
   'active-decoded-bytes': true,
+  'image-effect-count': true,
+  'image-effect-work': true,
+  'tiff-lzw-work': true,
+  'metafile-path-commands': true,
+  'metafile-record-points': true,
+  'metafile-record-polygons': true,
+  'metafile-record-rectangles': true,
+  'metafile-record-text-units': true,
 } satisfies Record<OoxmlDecodedImageLimitMetric, true>;
 
 function isDecodedImageLimitMetric(value: unknown): value is OoxmlDecodedImageLimitMetric {
@@ -383,6 +487,7 @@ function deserializeWorkerErrorUnchecked(payload: WorkerErrorPayload): Error {
   const decodedImagePayload = payload.decodedImage as unknown;
   const insufficientCreditPayload = payload.insufficientCredit as unknown;
   const resourceLimitPayload = payload.resourceLimit as unknown;
+  const unsupportedContentPayload = payload.unsupportedContent as unknown;
   const message = typeof rawMessage === 'string'
     ? rawMessage
     : 'Worker operation failed with an invalid error payload';
@@ -390,6 +495,10 @@ function deserializeWorkerErrorUnchecked(payload: WorkerErrorPayload): Error {
     ? rawErrorName
     : undefined;
   const code = typeof rawCode === 'string' ? rawCode : undefined;
+  if (code === 'unsupported-content') {
+    const details = unsupportedContentDetails(unsupportedContentPayload);
+    return details ? unsupportedContentError(details) : new Error('Invalid unsupported-content error payload');
+  }
   const decodedImage = decodedImageLimitDetailsFromWire(code, decodedImagePayload);
   if (decodedImage) {
     return new OoxmlDecodedImageLimitError(

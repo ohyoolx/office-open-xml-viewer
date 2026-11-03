@@ -1,8 +1,4 @@
 import {
-  WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT,
-  WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL,
-} from './compatibility.js';
-import {
   axisAlignedRectsOverlap,
   resolveAxisAlignedOverlap,
   type AxisAlignedRect,
@@ -38,29 +34,37 @@ export type FloatPlacementParticipant =
     }>
   | Readonly<FloatPlacementParticipantCore & {
       readonly kind: 'frame';
+      /** §17.18.104 framePr wrap projected by `frameWrapExclusionMode`, as on
+       * FloatRegistryEntryPt; absent projects square. */
+      readonly exclusionMode?: 'square' | 'topAndBottom';
     }>;
 
 export type FloatAvoidance =
   | Readonly<{ kind: 'drawingml-normative' }>
-  | Readonly<{ kind: 'word-different-paragraph'; paragraphId: number }>
   | Readonly<{ kind: 'none' }>;
 
-export function floatingTableAvoidance(
-  tableOverlap: 'never' | 'overlap',
-  paragraphId: number,
-): FloatAvoidance {
-  return tableOverlap === 'overlap'
-    ? Object.freeze({ kind: 'word-different-paragraph', paragraphId })
-    : Object.freeze({ kind: 'none' });
+/** ECMA-376 §17.4.56: a floating table avoids another floating table only
+ * when either one sets tblOverlap="never" (resolved in
+ * `resolveFloatPlacement`); an overlap-permitted table keeps its position
+ * beside floats of other paragraphs (Windows Word 16.0.20430, #1896). */
+export function floatingTableAvoidance(): FloatAvoidance {
+  return Object.freeze({ kind: 'none' });
 }
 
-export function drawingMLAvoidance(
-  allowOverlap: boolean,
-  paragraphId: number,
-): FloatAvoidance {
+/** ECMA-376 §20.4.2.3: an allowOverlap=true DrawingML object keeps its
+ * resolved position. Word controls from issue #1623 confirm that no
+ * different-paragraph displacement applies to such pictures. */
+export function drawingMLAvoidance(allowOverlap: boolean): FloatAvoidance {
   return allowOverlap
-    ? Object.freeze({ kind: 'word-different-paragraph', paragraphId })
+    ? Object.freeze({ kind: 'none' })
     : Object.freeze({ kind: 'drawingml-normative' });
+}
+
+/** A `w:framePr` frame keeps its resolved position over other floats
+ * (Windows Word 16.0.20430 #1896 controls: frames overlapping a frame or a
+ * floating table of another paragraph are not displaced). */
+export function frameAvoidance(): FloatAvoidance {
+  return Object.freeze({ kind: 'none' });
 }
 
 export function floatRegistryParticipant(
@@ -79,10 +83,14 @@ export function floatRegistryParticipant(
       tableOverlap: entry.overlap,
     };
   }
-  return {
-    ...core,
-    kind: entry.kind === 'shape' ? 'drawingml' : 'frame',
-  };
+  if (entry.kind === 'frame') {
+    return {
+      ...core,
+      kind: 'frame',
+      ...(entry.exclusionMode ? { exclusionMode: entry.exclusionMode } : {}),
+    };
+  }
+  return { ...core, kind: 'drawingml' };
 }
 
 export function floatRectParticipant(
@@ -122,10 +130,10 @@ export function floatRectParticipant(
       tableOverlap: float.tableOverlap,
     };
   }
-  return {
-    ...core,
-    kind: float.kind === 'shape' ? 'drawingml' : 'frame',
-  };
+  // A frame's FloatRect `mode` is its frameWrapExclusionMode projection.
+  return float.kind === 'frame'
+    ? { ...core, kind: 'frame', exclusionMode: float.mode }
+    : { ...core, kind: 'drawingml' };
 }
 
 export interface FloatPlacement {
@@ -144,6 +152,9 @@ export interface ResolveFloatPlacementInput {
    * coordinate path; exact anchor reflow deliberately omits both values. */
   readonly overlapEpsilonPt?: number;
   readonly rightBoundarySlackPt?: number;
+  /** The page's vertical extent. When supplied, a table that must avoid
+   * another (tblOverlap="never") only takes a position on the page. */
+  readonly pageVerticalBoundsPt?: Readonly<{ topPt: number; bottomPt: number }>;
 }
 
 function axisRect(rect: LayoutRect): AxisAlignedRect {
@@ -253,72 +264,112 @@ export function resolveFloatPlacement(
     }
     return [];
   });
-  const compatibilityBlockers = avoidance.kind === 'word-different-paragraph'
-    ? input.blockers.flatMap((blocker): AxisAlignedRect[] =>
-        blocker.paragraphId === avoidance.paragraphId
-          ? []
-          : [compatibilityBlockerInObjectSpace(moving, blocker)])
-    : [];
-  const movingRightPaddingPt = moving.exclusionBounds.xPt
-    + moving.exclusionBounds.widthPt
-    - moving.bounds.xPt
-    - moving.bounds.widthPt;
-  // Compatibility displacement historically resolved the moving exclusion
-  // rectangle. Its right edge, not only the object edge, must fit within the
-  // caller's boundary and slack after converting the collision into object
-  // space.
-  const rightBoundaryPt = avoidance.kind === 'word-different-paragraph'
-    ? input.rightBoundaryPt - movingRightPaddingPt
-    : input.rightBoundaryPt;
-  const normative = resolveObjectPosition(
-    input,
-    normativeBlockers,
-    rightBoundaryPt,
+  const resolved = resolveObjectPosition(input, normativeBlockers);
+  const page = input.pageVerticalBoundsPt;
+  if (moving.kind === 'table' && page && normativeBlockers.length > 0
+    && resolved.top + moving.bounds.heightPt > page.bottomPt + (input.overlapEpsilonPt ?? 0)) {
+    // `word-never-table-page-displacement`: when neither moving right nor
+    // moving down keeps the table on the page, set it above the tables it
+    // meets; when that leaves the page too, keep its authored position.
+    // (Leaving the text area is a pagination decision, made by the caller.)
+    const above = resolveAbove(axisRect(moving.bounds), normativeBlockers, input.overlapEpsilonPt ?? 0);
+    const top = above !== null && above >= page.topPt - (input.overlapEpsilonPt ?? 0)
+      ? above
+      : moving.bounds.yPt;
+    return placement(moving, 0, top - moving.bounds.yPt, []);
+  }
+  return placement(
+    moving,
+    resolved.left - moving.bounds.xPt,
+    resolved.top - moving.bounds.yPt,
+    [],
   );
-  const resolved = compatibilityBlockers.length === 0
-    ? normative
-    : resolveObjectPosition(
-        input,
-        [...normativeBlockers, ...compatibilityBlockers],
-        rightBoundaryPt,
-      );
-  const xPt = resolved.left - moving.bounds.xPt;
-  const yPt = resolved.top - moving.bounds.yPt;
-  const compatibilityChangedPlacement = resolved.left !== normative.left
-    || resolved.top !== normative.top;
-  return placement(moving, xPt, yPt, compatibilityChangedPlacement
-    ? [WORD_FLOAT_DIFFERENT_PARAGRAPH_DISPLACEMENT.id]
-    : []);
+}
+
+/** Move `moving` straight up until it meets none of `blockers`; null when
+ * that does not settle. Each step clears every blocker it meets, so it
+ * settles within `blockers.length` steps. */
+function resolveAbove(
+  moving: AxisAlignedRect,
+  blockers: readonly AxisAlignedRect[],
+  overlapEpsilon: number,
+): number | null {
+  const height = moving.bottom - moving.top;
+  let top = moving.top;
+  for (let step = 0; step <= blockers.length; step += 1) {
+    const current = { ...moving, top, bottom: top + height };
+    const intersecting = blockers.filter((blocker) =>
+      axisAlignedRectsOverlap(current, blocker, overlapEpsilon));
+    if (intersecting.length === 0) return top;
+    top = Math.min(...intersecting.map((blocker) => blocker.top)) - height;
+  }
+  return null;
 }
 
 export interface ResolveBlockFlowAdmissionInput {
+  /** The block's own inline extent. */
   readonly inlineStartPt: number;
   readonly inlineEndPt: number;
+  /** The inline band of the flow lines the block occupies (its column or
+   * story band), in the same coordinate space. */
+  readonly flowBandStartPt: number;
+  readonly flowBandEndPt: number;
   readonly blockStartPt: number;
   readonly blockExtentPt: number;
   readonly blockers: readonly FloatPlacementParticipant[];
   readonly overlapEpsilonPt: number;
 }
 
+/** The inline interval over which `blocker` excludes an ordinary-flow block,
+ * or null when it never does. */
+function blockFlowExclusionInterval(
+  blocker: FloatPlacementParticipant,
+  input: ResolveBlockFlowAdmissionInput,
+): Readonly<{ startPt: number; endPt: number }> | null {
+  const own = { startPt: input.inlineStartPt, endPt: input.inlineEndPt };
+  switch (blocker.kind) {
+    // §17.4.57 floating-table text exclusion (existing library policy).
+    case 'table': return own;
+    // ECMA-376 §17.18.104: none/notBeside (topAndBottom) allow no flow
+    // content beside the frame, so every line of the band that crosses it
+    // resumes below it; around (square) leaves the remaining line space,
+    // which a block cannot share (ordinary-block policy, as for tables), so
+    // only a block that itself overlaps the frame is moved.
+    case 'frame': return (blocker.exclusionMode ?? 'square') === 'topAndBottom'
+      ? {
+          startPt: Math.min(input.flowBandStartPt, own.startPt),
+          endPt: Math.max(input.flowBandEndPt, own.endPt),
+        }
+      : own;
+    // DrawingML objects keep their established paragraph-line wrap only.
+    case 'drawingml': return null;
+  }
+}
+
 /**
- * Admit one ordinary-flow block below floating-table text exclusions.
+ * Admit one ordinary-flow block below the text exclusions it may not sit
+ * beside: floating tables and `w:framePr` frames ({@link
+ * blockFlowExclusionInterval}).
  *
  * This is not §17.4.56 float-to-float placement: the moving object is flow
- * content, so §17.4.57 exclusion bounds apply. Each move adopts the bottom of
- * an intersecting blocker. The start is monotone and every cleared blocker can
+ * content, so exclusion bounds apply. Each move adopts the bottom of an
+ * intersecting blocker. The start is monotone and every cleared blocker can
  * never intersect again, giving a hard bound of `eligible.length` moves.
  */
 export function resolveBlockFlowAdmission(
   input: ResolveBlockFlowAdmissionInput,
 ): Readonly<{ blockStartPt: number }> {
-  if (input.inlineEndPt < input.inlineStartPt || input.blockExtentPt < 0) {
+  if (input.inlineEndPt < input.inlineStartPt
+    || input.flowBandEndPt < input.flowBandStartPt
+    || input.blockExtentPt < 0) {
     throw new RangeError('Block-flow admission received a negative extent');
   }
   const eligible = input.blockers.filter((blocker) => {
+    const interval = blockFlowExclusionInterval(blocker, input);
+    if (!interval) return false;
     const bounds = blocker.exclusionBounds;
-    return blocker.kind === 'table'
-      && input.inlineEndPt - bounds.xPt > input.overlapEpsilonPt
-      && bounds.xPt + bounds.widthPt - input.inlineStartPt > input.overlapEpsilonPt;
+    return interval.endPt - bounds.xPt > input.overlapEpsilonPt
+      && bounds.xPt + bounds.widthPt - interval.startPt > input.overlapEpsilonPt;
   });
   let blockStartPt = input.blockStartPt;
   for (let moveCount = 0; moveCount <= eligible.length; moveCount += 1) {
@@ -335,35 +386,4 @@ export function resolveBlockFlowAdmission(
       blocker.exclusionBounds.yPt + blocker.exclusionBounds.heightPt));
   }
   throw new Error('Block-flow float admission did not converge');
-}
-
-export interface ResolvePageAnchoredTableDeferralInput {
-  readonly bounds: LayoutRect;
-  readonly blockers: readonly FloatPlacementParticipant[];
-  readonly overlapEpsilonPt: number;
-}
-
-/** Established Word pagination behavior, deliberately separate from normative
- * §17.4.56 raw table placement. The authored object band is admitted against
- * already-reserved §17.4.57 floating-table text-exclusion bands. */
-export function resolvePageAnchoredTableDeferral(
-  input: ResolvePageAnchoredTableDeferralInput,
-): Readonly<{
-  defer: boolean;
-  appliedCompatibilityRuleIds: readonly string[];
-}> {
-  const moving = axisRect(input.bounds);
-  const defer = input.blockers.some((blocker) =>
-    blocker.kind === 'table'
-      && axisAlignedRectsOverlap(
-        moving,
-        axisRect(blocker.exclusionBounds),
-        input.overlapEpsilonPt,
-      ));
-  return Object.freeze({
-    defer,
-    appliedCompatibilityRuleIds: defer
-      ? Object.freeze([WORD_PAGE_ANCHORED_TABLE_COLLISION_DEFERRAL.id])
-      : Object.freeze([]),
-  });
 }

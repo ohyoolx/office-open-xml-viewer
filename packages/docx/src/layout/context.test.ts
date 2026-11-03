@@ -116,6 +116,53 @@ function ids(occurrences: readonly BodySectionOccurrence[]): string[] {
   return occurrences.map((occurrence) => occurrence.sectionOccurrenceId);
 }
 
+describe('section flow normalization', () => {
+  const flowMarker = (textDirection: string | null, sectionFlow?: string): BodyElement => ({
+    type: 'sectionBreak',
+    kind: 'nextPage',
+    columns: null,
+    textDirection,
+    pageNumType: null,
+    __sectionPlacement: {
+      sectionId: 'section:flow',
+      vAlign: null,
+      lineNumbering: null,
+      ...(sectionFlow === undefined ? {} : { sectionFlow }),
+    },
+  }) as unknown as BodyElement;
+
+  it('normalizes the section flow fact per section', () => {
+    const doc = document(
+      [paragraph('a'), flowMarker('btLr', 'bottomToTop'), paragraph('b')],
+      { textDirection: 'btLr' },
+    );
+    const { occurrences } = bodySectionIndexInput(doc);
+    expect(occurrences.map((occurrence) => occurrence.sectionFlow ?? null))
+      .toEqual(['bottomToTop', null]);
+    expect(occurrences.map((occurrence) => occurrence.textDirection)).toEqual(['btLr', 'btLr']);
+  });
+
+  it.each(['btLr', 'bottomToTop', 'sideways-lr'])
+    ('never derives the counter-clockwise frame from an authored %s token', (textDirection) => {
+      const doc = document(
+        [paragraph('a'), flowMarker(textDirection), paragraph('b')],
+        { textDirection },
+      );
+      for (const occurrence of bodySectionIndexInput(doc).occurrences) {
+        expect(occurrence.sectionFlow).toBeUndefined();
+      }
+    });
+
+  it.each([
+    ['tbRl', 'bottomToTop'],
+    [null, 'bottomToTop'],
+    ['btLr', 'topToBottom'],
+  ] as const)('rejects a wire whose direction is %s for section flow %s', (textDirection, flow) => {
+    const doc = document([paragraph('a'), flowMarker(textDirection, flow), paragraph('b')]);
+    expect(() => bodySectionIndexInput(doc)).toThrow(TypeError);
+  });
+});
+
 describe('pre-indexed body section ownership', () => {
   it('assigns each paragraph-owned marker to the section it terminates', () => {
     const doc = document([
@@ -355,6 +402,24 @@ describe('section geometry coordinate boundary', () => {
     });
 
     expect(physicalSectionGeometry(logicalSectionGeometry(physical))).toEqual(physical);
+  });
+
+  it('keeps the clockwise margin mapping and gives a native BtoT frame its own edges', () => {
+    const physical = geometry({ marginTop: 36, marginRight: 54, marginBottom: 72, marginLeft: 90 });
+    // Established Transitional vertical frame: logical left/top/right/bottom
+    // are the physical top/right/bottom/left margins.
+    expect(logicalSectionGeometry(physical)).toEqual(geometry({
+      pageWidth: 792, pageHeight: 612,
+      marginLeft: 36, marginTop: 54, marginRight: 72, marginBottom: 90,
+    }));
+    // Native BtoT: lines start at the physical bottom and later lines move
+    // right, so logical left/right/top/bottom are physical bottom/top/left/right.
+    const native = logicalSectionGeometry(physical, 'bottomToTop');
+    expect(native).toEqual(geometry({
+      pageWidth: 792, pageHeight: 612,
+      marginLeft: 72, marginRight: 36, marginTop: 90, marginBottom: 54,
+    }));
+    expect(physicalSectionGeometry(native, 'bottomToTop')).toEqual(physical);
   });
 
   it('projects only page-box facts and preserves signed-margin body distance', () => {

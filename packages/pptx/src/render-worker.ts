@@ -1,23 +1,29 @@
+import { loadFontDemandCollector } from './font-demand-collector.js';
 import type { CjkLang } from '@silurus/ooxml-core';
 import init, { PptxArchive, reinit } from './wasm/pptx_parser.js';
 import type { PptxTextRunInfo } from './renderer';
-import { PPTX_GOOGLE_FONTS } from './google-fonts';
+import { PPTX_GOOGLE_FONTS, pptxSlideOfficeFontRequests } from './google-fonts';
+import { acquireOfficeRoutes, distinctOfficeRouteLoads, type AcquiredOfficeRoutes } from './office-route-acquisition.js';
 import {
   findPreflightMimeType,
   PresentationPreflightBuilder,
   type PresentationPreflight,
 } from './presentation-preflight';
 import { PptxSlideRepository } from './slide-repository';
-import { loadPptxSlideFromCursor, readPptxSlideCursorUsage } from './slide-cursor-operation';
+import { loadPptxSlideFromCursor } from './slide-cursor-operation';
 import { SlidePullWorker } from './slide-pull-worker';
 import {
-  preloadGoogleFonts,
+  GoogleFontPreloadLease,
+  activeFontSet,
+  loadOfficeFontFallbacks,
+  unloadOfficeFontFallbacks,
+  unregisterEmbeddedFonts,
   decodeDataUrl,
   WasmParserHost,
   dropDecodedBitmapCache,
   dropSvgImageCache,
 } from '@silurus/ooxml-core';
-import type { OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
+import type { LoadedOfficeFontFallbacks, OoxmlResourceUsageSnapshot } from '@silurus/ooxml-core';
 import {
   decodeOoxmlResourceUsage,
   HARD_MAX_PPTX_CACHED_SLIDES,
@@ -40,29 +46,34 @@ import type {
   RenderWorkerResponse,
 } from './worker-protocol';
 import { findPptxElementBoundsByIds, hitTestPptxSlideContext } from './element-selection';
-import { excludeEmbeddedFontFamilies, loadEmbeddedFonts } from './embedded-fonts';
+import { excludeEmbeddedFontFamilies, loadEmbeddedFonts, uncoveredOfficeFontRequests } from './embedded-fonts';
 import { ProgressivePreflightGate } from './progressive-preflight-gate';
+import type { WorkerPresentationSourceOwner, WorkerCursorArchive } from './internal/worker-presentation-source';
 
 const host = new WasmParserHost<PptxArchive>(init, {
   freeArchive: (archive) => archive.free(),
   reinit,
 });
+let source: WorkerPresentationSourceOwner<PptxArchive> | undefined;
 
-const executeArchive = <T>(operation: (archive: PptxArchive) => T): T => {
+function executeArchive<T>(operation: (archive: WorkerCursorArchive) => T): T {
+  if (source) return source.execute(operation);
   const archive = host.archive;
   if (!archive) throw new Error('Presentation not loaded');
   return host.run(() => operation(archive));
-};
+}
 
 const slidePull = new SlidePullWorker(
-  () => host.archive,
+  () => source?.cursor() ?? host.archive,
   undefined,
   (operation) => executeArchive(operation),
 );
 
 let preflight: PresentationPreflight | null = null;
 let cjkFallback: CjkLang | undefined;
+let googleSubstitutes = false;
 let preflightBuilder: PresentationPreflightBuilder | null = null;
+let googleFonts: GoogleFontPreloadLease | null = null;
 let slides: PptxSlideRepository | null = null;
 let availableSlideCount = 0;
 const slideAvailabilityWaiters = new Set<() => void>();
@@ -72,8 +83,26 @@ let nextOperationId = 1;
 type PresentationLifecycleState = 'empty' | 'opening' | 'ready' | 'failed';
 let presentationState: PresentationLifecycleState = 'empty';
 let fontsLoaded: Promise<unknown> = Promise.resolve();
+const officeFontLoads = new Map<string, Promise<LoadedOfficeFontFallbacks>>();
+
+async function officeRoutesForRequests(
+  requests: readonly import('@silurus/ooxml-core').OfficeFontFallbackRequest[],
+): Promise<AcquiredOfficeRoutes> {
+  const uncovered = uncoveredOfficeFontRequests(requests, embeddedFontTuples);
+  const fontSet = activeFontSet();
+  return acquireOfficeRoutes(officeFontLoads, uncovered, (fresh) => loadOfficeFontFallbacks(fresh, fontSet), fontSet);
+}
+
+function releaseOfficeFonts(): void {
+  for (const pending of distinctOfficeRouteLoads(officeFontLoads)) {
+    void pending.then((loaded) => unloadOfficeFontFallbacks(loaded.faces), () => undefined);
+  }
+  officeFontLoads.clear();
+}
+let embeddedFontFaces: FontFace[] = [];
 let embeddedFontAliases: ReadonlyMap<string, string> = new Map();
 let embeddedFontAuthoredFamilies: ReadonlyMap<string, string> = new Map();
+let embeddedFontTuples: ReadonlySet<string> = new Set();
 let resourceUsage: OoxmlResourceUsageSnapshot | undefined;
 let renderers: LoadedWorkerRenderers = {};
 const rawParts = new BoundedRawPartCache({
@@ -131,7 +160,7 @@ function loadSlide(slideIndex: number) {
 function getMedia(path: string): Promise<Blob> {
   const mimeType = findPreflightMimeType(requirePreflight(), path);
   return rawParts.get(path, mimeType, () => slidePull.run(() => {
-    const bytes = executeArchive((archive) => archive.extract_media(path));
+    const bytes = source ? source.extractMedia(path) : host.run(() => host.archive!.extract_media(path));
     return new Blob([bytes as BlobPart], { type: mimeType });
   }));
 }
@@ -145,12 +174,17 @@ function getImage(path: string, mimeType: string): Promise<Blob> {
 
 function getFontBytes(path: string): Promise<Uint8Array> {
   return slidePull.run(() => {
-    const bytes = executeArchive((archive) => archive.extract_font(path));
+    const bytes = source ? source.extractFont(path) : host.run(() => host.archive!.extract_font(path));
     return new Uint8Array(bytes as Uint8Array);
   });
 }
 
 async function openPresentation(request: Extract<RenderWorkerRequest, { kind: 'parse' }>) {
+  releaseOfficeFonts();
+  unregisterEmbeddedFonts(embeddedFontFaces);
+  embeddedFontFaces = [];
+  googleFonts?.release();
+  googleFonts = null;
   progressivePreflightGate.reset();
   await slidePull.reset();
   slides?.clear();
@@ -167,41 +201,42 @@ async function openPresentation(request: Extract<RenderWorkerRequest, { kind: 'p
   fontsLoaded = Promise.resolve();
   embeddedFontAliases = new Map();
   embeddedFontAuthoredFamilies = new Map();
+  embeddedFontTuples = new Set();
   resourceUsage = undefined;
   renderers = await loadWorkerRenderers(request.renderers);
 
-  const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(request.resourcePolicy);
   const bootstrap = await slidePull.run(() => executeArchiveFromNew(
-    request.buffer,
-    maxEntry,
-    maxTotal,
-    maxEntries,
+    request,
   ));
-  // The retained archive exposes font reads as independent operations, so font
-  // decoding can overlap the sequential slide preflight without sharing cursor
-  // ownership. First paint still waits for `fontsLoaded` below.
-  const embeddedFontsLoaded = loadEmbeddedFonts(bootstrap.embeddedFonts, getFontBytes);
+  // Load-time resources belong to the parse failure channel. Complete embedded
+  // extraction before preflight/publication, including a zero-slide deck, so a
+  // rejected font read cannot outlive parse cleanup or publish a ready result.
+  const embedded = await loadEmbeddedFonts(bootstrap.embeddedFonts, getFontBytes);
+  embeddedFontFaces = embedded.faces;
+  embeddedFontAliases = embedded.aliases;
+  embeddedFontAuthoredFamilies = embedded.authoredFamilies;
+  embeddedFontTuples = embedded.tuples;
   cjkFallback = request.cjkFallback;
-  preflightBuilder = new PresentationPreflightBuilder(bootstrap, { cjkFallback });
+  googleSubstitutes = request.useGoogleFonts === true;
+  // Optional Google subset loading is library policy keyed to the slide model
+  // alone, as in main mode. Registering an optional renderer does not widen it:
+  // the text those renderers draw (math runs, charts) already yields 'all', and
+  // TIFF decoding draws no text.
+  preflightBuilder = new PresentationPreflightBuilder(bootstrap, { cjkFallback, collectFontDemand: await loadFontDemandCollector(request.useGoogleFonts === true) });
   slides = new PptxSlideRepository({
     slideCount: bootstrap.slideCount,
     maxCachedSlides: HARD_MAX_PPTX_CACHED_SLIDES,
     maxCachedStructuralBytes: HARD_MAX_PPTX_CACHED_SLIDE_PROJECTION_BYTES,
     loadSlide,
   });
+  if (request.useGoogleFonts) googleFonts = new GoogleFontPreloadLease(PPTX_GOOGLE_FONTS);
   if (request.progressiveLayout) {
-    const loadedGoogleFonts = new Set<string>();
     const ensureFonts = async (): Promise<void> => {
-      const embedded = await embeddedFontsLoaded;
-      embeddedFontAliases = embedded.aliases;
-      embeddedFontAuthoredFamilies = embedded.authoredFamilies;
       if (!request.useGoogleFonts) return;
-      const requested = excludeEmbeddedFontFamilies(
-        preflightBuilder!.currentFontPreloadNames,
-        embedded.aliases,
-      ).filter((name): name is string => !!name && !loadedGoogleFonts.has(name));
-      for (const name of requested) loadedGoogleFonts.add(name);
-      if (requested.length) await preloadGoogleFonts(requested, PPTX_GOOGLE_FONTS);
+      await googleFonts?.ensure(
+        excludeEmbeddedFontFamilies(preflightBuilder!.currentFontPreloadNames, embedded.aliases),
+        preflightBuilder!.currentFontPreloadDemandDelta,
+      );
     };
     for (let index = 0; index < bootstrap.slideCount; index += 1) {
       await slides.withSlide(index, () => undefined);
@@ -236,17 +271,16 @@ async function openPresentation(request: Extract<RenderWorkerRequest, { kind: 'p
     availableSlideCount = bootstrap.slideCount;
     wakeSlideAvailabilityWaiters();
     fontsLoaded = (async () => {
-      const embedded = await embeddedFontsLoaded;
-      embeddedFontAliases = embedded.aliases;
-      embeddedFontAuthoredFamilies = embedded.authoredFamilies;
       if (!request.useGoogleFonts) return embedded.faces;
-      const substitutes = await preloadGoogleFonts(
+      await googleFonts?.ensure(
         excludeEmbeddedFontFamilies(preflight.fontPreloadNames, embedded.aliases),
-        PPTX_GOOGLE_FONTS,
+        preflight.fontPreloadDemand,
       );
-      return [...embedded.faces, ...substitutes];
+      return embedded.faces;
     })();
   }
+  // Google subsets started by ordinary preflight must also settle before ready.
+  await fontsLoaded;
   return preflight;
 }
 
@@ -267,22 +301,27 @@ async function waitForSlideAvailability(slideIndex: number): Promise<void> {
 }
 
 function executeArchiveFromNew(
-  buffer: ArrayBuffer,
-  maxEntry: bigint | null | undefined,
-  maxTotal: bigint | null | undefined,
-  maxEntries: bigint | null | undefined,
-): PresentationBootstrap {
+  request: Extract<RenderWorkerRequest, { kind: 'parse' }>,
+): PresentationBootstrap | Promise<PresentationBootstrap> {
+  if (request.source) {
+    const descriptor = request.source;
+    return (async () => {
+      if (!request.sourceOwnerUrl) throw new TypeError('PPTX source owner URL is missing');
+      const { WorkerPresentationSourceOwner } = await import(/* @vite-ignore */ request.sourceOwnerUrl) as typeof import('./internal/worker-presentation-source.js');
+      source = new WorkerPresentationSourceOwner(host);
+      await source.openModelSource(new Uint8Array(request.buffer), descriptor, request.sourceTransfer);
+      return JSON.parse(new TextDecoder().decode(
+        source.execute((archive) => archive.presentation_bootstrap()),
+      )) as PresentationBootstrap;
+    })();
+  }
+  const [maxEntry, maxTotal, maxEntries] = resourcePolicyForWasm(request.resourcePolicy);
   return host.run(() => {
     const archive = new PptxArchive(
-      new Uint8Array(buffer),
-      maxEntry,
-      maxTotal,
-      maxEntries,
+      new Uint8Array(request.buffer), maxEntry, maxTotal, maxEntries,
     );
     host.setArchive(archive);
-    return JSON.parse(
-      new TextDecoder().decode(archive.presentation_bootstrap()),
-    ) as PresentationBootstrap;
+    return JSON.parse(new TextDecoder().decode(archive.presentation_bootstrap())) as PresentationBootstrap;
   });
 }
 
@@ -307,8 +346,7 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
       reservePresentationParse();
       ownsParseReservation = true;
     }
-    await host.ensureReady();
-
+    if (request.kind === 'parse' ? !request.source : !source) await host.ensureReady();
     if (request.kind === 'parse') {
       const compact = await openPresentation(request);
       post({
@@ -327,11 +365,16 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
     await slidePull.run(() => executeArchive((archive) => archive.assert_healthy()));
 
     if (request.kind === 'renderSlide') {
+      const officeRequests = await requireSlides().withSlide(request.slideIndex, (slide) =>
+        pptxSlideOfficeFontRequests(slide, compact.majorFont, compact.minorFont));
+      await fontsLoaded;
+      const { routes: officeFontRoutes, installed: officeInstalledFamilies } = await officeRoutesForRequests(officeRequests);
       const { bitmap, runs } = await requireSlides().withSlide(request.slideIndex, async (slide) => {
         await slidePull.run(() => executeArchive((archive) => archive.assert_healthy()));
-        await fontsLoaded;
         const { renderSlideWithEmbeddedFonts } = await rendererModule;
-        const canvas = new OffscreenCanvas(1, 1);
+        // A caller-transferred surface keeps the caller's inherited canvas
+        // language; a request without one keeps a local surface.
+        const canvas = request.canvas ?? new OffscreenCanvas(1, 1);
         const runs: PptxTextRunInfo[] = [];
         await renderSlideWithEmbeddedFonts(canvas, slide, compact.slideWidth, compact.slideHeight, {
           width: request.width,
@@ -344,6 +387,10 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
           hlinkColor: compact.hlinkColor,
           embeddedFontAliases,
           embeddedFontAuthoredFamilies,
+          embeddedFontTuples,
+          officeFontRoutes,
+          officeInstalledFamilies,
+          googleSubstitutes,
           fetchMedia: getMedia,
           fetchImage: getImage,
           svgDecoder: svgDecodeClient.decode,
@@ -362,11 +409,14 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
     }
 
     if (request.kind === 'collectRuns') {
+      const officeRequests = await requireSlides().withSlide(request.slideIndex, (slide) =>
+        pptxSlideOfficeFontRequests(slide, compact.majorFont, compact.minorFont));
+      await fontsLoaded;
+      const { routes: officeFontRoutes, installed: officeInstalledFamilies } = await officeRoutesForRequests(officeRequests);
       const runs = await requireSlides().withSlide(request.slideIndex, async (slide) => {
         await slidePull.run(() => executeArchive((archive) => archive.assert_healthy()));
-        await fontsLoaded;
         const { renderSlideWithEmbeddedFonts } = await rendererModule;
-        const canvas = new OffscreenCanvas(1, 1);
+        const canvas = request.canvas ?? new OffscreenCanvas(1, 1);
         const runs: PptxTextRunInfo[] = [];
         await renderSlideWithEmbeddedFonts(canvas, slide, compact.slideWidth, compact.slideHeight, {
           width: request.width,
@@ -377,6 +427,10 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
           hlinkColor: compact.hlinkColor,
           embeddedFontAliases,
           embeddedFontAuthoredFamilies,
+          embeddedFontTuples,
+          officeFontRoutes,
+          officeInstalledFamilies,
+          googleSubstitutes,
           fetchMedia: getMedia,
           fetchImage: getImage,
           svgDecoder: svgDecodeClient.decode,
@@ -419,29 +473,38 @@ self.onmessage = async (event: MessageEvent<RenderWorkerRequest | WorkerSvgDecod
       return;
     }
     if (request.kind === 'extractFont') {
-      const bytes = (await getFontBytes(request.path)).buffer as ArrayBuffer;
+      const font = await getFontBytes(request.path);
+      const bytes = source
+        ? source.copyBytes(font)
+        : font.buffer as ArrayBuffer;
       post({ kind: 'fontExtracted', id: request.id, bytes }, [bytes]);
       return;
     }
     if (request.kind === 'resourceUsage') {
-      const usage = decodeOoxmlResourceUsage(executeArchive(
-        (archive) => archive.resource_usage(),
-      ));
+      const bytes = source ? source.resourceUsage() : host.run(() => host.archive?.resource_usage());
+      const usage = bytes === undefined ? undefined : decodeOoxmlResourceUsage(bytes);
       post({ kind: 'resourceUsage', id: request.id, usage });
       return;
     }
 
     if (request.kind === 'toMarkdown') {
-      const markdown = await slidePull.run(() =>
-        executeArchive((archive) => archive.to_markdown()));
+      const markdown = await slidePull.run(() => source ? source.toMarkdown() : host.run(() => host.archive!.to_markdown()));
       post({ kind: 'markdownRendered', id: request.id, markdown });
     }
   } catch (error) {
     if (ownsParseReservation) {
       presentationState = 'failed';
       wakeSlideAvailabilityWaiters();
+      try { source?.closeModelSource(); } catch {}
     }
-    if (request.kind === 'parse') {
+    if (ownsParseReservation) {
+      releaseOfficeFonts();
+      unregisterEmbeddedFonts(embeddedFontFaces);
+      embeddedFontFaces = [];
+      googleFonts?.release();
+      googleFonts = null;
+      rawParts.clear();
+      try { host.run(() => host.disposeArchive()); } catch {}
       progressivePreflightGate.reset();
       slides?.clear();
       slides = null;

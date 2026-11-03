@@ -141,19 +141,21 @@ describe('DrawingML gradient geometry', () => {
     });
   });
 
-  it('uses the authored path focus and tile rectangles', () => {
+  it('uses the authored circle focus and tile rectangles', () => {
     const { ctx, calls } = gradientContext();
     resolveFill({
       fillType: 'gradient',
       stops: [{ position: 0, color: '000000' }, { position: 1, color: 'FFFFFF' }],
       angle: 0,
       gradType: 'radial',
-      path: 'rect',
+      path: 'circle',
       tileRect: { l: 0.5 },
       fillToRect: { l: 0.25, r: 0.25, t: 0.5, b: 0.5 },
     }, ctx, 0, 0, 200, 100);
 
-    expect(calls[0]).toEqual({ kind: 'radial', args: [150, 50, 0, 150, 50, 50] });
+    expect(calls[0].kind).toBe('radial');
+    expect(calls[0].args.slice(0, 5)).toEqual([150, 50, 0, 150, 50]);
+    expect(calls[0].args[5]).toBeCloseTo(Math.hypot(50, 50));
   });
 
   it('counter-rotates a non-shape-rotating gradient', () => {
@@ -169,6 +171,15 @@ describe('DrawingML gradient geometry', () => {
     [0, 50, 100, 50].forEach((value, index) => {
       expect(calls[0].args[index]).toBeCloseTo(value);
     });
+  });
+
+  it('counter-rotates a radial focus about the fill box centre', () => {
+    const { ctx, calls } = gradientContext();
+    resolveFill({ fillType: 'gradient', stops: [{ position: 0, color: '000000' }, { position: 1, color: 'FFFFFF' }],
+      angle: 0, gradType: 'radial', path: 'circle', rotWithShape: false,
+      fillToRect: { l: 0.75, r: 0.25, t: 0.5, b: 0.5 },
+    }, ctx, 0, 0, 200, 100, 90);
+    [100, 0, 0, 100, 0].forEach((value, index) => expect(calls[0].args[index]).toBeCloseTo(value));
   });
 
   it('does not allocate a repeating pattern for an all-zero tileRect', () => {
@@ -241,6 +252,18 @@ describe('DrawingML gradient geometry', () => {
       expect(result).not.toBeNull();
       expect(allocations).toEqual([{ width: 100, height: 100 }, { width: 200, height: 100 }]);
       expect(matrix).toMatchObject({ a: 1, d: 1, e: 100, f: 0 });
+      const fixed = resolveFill({
+        fillType: 'gradient', gradType: 'radial', path: 'circle', angle: 0,
+        stops: [{ position: 0, color: '000000' }, { position: 1, color: 'FFFFFF' }],
+        tileRect: { l: 0.5 }, flip: 'x', rotWithShape: false,
+      }, ctx, 0, 0, 200, 100, 90);
+      expect(fixed).not.toBeNull();
+      expect(matrix?.a).toBeCloseTo(0);
+      expect(matrix?.b).toBeCloseTo(-1);
+      expect(matrix?.c).toBeCloseTo(1);
+      expect(matrix?.d).toBeCloseTo(0);
+      expect(matrix?.e).toBeCloseTo(50);
+      expect(matrix?.f).toBeCloseTo(50);
     } finally {
       Object.defineProperty(globalThis, 'OffscreenCanvas', {
         configurable: true,

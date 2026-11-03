@@ -1,6 +1,6 @@
 > [!NOTE]
-> This fork maintains `@jiyu/ooxml` on `jiyu/0.88.x`, with versions such as
-> `0.88.0-jiyu.2`. It publishes to the private registry in `publishConfig`;
+> This fork maintains `@jiyu/ooxml` on `jiyu/0.89.x`, with versions such as
+> `0.89.7-jiyu.1`. It publishes to the private registry in `publishConfig`;
 > the upstream public-npm publishing workflow is disabled in this fork.
 > For a release, use Node 24 and the pinned pnpm version, run
 > `pnpm install --frozen-lockfile`, `pnpm build:wasm`, `pnpm typecheck`,
@@ -8,7 +8,7 @@
 > resulting `npm pack` tarball in a consumer, then publish that same tarball
 > with `npm publish <tarball> --tag jiyu`. Keep registry credentials in local
 > npm configuration. Existing consumers can retain their import paths with
-> the dependency alias `"@silurus/ooxml": "npm:@jiyu/ooxml@0.88.0-jiyu.2"`.
+> the dependency alias `"@silurus/ooxml": "npm:@jiyu/ooxml@0.89.7-jiyu.1"`.
 
 > [!NOTE]
 > **This entire codebase — Rust parsers, TypeScript renderers, tests, and tooling — is implemented by AI coding agents, primarily [Claude](https://claude.ai) and [Codex](https://openai.com/codex/)**, through iterative prompting. No human-written application code exists in this repository.
@@ -44,6 +44,8 @@ So I'm building this library with AI coding agents, spec-first, and keeping it f
 A browser-based viewer for Office Open XML documents that renders to an HTML Canvas element.
 The parsers are written in Rust and compiled to WebAssembly; the renderers use the Canvas 2D API.
 Each format also exposes a headless engine (`DocxDocument` / `XlsxWorkbook` / `PptxPresentation`) that renders into any caller-supplied canvas, so you can compose your own UI — scroll views, thumbnail grids, master-detail panes — instead of being locked into the built-in viewer. See the [live framework examples](https://ooxml.silurus.dev/frameworks/) for runnable React, Vue, Svelte, and Solid projects.
+
+Optional, experimental [legacy Office add-on](https://ooxml.silurus.dev/legacy-office/) reads a supported subset of `.doc`, `.xls` and `.ppt` with the same viewers.
 
 ## Project scope: read-only viewing
 
@@ -186,14 +188,18 @@ await sheet.load('/report.dat', { format: 'delimited-text', delimiter: '|' });
 
 OMML equations (`m:oMath` / `m:oMathPara`) in `.docx`, `.pptx` and `.xlsx` are rendered with
 [MathJax](https://www.mathjax.org/) + [STIX Two Math](https://github.com/stipub/stixfonts).
-That engine is ~3 MB, so it is **opt-in**: import the `math` engine from the separate
+That engine is ~4 MB, so it is **opt-in**: import the `math` engine from the separate
 `@silurus/ooxml/math` entry and pass it to the viewer. Pass it and equations render;
 omit it and the engine asset is not fetched or evaluated (equations are simply skipped;
-the on-demand render-worker asset retains a small loader). When you *do* pass it, the ~3 MB engine ships
+the on-demand render-worker asset retains a small loader). When you *do* pass it, the ~4 MB engine ships
 as a **standalone asset file** next to the bundle rather than an inline data URL, and is
 fetched **on demand — only the first time a document actually contains an equation**, so
 equation-free documents never pay for it. It is fully self-contained: served from your own
 origin, no cross-origin requests.
+
+Accented Latin letters use STIX Two Math paths in normal, italic, bold and bold-italic
+equations. Less common Cyrillic, phonetic and dingbat characters use a system-font
+fallback, so their appearance can vary by platform.
 
 ```typescript
 import { DocxViewer } from '@silurus/ooxml/docx';
@@ -211,6 +217,50 @@ constructor or the `.load()` options — and every render reuses it; it is never
 per-render argument. (Excel stores "Insert > Equation" as OMML inside the shared
 DrawingML `<xdr:txBody>` grammar, so `XlsxViewer` renders equations embedded in
 shapes / text boxes the same way.)
+
+### Experimental legacy DOC, XLS, and PPT sources
+
+Legacy binary Office files can be read directly into the ordinary document,
+workbook and presentation models through the experimental
+`@silurus/ooxml-legacy-office` add-on. Its readers are separate opt-in entries,
+one per format, passed in like the other opt-in modules (`{ legacyDoc }`,
+`{ legacyXls }` or `{ legacyPpt }`). Install matching versions of both packages:
+
+```sh
+npm i @silurus/ooxml @silurus/ooxml-legacy-office
+```
+
+Each entry exports a reader for the matching loader or viewer:
+
+```typescript
+import { DocxViewer } from '@silurus/ooxml/docx';
+import { legacyDoc } from '@silurus/ooxml-legacy-office/doc';
+
+const canvas = document.querySelector('canvas') as HTMLCanvasElement;
+const viewer = new DocxViewer(canvas, { legacyDoc });
+await viewer.load(docOrDocxBytes);
+```
+
+`legacyXls` (`@silurus/ooxml-legacy-office/xls`) and `legacyPpt`
+(`@silurus/ooxml-legacy-office/ppt`) work the same way for XLSX and PPTX; for
+custom asset URLs create the reader with `createLegacyDoc({ wasmUrl, moduleUrl })`
+(likewise `createLegacyXls` and `createLegacyPpt`). A reader
+claims only its own binary family; every other input takes the unchanged OOXML
+path, and without a source a legacy file still rejects with the typed
+`legacy-binary-format` error. Importing a reader fetches nothing: its
+self-contained source module and WASM load in the parser worker (or in Node)
+only when a claimed file is opened, and no OOXML package is generated. The
+readers are narrow and experimental and reject unsupported content rather than
+showing a partial document. They do not execute macros, fields, formulas, actions
+or embedded objects. Claimed content outside the supported subset rejects with
+`OoxmlError.code === 'unsupported-content'` (`details.format` names the source
+format); offer conversion for that code. Resource limits, encryption and parser
+crashes stay distinct from it; some native reader budgets surface as untyped
+errors (see [Experimental legacy Office sources](docs/legacy-office-conversion.md)).
+The package versions must match exactly; upgrade both together.
+No migration is required without the add-on. See the [legacy Office guide](https://ooxml.silurus.dev/legacy-office/)
+for viewer and Node examples, and [Experimental legacy Office sources](docs/legacy-office-conversion.md)
+for the full support boundaries.
 
 ### Optional rendering modules
 
@@ -257,10 +307,11 @@ chart behavior is documented in
 [Chart compatibility evidence and scope](docs/chart-compatibility-evidence.md).
 
 The bounded TIFF 6.0 codec decodes the first IFD/page of stripped, top-left
-images in the uncompressed bilevel, 8-bit grayscale, RGB, RGBA and process-CMYK
-classes, plus 1-bit CCITT Group 4. Unsupported or malformed first-page classes
-fail with a diagnostic render error. It is not a general-purpose TIFF library,
-but as a small
+images in the bilevel, 8-bit grayscale, RGB, RGBA and process-CMYK classes,
+uncompressed or LZW-compressed (8-bit classes optionally with the horizontal
+differencing predictor), plus 1-bit CCITT Group 4. Unsupported or malformed
+first-page classes fail with a diagnostic render error. It is not a
+general-purpose TIFF library, but as a small
 by-product the same `tiff.render()` method can provide a simple preview of a
 supported standalone TIFF file. Its optional `TiffRenderOptions` argument can
 request a bounded display-sized bitmap; the Office viewers supply those targets
@@ -714,7 +765,7 @@ owns the layout, paint and type primitives shared by DOCX, XLSX and PPTX.
 | `packages/docx/parser/src/lib.rs` | Rust WASM parser — DOCX ZIP → `Document` JSON |
 | `packages/xlsx/parser/src/lib.rs` | Rust WASM parser — XLSX ZIP → `Workbook` JSON |
 | `packages/pptx/parser/src/lib.rs` | Rust WASM parser — PPTX ZIP → `Presentation` JSON |
-| `packages/docx/src/renderer.ts` | DOCX Canvas 2D rendering and text layout |
+| `packages/docx/src/renderer.ts` | DOCX Canvas 2D paint from retained page geometry |
 | `packages/xlsx/src/renderer.ts` | XLSX Canvas 2D viewport rendering |
 | `packages/pptx/src/renderer.ts` | PPTX Canvas 2D rendering |
 | `packages/*/src/worker.ts` | Main-mode parser Worker entry |
@@ -780,14 +831,15 @@ file without uploading it.
 | | ChartEx (waterfall / histogram / Pareto / funnel / box &amp; whisker / treemap / sunburst) | ✅ opt-in |
 | | Math equations (OMML `m:oMath` / `m:oMathPara`, rendered via MathJax — opt-in `@silurus/ooxml/math`) | ✅ |
 | | Images (inline and anchored, with text wrap and adaptive display-sized decoding for oversized rasters) | ✅ |
-| | TIFF images (opt-in `@silurus/ooxml/tiff`; bounded bilevel, grayscale, RGB(A), process-CMYK and CCITT Group 4) | ✅ |
+| | TIFF images (opt-in `@silurus/ooxml/tiff`; bounded bilevel, grayscale, RGB(A) and process-CMYK, uncompressed or LZW, plus CCITT Group 4) | ✅ |
 | | SVG images (`asvg:svgBlip` MS-2016 extension — vector drawn from the embedded `.svg`, raster fallback) | ✅ |
 | | Text boxes / drawing shapes (inline and anchored `wps:wsp` / `wps:txbx`, including solid, gradient, and image fills; `a:prstGeom` — 186 preset geometries via the shared engine; connector arrow heads `headEnd` / `tailEnd` (§20.1.8.3) and `prstDash` dash patterns (§20.1.8.48)). Text-box paragraphs run through the **same line-layout engine as body text**, so kinsoku 行頭/行末禁則 (§17.15.1.58–60), UAX#9 bidi (`w:bidi`, §17.3.1.6), justification (§17.18.44) and tab stops (§17.3.1.37) all apply inside a box | ✅ |
 | | WMF **and EMF** metafile images (legacy vector, incl. inside text boxes) — rasterized via a built-in player: window→viewport mapping (MS-EMF map modes, world transform), pens/brushes, poly/rect/ellipse, text-out, path clipping, and embedded DIB blits | ✅ |
+| | Paragraph text frames (`w:framePr`) — inherited positioning and spacing, with surrounding text wrap | ✅ |
 | | Legacy VML content — positioned shapes, text boxes, image previews, and authored text wrapping | ✅ |
 | | OLE embedded objects (`w:object` — the baked VML `v:imagedata` preview is drawn; the embedded app is not run) | ✅ |
-| **Advanced** | Footnotes — reference markers + bottom-of-page bodies with separator rule, numbered (`w:footnoteReference` / `w:footnoteRef`, §17.11) | ✅ |
-| | Endnotes — reference markers + bodies at document end (`w:endnoteReference`, §17.11) | ✅ |
+| **Advanced** | Footnotes — numbered markers, authored separators and paragraph continuation across pages; column placement follows document compatibility settings (`w:footnoteReference` / `w:footnoteRef`, §17.11) | ✅ |
+| | Endnotes — reference markers + document-end bodies, including paragraph continuation across pages (`w:endnoteReference`, §17.11) | ✅ |
 | | Page-number formats (`w:pgNumType` restart / format §17.6.12; PAGE `\*` switches — decimal / roman / letter / hex / ordinal-dash / hebrew2 / koreanLegal, §17.18.59) | ✅ |
 | | Field date/time pictures (`TIME` / `DATE` field `\@` format, §17.16.5.72 / .16) | ✅ |
 | | `w:snapToGrid` opt-out of the document grid (§17.3.1.32) | ✅ |
@@ -812,7 +864,7 @@ file without uploading it.
 | **Workbook** | Multiple sheets, sheet names | ✅ |
 | | Sheet tab colors (`<sheetPr><tabColor>` — theme / tint / indexed / rgb) | ✅ |
 | **Cells** | Text, number, boolean, error values | ✅ |
-| | Formula results (from cached `<v>`) | ✅ |
+| | Formula results (cached `<v>` only; formulas, including `TODAY()` / `NOW()`, are never recalculated) | ✅ |
 | | Dates (ECMA-376 date format codes) | ✅ |
 | | Rich text (per-run formatting) | ✅ |
 | | East-Asian furigana (`<rPh>` §18.4.6 + `<phoneticPr>` §18.4.3 — drawn when a cell opts in via `ph="1"`; row-level `<row ph>` inheritance) | ✅ |
@@ -834,7 +886,7 @@ file without uploading it.
 | | Hidden rows / columns | ✅ |
 | | Row / column outline grouping (`outlineLevel` / `collapsed` §18.3.1.73 / .13, `<outlinePr>` — gutter brackets, +/− collapse, numbered level buttons; view-only) | ✅ |
 | **Elements** | Images (`<xdr:twoCellAnchor>`, with adaptive display-sized decoding for oversized rasters) | ✅ |
-| | TIFF images (opt-in `@silurus/ooxml/tiff`; bounded bilevel, grayscale, RGB(A), process-CMYK and CCITT Group 4) | ✅ |
+| | TIFF images (opt-in `@silurus/ooxml/tiff`; bounded bilevel, grayscale, RGB(A) and process-CMYK, uncompressed or LZW, plus CCITT Group 4) | ✅ |
 | | OLE embedded objects (`<oleObjects>` — the legacy VML `v:imagedata` preview keyed by `oleObject@shapeId` is drawn; an image-typed `objectPr` target is preferred when present, and the embedded app is not run) | ✅ |
 | | SVG images (`asvg:svgBlip` MS-2016 extension — vector drawn from the embedded `.svg`, raster fallback) | ✅ |
 | | Drawing shapes / text boxes (`xdr:sp`, `xdr:txBody` — 186 preset geometries via the shared engine, with `avLst` adjust handles) | ✅ |
@@ -847,6 +899,7 @@ file without uploading it.
 | | Chart manual layout (`<c:title><c:layout>` and `<c:plotArea><c:layout>`) | ✅ |
 | | Sparklines (`x14:sparklineGroup` — line / column / win-loss, with markers and high/low/first/last/negative highlights) | ✅ |
 | **Advanced** | Conditional formatting (`cellIs`, `colorScale`, `dataBar`, `iconSet`, `top10`, `aboveAverage`) | ✅ |
+| | Conditional-formatting formulas (`expression`, text / blanks / errors rules — partial evaluator over cached values; complete evaluation tracked in [#1547](https://github.com/yukiyokotani/office-open-xml-viewer/issues/1547)). A rule the evaluator cannot evaluate neither formats nor stops lower rules | ⚠️ Partial |
 | | Slicers (static, Office 2010 extension) | ✅ |
 | | Pivot tables (saved worksheet output renders unchanged; read-only metadata is exposed. Refresh, recalculation, filtering, restructuring, and interactivity are unsupported) | ⚠️ Partial |
 | | Cell comments / notes (classic `xl/commentsN.xml` + Office-365 threaded comments — red triangle indicator + author / text via the worksheet model; pointer or keyboard users can open the popup, with a polite screen-reader status) | ✅ |
@@ -882,7 +935,7 @@ file without uploading it.
 | | Animations / transitions | ❌ Not planned |
 | **Element types** | Shapes (`sp`) | ✅ |
 | | Pictures (`pic`, with adaptive display-sized decoding for oversized rasters) | ✅ |
-| | TIFF images (opt-in `@silurus/ooxml/tiff`; bounded bilevel, grayscale, RGB(A), process-CMYK and CCITT Group 4) | ✅ |
+| | TIFF images (opt-in `@silurus/ooxml/tiff`; bounded bilevel, grayscale, RGB(A) and process-CMYK, uncompressed or LZW, plus CCITT Group 4) | ✅ |
 | | SVG images (`asvg:svgBlip` MS-2016 extension — vector drawn from the embedded `.svg`, PNG fallback) | ✅ |
 | | Groups (`grpSp`) with nested transforms | ✅ |
 | | Connectors (`cxnSp`) | ✅ |
@@ -950,8 +1003,9 @@ file without uploading it.
 | | Word wrap / no wrap | ✅ |
 | | Japanese kinsoku line breaking (`a:pPr@eaLnBrk`, §21.1.2.2.7 — 行頭/行末禁則, shared core engine) | ✅ |
 | | Multi-column text body (`numCol` / `spcCol` — balanced flow) | ✅ |
-| | Theme object-default inheritance (`<a:objectDefaults><a:txDef\|spDef>` bodyPr fallback) | ✅ |
+| | Theme object defaults (`<a:objectDefaults>`) treated as new-object templates only, as PowerPoint does | ✅ |
 | **Tables** | Cells, rows, columns | ✅ |
+| | Table background (`a:tblBg`, beneath cell fills; optional `TableElement.background: Fill` in parsed models) | ✅ |
 | | Cell merges (horizontal / vertical) | ✅ |
 | | Cell borders | ✅ |
 | | Cell fills (solid / gradient) | ✅ |
@@ -980,7 +1034,7 @@ file without uploading it.
 - **[`packages/markdown/`](packages/markdown/)** — internal workspace adapter and `ooxml-md` development CLI for the same GitHub-flavoured Markdown projection exposed by each format model's `toMarkdown()` method.
 - **[`packages/node/`](packages/node/)** — the implementation behind the public Node-only `@silurus/ooxml/node` subpath. Its canonical APIs are the explicitly owned, bounded `openPptxPresentation`, `openDocxDocument`, and `openXlsxWorkbook` sessions. Async `materializePptxPresentation`, `materializeDocxDocument`, `materializeXlsxWorkbookIndex`, `materializeXlsxWorksheet`, and `materializeXlsxWorkbook` are provided when a complete caller-owned graph is actually needed. Each `open*` call returns an explicit, idempotent `close()`-able session; PPTX streams `slides()`, DOCX completes format-required sequential pagination before streaming `pages()`, and XLSX parses its workbook index once before sequential `worksheetRows(sheetIndex)` streams reuse the retained archive. Useful for CI checks and headless rendering pipelines; canvas rendering accepts a user-supplied backend such as `skia-canvas` without making it a runtime dependency.
   See the [0.75 to 0.76 migration guide](docs/migration-0.76.md) for every removed synchronous helper and its replacement.
-- **[`packages/vscode-extension/`](packages/vscode-extension/)** — VS Code extension (`ooxml-viewer`) that registers `CustomEditorProvider`s for `.docx`, `.xlsx`, and `.pptx`, and (opt-in) auto-installs and registers the `ooxml-mcp-server` for GitHub Copilot Chat in Agent mode, including active Viewer selection. Claude Code and Codex can configure the same binary separately for path-based file tools, but do not receive the active selection bridge. The preview is offline by default; an opt-in `ooxmlViewer.useGoogleFonts` setting (off, and force-disabled in untrusted workspaces) surfaces the library's metric-compatible font substitution, widening the webview CSP to the Google Fonts CDN only while enabled.
+- **[`packages/vscode-extension/`](packages/vscode-extension/)** — VS Code extension (`ooxml-viewer`) that registers `CustomEditorProvider`s for `.docx`, `.xlsx`, and `.pptx`, and (opt-in) auto-installs and registers the `ooxml-mcp-server` for GitHub Copilot Chat in Agent mode, including active Viewer selection. Claude Code and Codex can configure the same binary separately for path-based file tools, but do not receive the active selection bridge. The preview is offline by default; an opt-in `ooxmlViewer.useGoogleFonts` setting (off, and force-disabled in untrusted workspaces) loads optional webfont substitutes and script fallbacks, widening the webview CSP to the Google Fonts CDN only while enabled.
 - **[`packages/mcp-server/`](packages/mcp-server/)** — Rust MCP server (`ooxml-mcp-server`) exposing the parsers as tools for AI agents (Claude, Copilot, Codex, etc.). Provides structured queries (`docx_get_structure`, `xlsx_get_cell_range`, `pptx_get_slide_structure`, …) so agents can inspect OOXML files without shelling out to `unzip`. Prebuilt binaries are attached to each [GitHub Release](https://github.com/yukiyokotani/office-open-xml-viewer/releases) for macOS / Linux / Windows; the VS Code extension downloads them on demand.
 
 ---
@@ -1000,10 +1054,12 @@ pnpm storybook
 # Type-check all packages
 pnpm typecheck
 
-# Run visual regression tests (local only — not run in CI)
+# Visual regression tests (local only — not run in CI). `pnpm vrt` compares
+# against a baseline checkout captured with `pnpm vrt:snapshot`; see AGENTS.md
+# for the required VRT_BASELINE_REVISION / VRT_BASELINE_CHECKOUT variables.
 pnpm vrt
-# Adopt the current rendering as the new reference baseline
-UPDATE_REFS=1 pnpm vrt
+# Fidelity ratchet against the committed demo references
+pnpm vrt:fidelity
 
 # Build the library
 pnpm build
@@ -1012,9 +1068,9 @@ pnpm build
 ### WASM build (individual packages)
 
 ```bash
-cd packages/docx/parser && wasm-pack build --target web && cp pkg/docx_parser_bg.wasm  pkg/docx_parser.js  ../src/wasm/
-cd packages/xlsx/parser && wasm-pack build --target web && cp pkg/xlsx_parser_bg.wasm  pkg/xlsx_parser.js  ../src/wasm/
-cd packages/pptx/parser && wasm-pack build --target web && cp pkg/pptx_parser_bg.wasm pkg/pptx_parser.js ../src/wasm/
+pnpm --filter @silurus/ooxml-docx wasm
+pnpm --filter @silurus/ooxml-xlsx wasm
+pnpm --filter @silurus/ooxml-pptx wasm
 ```
 
 ## Error handling
@@ -1025,6 +1081,27 @@ Promise. This includes `viewer.load()` parsing and its initial render, whether
 or not the Viewer has an `onError(error)` callback. A failure is never delivered
 through both channels.
 
+All three formats use a module Web Worker for parsing, including the default
+`mode: 'main'`; the mode selects where rendering runs, not whether parsing uses
+a Worker. The supported browser setup requires a page with a normal,
+non-opaque origin where Worker loading is permitted. An iframe with
+`sandbox="allow-scripts"` but no `allow-same-origin` has an opaque origin. Worker
+loading may fail there depending on the browser and Worker script, so this
+embedding setup is not supported even if it happens to work in one browser.
+There is no classic-Worker or no-Worker fallback for this configuration.
+
+For a regular iframe, omit `sandbox`. To retain sandbox restrictions, serve
+the viewer page from a dedicated origin distinct from the parent and use, for
+example,
+`<iframe sandbox="allow-scripts allow-same-origin" src="https://viewer.example.net/viewer.html"></iframe>`.
+Here `allow-same-origin` retains the **iframe page's** origin; it does not give
+the iframe the parent's origin. This separate-origin setup requires a `src`
+URL; `srcdoc` inherits the parent's origin when origin sandboxing is disabled.
+If module scripts or other resources are fetched across origins, configure
+CORS as required; the page's CSP must also allow its module Worker and required
+assets. The Worker error message includes an opaque-origin hint when the
+browser gives no detail, but it cannot identify every Worker failure.
+
 Use `onError` for later Viewer-managed work that has no directly awaitable
 result, such as virtualized scroll-view rendering or embedded-media playback.
 Those failures are logged with `console.error` when the callback is omitted.
@@ -1034,9 +1111,13 @@ decode or playback failures after the presentation handle has been returned.
 
 Stable failures can be narrowed without parsing message strings:
 
-- `OoxmlError` — container failures. Its `code` is `encrypted`,
-  `invalid-password`, `unsupported-encryption`, `legacy-binary-format`, or
-  `not-ooxml`.
+- `OoxmlError` — typed input and source failures. Its `code` is `encrypted`,
+  `invalid-password`, `unsupported-encryption`, `legacy-binary-format`,
+  `not-ooxml`, `unsupported-image-effect` (a picture-effect chain that is
+  malformed or cannot be drawn), `invalid-numbering` (DOCX numbering that Word
+  cannot open), or `unsupported-content`. For `unsupported-content`, offer conversion: the configured
+  source cannot represent this input. Frozen `details` contain only its
+  `format` identifier and `reason: 'source-subset'`.
 - `OoxmlResourceLimitError` (`code === 'ooxml-resource-limit'`) — a measured
   package or format resource crossed a configurable limit or hard ceiling.
   `details.violation` contains the resource, metric, limit, observed value, and
@@ -1109,7 +1190,6 @@ try {
   `maxArchiveEntryBytes` applies to every XML, text, image, media, and other package part that the parser reads. `maxTotalInflatedBytes` counts the largest amount actually read from each distinct part during the lifetime of the loaded package; reading the same part again does not consume that budget twice. `maxArchiveEntries` bounds central-directory entries before the ZIP library allocates its owned index. Set an individual field to `null` to disable that configurable budget. Internal hard safety ceilings still apply, so disabling a budget does not make arbitrary archives acceptable. Values other than `null` must be positive safe integers; byte fields are expressed in bytes and the entry field is a count.
 
   A violation rejects with `OoxmlResourceLimitError` (`code === 'ooxml-resource-limit'`). Its structured `details.violation` reports the resource, metric, limit, observed value, usage snapshot, and part name when a particular part caused the failure. The deprecated `maxZipEntryBytes` option remains as a compatibility alias for `resourceLimits.maxArchiveEntryBytes`, but is scheduled for removal in a future breaking release; new code should use `resourceLimits`.
-
   Applications can collect the same data as a machine-readable `OoxmlResourceMetrics` report without enabling console output. This is useful for choosing limits from representative files in the application's own domain:
   ```ts
   new DocxViewer(canvas, {
@@ -1151,6 +1231,22 @@ try {
   The package counters and raster-image guards are deterministic admission limits, not exact JavaScript/WASM process-memory accounting. XML trees, document models, canvas backing stores, browser decoder overhead, renderer state, and browser-managed SVG/vector parse or decoded storage can still require several times the measured input. SVG has no portable decoded-byte measure or explicit browser release primitive; the library count-bounds its cache and revokes owned object URLs, but cannot charge it as RGBA bytes. The defaults therefore reduce risk but cannot promise that an OOM is impossible on every device. Running parse and render work in `mode: 'worker'` can contain many failures away from the main UI thread, but a Worker is not a separate operating-system process or a strict memory sandbox.
 
   A measured limit crossing is reported as `OoxmlResourceLimitError`. A residual WASM failure that reaches a recognized trap-shaped boundary is reported conservatively as `parser-crashed`, not `parser-oom`: with the current aborting Rust/WASM boundary, panic, allocation failure, explicit `unreachable`, and stack overflow can lose their distinct causes and converge on the same generic runtime error. Inferring OOM from an exception class or message would misclassify some parser defects as large-file failures. Reliable OOM classification would require preserving a structured cause before the trap across every relevant allocation path; it cannot be recovered from the generic trap afterward. The WebAssembly JavaScript embedding also permits implementation-defined stack/OOM failures, including an indistinguishable plain `Error` or process termination, so converting and poisoning every engine-level failure cannot be guaranteed.
+- **Bounded XLSX worksheets.** Each XLSX worksheet model is checked against logical budgets. The defaults are 100,000 rows, 250,000 cell records, 32 MiB of owned UTF-8 string content, and 64 MiB of structural JSON. Override them with `xlsxWorksheetLimits` on `XlsxViewer`, `XlsxSheetViewer`, or `XlsxWorkbook.load(...)`:
+  ```ts
+  new XlsxViewer(container, {
+    xlsxWorksheetLimits: { maxRows: 110000, maxCells: 300000 },
+  });
+  ```
+  An omitted or `undefined` option, an empty object, and any omitted field use the defaults. Supplied fields (`maxRows`, `maxCells`, `maxOwnedUtf8Bytes`, `maxJsonBytes`) must be positive safe integers no greater than `Number.MAX_SAFE_INTEGER - 1`. `null` is invalid. The option is validated before any load effects and is snapshotted for each load. DOCX and PPTX ignore it.
+
+  Row and cell budgets count retained records. They do not count grid coordinates or unique indexes. `maxOwnedUtf8Bytes` counts every string owned by `Cell.value`, including typed-value discriminators and rich-text and phonetic strings, plus formula text. Shared strings are charged per cell after resolution.
+
+  `maxJsonBytes` covers the worksheet model and its covered ancillary data. Browser and Node builds measure the UTF-8 length of `JSON.stringify` over the assembled structure. The native Rust path measures its complete `serde_json` UTF-8 output, which is a separately documented boundary.
+
+  For each dimension, the aggregate derived worksheet cache uses the larger of its default and the worksheet limit. The cache defaults are 200,000 rows, 500,000 cells, 64 MiB owned, and 128 MiB JSON. Each renderer coordinate index independently allows `max(250000, maxCells)` entries, charged per unique key. Delimited-text parsing counts every parsed field, including blanks, against `maxCells`; its fixed 64 MiB input limit is separate. The non-retaining Node `worksheetRows` path keeps streaming semantics, so cumulative budgets apply only to models it materializes.
+
+  ZIP, input, wire, representation, and copy limits remain independent. Raising these budgets does not promise that a whole 251,000-cell selection can be copied to the clipboard. The budgets are logical counters, not physical memory measurements. Increasing them accepts additional out-of-memory risk; the library does not guarantee that an allocation failure can be caught. With unchanged defaults no migration is needed. The one exception: errors from these adjustable guards now report `configurable: true`, whether the default or an override applied. Hard-ceiling errors remain `configurable: false`.
+
 - **No network by default.** The library does not send telemetry or analytics, and does not contact third-party services unless you ask it to. In particular, theme webfonts, Office font metric substitutes (Carlito/Caladea), and the script fallback fonts are **not** loaded from Google Fonts unless you pass `useGoogleFonts: true` to the relevant `Viewer` / `load(...)` options — supported uniformly by `DocxViewer`, `PptxViewer`, `XlsxViewer`, and `XlsxSheetViewer`. When enabled, fonts for non-Latin scripts are supplied on demand from Noto families so text does not fall back to tofu: Arabic (Noto Naskh/Sans Arabic), CJK (Noto Sans/Serif KR · SC · TC · JP, plus Noto Sans HK, picked per document language so shared Han glyphs take the right shapes), Cyrillic (Noto Sans/Serif), Hebrew (Noto Sans/Serif Hebrew, RTL), Thai (Noto Sans Thai) and Devanagari (Noto Sans Devanagari). No font binaries ship in the bundle. This sends the end-user's IP and User-Agent to `fonts.googleapis.com`, which may have GDPR implications.
 - **XML parsing.** Uses `roxmltree`, which does not resolve external entities (XXE-safe by default).
 - **Encrypted OOXML ([MS-OFFCRYPTO] Agile Encryption).** Password-protected `.docx` / `.xlsx` / `.pptx` files are OLE2/CFB containers, not ZIPs. Pass `password` to `load(...)` and the file is decrypted **client-side** via WebCrypto — no bytes and no password leave the browser:
@@ -1174,7 +1270,7 @@ tarball) for the full list and license texts. Highlights:
   (Apache License 2.0) — the equation-rendering engine behind the
   opt-in `@silurus/ooxml/math` entry described in
   [Rendering equations](#rendering-equations). It ships in the tarball as
-  a standalone ~3 MB asset but is never loaded by a consuming app unless
+  a standalone ~4 MB asset but is never loaded by a consuming app unless
   that app imports `@silurus/ooxml/math` and the viewer is handed a
   document that actually contains an equation.
 - **Rust crate dependencies** of the WASM parsers (docx/pptx/xlsx) — all

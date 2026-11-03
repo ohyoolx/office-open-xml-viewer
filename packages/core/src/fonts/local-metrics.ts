@@ -43,6 +43,15 @@ export interface LoadedLocalFontMetrics {
   metrics: Record<string, ResolvedLocalFontMetric>;
 }
 
+// Keep probe timing out of the public result shape. A completed job can still
+// contain a local() probe that hit its own ceiling; callers must not treat that
+// as evidence that the authored face is unavailable.
+const timedOutProbes = new WeakSet<LoadedLocalFontMetrics>();
+
+export function hadLocalFontProbeTimeout(result: LoadedLocalFontMetrics): boolean {
+  return timedOutProbes.has(result);
+}
+
 export function normalizeLocalFontMetricFamily(family: string): string {
   return family.trim().toLowerCase();
 }
@@ -81,12 +90,14 @@ function measureContext():
  */
 export async function loadLocalFontMetrics(
   requests: readonly LocalFontMetricRequest[],
+  targetFontSet: FontFaceSet | null = activeFontSet(),
 ): Promise<LoadedLocalFontMetrics> {
-  const set = activeFontSet();
+  const set = targetFontSet;
   if (!set || typeof FontFace === 'undefined') return { faces: [], metrics: {} };
 
   const faces: FontFace[] = [];
   const metrics: Record<string, ResolvedLocalFontMetric> = {};
+  let timedOut = false;
   type PreparedRequest = LocalFontMetricRequest & {
     family: string;
     normalizedFamily: string;
@@ -102,7 +113,8 @@ export async function loadLocalFontMetrics(
     if (request.lineHeightMultiplier != null && !(request.lineHeightMultiplier > 0)) continue;
     const weight = request.weight ?? 400;
     const style = request.style ?? 'normal';
-    if (!(weight >= 100 && weight <= 900) || (style !== 'normal' && style !== 'italic')) continue;
+    if (!(Number.isInteger(weight) && weight >= 1 && weight <= 1000)
+      || (style !== 'normal' && style !== 'italic')) continue;
     const source = localNames.map(quoteLocalName).join(', ');
     const normalizedFamily = normalizeLocalFontMetricFamily(family);
     const signature = `local-face:${source}:${weight}:${style}`;
@@ -129,6 +141,7 @@ export async function loadLocalFontMetrics(
       // pending load, so await it for every holder before measuring; `isNew`
       // alone is not a sufficient loaded-state guarantee under concurrent opens.
       const loaded = await withFontCeiling(face.load());
+      if (!loaded || face.status !== 'loaded') timedOut = true;
       if (!loaded || face.status !== 'loaded') throw new Error('local font load timed out');
       let hasRoute = false;
       for (const request of group.requests) {
@@ -165,7 +178,9 @@ export async function loadLocalFontMetrics(
       releaseFaces([face]);
     }
   }
-  return { faces, metrics };
+  const result = { faces, metrics };
+  if (timedOut) timedOutProbes.add(result);
+  return result;
 }
 
 export function unloadLocalFontMetrics(faces: Iterable<FontFace>): void {

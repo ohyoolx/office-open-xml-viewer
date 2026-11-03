@@ -31,6 +31,7 @@ export function projectRenderWorkerLayoutMeta(
     ? { completedSourceKeys: reviewIndex.completedSourceKeys }
     : undefined;
   return {
+    diagnostics: layout.diagnostics,
     pageCount: layout.pages.length,
     pageSizes: layout.pages.map((page) => ({
       widthPt: page.geometry.widthPt,

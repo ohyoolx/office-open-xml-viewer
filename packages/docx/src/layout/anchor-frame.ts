@@ -185,6 +185,16 @@ export type AnchorFrameResult = Readonly<{
   issues: readonly AnchorFrameIssue[];
 }>;
 
+/** Canonical authored allocation and axes, resolved before the wrap exclusion
+ * and effect geometry that complete anchor acquisition validates. */
+type AnchorPlacementResult = Readonly<{
+  status: 'resolved';
+  occurrenceId: string;
+  axes: Readonly<{ horizontal: AnchorAxisDiagnostic; vertical: AnchorAxisDiagnostic }>;
+  issues: readonly AnchorFrameIssue[];
+  geometry: Readonly<Pick<AnchorFrameGeometry, 'objectFrame' | 'size'>>;
+}> | Extract<AnchorFrameResult, { status: 'unsupported' }>;
+
 type Axis = 'horizontal' | 'vertical';
 type ReferenceFrameName = ResolvedAxisDiagnostic['referenceFrame'];
 
@@ -394,12 +404,17 @@ function resolveSize(
     if (status === 'missing') {
       return { problem: issue('missing-size', `extent.${axisName}`, `${axisName} is required`) };
     }
-    if (status !== 'valid' || !finite(value) || value <= 0) {
+    // ECMA-376 §20.4.2.7: wp:extent uses CT_PositiveSize2D, whose
+    // ST_PositiveCoordinate axes include zero (minInclusive=0). Preserve a
+    // line's collapsed axis; effectExtent and wrap distances expand its bounds
+    // independently. Requiring area here would abort page-anchor prescan for
+    // valid horizontal/vertical lines with square wrapping.
+    if (status !== 'valid' || !finite(value) || value < 0) {
       return {
         problem: issue(
           'invalid-size',
           `extent.${axisName}`,
-          `${axisName} extent must be finite and positive`,
+          `${axisName} extent must be finite and non-negative`,
         ),
       };
     }
@@ -583,19 +598,10 @@ function resolveAxis(
       );
       return { diagnostic: unsupportedAxis(axis, acquisition, problem), problem };
     }
-    const leadingName = axis === 'horizontal' ? 'left' : 'top';
-    const trailingName = axis === 'horizontal' ? 'right' : 'bottom';
-    const isInside = choice.value === 'inside';
-    const parityLeading = frames.pageParity === 'odd';
-    const alignedLeading = choice.value === leadingName
-      || (isInside && parityLeading)
-      || (choice.value === 'outside' && !parityLeading);
-    const alignedTrailing = choice.value === trailingName
-      || (isInside && !parityLeading)
-      || (choice.value === 'outside' && parityLeading);
-    resolvedOriginPt = alignedLeading
+    const placement = alignedAnchorPlacement(axis, choice.value, frames.pageParity);
+    resolvedOriginPt = placement === 'leading'
       ? baseResult.base.startPt
-      : alignedTrailing
+      : placement === 'trailing'
         ? baseResult.base.endPt - sizePt
         : baseResult.base.startPt + (lengthPt - sizePt) / 2;
     value = choice.value;
@@ -625,6 +631,36 @@ function resolveAxis(
         : null,
     },
   };
+}
+
+/**
+ * Which edge of the alignment base an ECMA-376 §20.4.3.1 `wp:align` value
+ * holds the object against. `inside`/`outside` follow the page parity
+ * (odd pages lead with inside). Callers validate the value beforehand.
+ */
+export function alignedAnchorPlacement(
+  axis: Axis,
+  value: string,
+  pageParity: 'odd' | 'even' | null,
+): 'leading' | 'center' | 'trailing' {
+  const leadingName = axis === 'horizontal' ? 'left' : 'top';
+  const trailingName = axis === 'horizontal' ? 'right' : 'bottom';
+  const parityLeading = pageParity === 'odd';
+  if (
+    value === leadingName
+    || (value === 'inside' && parityLeading)
+    || (value === 'outside' && !parityLeading)
+  ) {
+    return 'leading';
+  }
+  if (
+    value === trailingName
+    || (value === 'inside' && !parityLeading)
+    || (value === 'outside' && parityLeading)
+  ) {
+    return 'trailing';
+  }
+  return 'center';
 }
 
 function simpleAxis(
@@ -787,12 +823,17 @@ function polygonGeometry(
       yPt: frame.yPt + (point.y / FIXED_WRAP_COORDINATE_SIZE) * frame.heightPt,
     });
   }
-  const xs = points.map((point) => point.xPt);
-  const ys = points.map((point) => point.yPt);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
+  // Do not spread authored vertices into Math.min/max arguments.
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const point of points) {
+    minX = Math.min(minX, point.xPt);
+    maxX = Math.max(maxX, point.xPt);
+    minY = Math.min(minY, point.yPt);
+    maxY = Math.max(maxY, point.yPt);
+  }
   return {
     polygon: { edited: polygon.edited, points },
     bounds: { xPt: minX, yPt: minY, widthPt: maxX - minX, heightPt: maxY - minY },
@@ -827,7 +868,7 @@ function frozenResult(result: AnchorFrameResult): AnchorFrameResult {
  * §§20.4.3.1-.7; implementation-note evidence is owned by the compatibility
  * decision module.
  */
-export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
+function resolveAnchorPlacement(input: AnchorFrameInput): AnchorPlacementResult {
   const { acquisition, frames } = input;
   // CT_Anchor makes these authoring controls required even when a particular
   // layout stage does not consume their values. Rejecting incomplete facts at
@@ -947,6 +988,24 @@ export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
     widthPt: width.resolved.valuePt,
     heightPt: height.resolved.valuePt,
   };
+  return snapshotPlainData<AnchorPlacementResult>({
+    status: 'resolved', occurrenceId: acquisition.occurrenceId,
+    axes: { horizontal: horizontal.diagnostic, vertical: vertical.diagnostic },
+    issues: [], geometry: { objectFrame, size: {
+      horizontal: width.resolved.diagnostic, vertical: height.resolved.diagnostic,
+    } },
+  }, 'anchor placement result');
+}
+
+/** Complete ordinary anchor acquisition preserves the canonical placement
+ * guards and issue precedence, then validates all wrap/effect geometry. */
+export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
+  const { acquisition } = input;
+  const placement = resolveAnchorPlacement(input);
+  if (placement.status !== 'resolved') return placement;
+  const objectFrame = placement.geometry.objectFrame;
+  const horizontal = { diagnostic: placement.axes.horizontal };
+  const vertical = { diagnostic: placement.axes.vertical };
   const parentEffects = effectEdges(acquisition.parentEffectExtent, 'parentEffectExtent', false);
   if (parentEffects.problem || !parentEffects.values) {
     const problem = parentEffects.problem as AnchorFrameIssue;
@@ -1089,10 +1148,7 @@ export function resolveAnchorFrame(input: AnchorFrameInput): AnchorFrameResult {
       objectFrame,
       inkBounds,
       wrapBounds,
-      size: {
-        horizontal: width.resolved.diagnostic,
-        vertical: height.resolved.diagnostic,
-      },
+      size: placement.geometry.size,
       parentEffectExtent: parentEffects.values,
       wrap: {
         kind: acquisition.wrap.kind,

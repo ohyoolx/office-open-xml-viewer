@@ -9,9 +9,9 @@ import type {
   DocTableCell,
   DocTableRow,
   DocxDocumentModel,
-    SectionProps,
+  SectionProps,
 } from '../types.js';
-import type { TableFragmentLayout } from './table-pagination.js';
+import { acceptTableAnchorReferenceRefinement, type TableFragmentLayout, type TableFragmentResult } from './table-pagination.js';
 
 function makeStubCtx(): CanvasRenderingContext2D {
   let font = '10px serif';
@@ -140,7 +140,229 @@ function expectDeeplyFrozen(value: unknown, seen = new WeakSet<object>()): void 
   for (const child of Object.values(value)) expectDeeplyFrozen(child, seen);
 }
 
+function gridCarrierFixture(text = '', options: {
+  pageHeight?: number; reference?: 'paragraph' | 'line' | 'page';
+  allowOverlap?: boolean; laterRow?: boolean; tab?: boolean;
+  ordinaryBlocker?: boolean; emptyTextRun?: boolean; colSpan?: number;
+  longTail?: boolean; header?: boolean;
+} = {}): DocxDocumentModel {
+  const nested = table([row([textCell('framed grid')], { rowHeight: 30, rowHeightRule: 'exact' })],
+    [100], { widthPt: 100 });
+  Object.assign(nested, { __tableLayout: {
+    effectiveStyleId: null, ordinaryFlow: false,
+    grid: { authored: true, columns: [{ width: '2000' }], requiredColumnCount: 1 },
+    preferredWidth: { kind: 'dxa', value: '2000' },
+    layout: { kind: 'fixed' }, cellSpacing: null,
+    cellFrame: { dropCap: 'none', lines: 1, wrap: 'around', hAnchor: 'margin',
+      vAnchor: 'text', hRule: 'auto', hSpace: 0, vSpace: 0, xAlign: 'left', y: 15 },
+  } });
+  const host = table([row([cell([nested as CellElement, paragraph('') as CellElement])],
+    { rowHeight: 10, rowHeightRule: 'exact' })], [100]);
+  const anchor = paragraph(text);
+  if (options.emptyTextRun) anchor.runs.push({ ...paragraph('x').runs[0]!, text: '' } as never);
+  anchor.runs.push({ type: 'anchorHost', fontSize: 10,
+    __anchorOccurrenceId: 'empty-carrier-box' } as never);
+  const missingEdges = {
+    topPt: null, topStatus: 'missing', rightPt: null, rightStatus: 'missing',
+    bottomPt: null, bottomStatus: 'missing', leftPt: null, leftStatus: 'missing',
+  };
+  anchor.runs.push({ type: 'shape', widthPt: 20, heightPt: 8,
+    anchorXPt: 60, anchorYPt: 4, anchorXFromMargin: false, anchorYFromPara: true,
+    anchorXRelativeFrom: 'column', anchorYRelativeFrom: 'paragraph',
+    presetGeometry: 'rect', subpaths: [], fill: { fillType: 'solid', color: 'FFFFFF' },
+    stroke: null, wrapMode: 'none', zOrder: 0,
+    __anchorAcquisition: {
+      occurrenceId: 'empty-carrier-box',
+      simplePosition: { enabled: false, status: 'valid', xPt: 0, xStatus: 'valid', yPt: 0, yStatus: 'valid' },
+      horizontal: { relativeFrom: 'column', relativeFromStatus: 'valid', choice: { kind: 'offset', valuePt: 60 } },
+      vertical: { relativeFrom: options.reference ?? 'paragraph', relativeFromStatus: 'valid', choice: { kind: 'offset', valuePt: 4 } },
+      extent: { widthPt: 20, widthStatus: 'valid', heightPt: 8, heightStatus: 'valid' },
+      parentEffectExtent: missingEdges, anchorDistances: missingEdges,
+      relativeSize: { horizontal: null, vertical: null },
+      wrap: { kind: 'none', authoredKinds: ['wrapNone'], side: 'bothSides', distances: missingEdges, effectExtent: null, polygon: null },
+      behavior: { behindDoc: false, behindDocStatus: 'valid', relativeHeight: 0, relativeHeightStatus: 'valid',
+        locked: false, lockedStatus: 'valid', allowOverlap: options.allowOverlap ?? true, allowOverlapStatus: 'valid',
+        layoutInCell: true, layoutInCellStatus: 'valid' },
+      group: null,
+    },
+  } as DocParagraph['runs'][number]);
+  if (options.tab) anchor.runs.unshift(paragraph('\t').runs[0]!);
+  const following = table([...(options.laterRow ? [row([textCell('')])] : []),
+    row([cell([anchor as CellElement,
+      ...(options.longTail ? [paragraph('tail '.repeat(100)) as CellElement] : [])],
+    { colSpan: options.colSpan ?? 1 })], { isHeader: options.header ?? false })],
+    options.colSpan === 3 ? [40, 30, 30] : [100]);
+  const model = documentModel([host as BodyElement, following as BodyElement], options.pageHeight ?? 200);
+  if (options.ordinaryBlocker) {
+    const blocker = table([row([textCell('ordinary blocker')], { rowHeight: 10, rowHeightRule: 'exact' })], [100]);
+    Object.assign(blocker, { tblpPr: {
+      leftFromText: 0, rightFromText: 0, topFromText: 0, bottomFromText: 0,
+      horzAnchor: 'margin', horzSpecified: true, vertAnchor: 'page', tblpX: 0, tblpY: 20,
+    } });
+    model.body.unshift(blocker as BodyElement);
+  }
+  return model;
+}
+
 describe('retained table pagination contracts', () => {
+  it.each(['advance', 'bounds', 'cursor', 'missing', 'fresh'] as const)(
+    'keeps an admitted transaction and reports a %s refinement mismatch', (mismatch) => {
+      const fragment = retainedTopLevelTables(layoutDocument(gridCarrierFixture(''))).at(-1)!;
+      const original: TableFragmentResult = Object.freeze({
+        fragment, nextCursor: null, requiresFreshPage: false,
+        floatingTablePlacements: Object.freeze([]),
+        floatingTableRegistryDelta: Object.freeze({
+          coordinateSpace: 'upright-physical-page-points' as const, flowDomainId: fragment.flowDomainId,
+          baseEntries: Object.freeze([]), baseNextParagraphId: 3, nextParagraphId: 4, entries: Object.freeze([]),
+        }),
+      });
+      const adjusted: TableFragmentResult = Object.freeze({
+        ...original,
+        fragment: mismatch === 'missing' ? null : Object.freeze({
+          ...fragment,
+          advancePt: fragment.advancePt + (mismatch === 'advance' ? 1 : 0),
+          flowBounds: mismatch === 'bounds' ? Object.freeze({ ...fragment.flowBounds, yPt: fragment.flowBounds.yPt + 1 }) : fragment.flowBounds,
+        }),
+        nextCursor: mismatch === 'cursor' ? Object.freeze({ rowIndex: 1, rowFragmentIndex: 0, cells: Object.freeze([]) }) : null,
+        requiresFreshPage: mismatch === 'fresh',
+        floatingTablePlacements: Object.freeze([]),
+      });
+      const result = acceptTableAnchorReferenceRefinement(original, adjusted);
+      expect(result.fragment!.advancePt).toBe(fragment.advancePt);
+      expect(result.fragment!.flowBounds).toBe(fragment.flowBounds);
+      expect(result.fragment!.rows).toBe(fragment.rows);
+      expect(result.nextCursor).toBe(original.nextCursor);
+      expect(result.floatingTablePlacements).toBe(original.floatingTablePlacements);
+      expect(result.floatingTableRegistryDelta).toBe(original.floatingTableRegistryDelta);
+      expect(result.fragment!.diagnostics?.at(-1)).toMatchObject({ code: 'UNSUPPORTED_FEATURE', severity: 'warning', source: fragment.source });
+      expect(original.fragment).toBe(fragment);
+      expectDeeplyFrozen(result);
+    },
+  );
+  it('accepts a pagination-equivalent anchor refinement without cloning it', () => {
+    const fragment = retainedTopLevelTables(layoutDocument(gridCarrierFixture(''))).at(-1)!;
+    const original = Object.freeze({ fragment, nextCursor: null, requiresFreshPage: false });
+    const adjusted = Object.freeze({ ...original, fragment: Object.freeze({ ...fragment }) });
+    expect(acceptTableAnchorReferenceRefinement(original, adjusted)).toBe(adjusted);
+  });
+  it('rejects refinement of a fragment that was never admitted', () => {
+    const result = Object.freeze({ fragment: null, nextCursor: null, requiresFreshPage: true });
+    expect(() => acceptTableAnchorReferenceRefinement(result, result)).toThrow('requires an admitted table fragment');
+  });
+
+  it.each([
+    ['anchor-only', '', 24],
+    ['text carrier', 'following label', 59],
+    ['spacing carrier', '\u2002', 59],
+    ['ordinary space', ' ', 59],
+    ['nonbreaking space', '\u00a0', 59],
+    ['zero width text', '\u200b', 59],
+  ] as const)('keeps the %s drawing reference distinct from grid-frame-displaced flow', (_kind, text, expectedDrawingYPt) => {
+    const layout = layoutDocument(gridCarrierFixture(text));
+    const [first, second] = retainedTopLevelTables(layout);
+    const drawing = layout.pages[0]?.layers.paintOrder.find((entry) => entry.kind === 'drawing');
+    if (!first || !second || drawing?.kind !== 'drawing') throw new Error('expected retained tables and drawing');
+    // The frame occupies y25..55. Flow still clears it. An empty anchor
+    // carrier retains its insertion reference y20; visible text or even
+    // authored whitespace owns the displaced paragraph flow reference y55.
+    expect(first.resolvedFloatingTables[0]?.bounds.yPt).toBeCloseTo(25, 10);
+    expect(second.flowBounds.yPt).toBeCloseTo(55, 10);
+    expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(expectedDrawingYPt, 10);
+    expect(second.rows[0]?.cells[0]?.blocks[0]?.layout.kind).toBe('paragraph');
+    expectDeeplyFrozen(layout);
+  });
+  it.each([
+    ['tab', { tab: true }, 59],
+    ['empty text run', { emptyTextRun: true }, 59],
+    ['header carrier', { header: true }, 59],
+    ['line reference', { reference: 'line' as const }, 59],
+    ['collision constrained', { allowOverlap: false }, 59],
+    ['later row', { laterRow: true }, null],
+  ] as const)('keeps %s carriers on their actual flow reference', (_kind, options, expectedYPt) => {
+    const layout = layoutDocument(gridCarrierFixture('', options));
+    const drawing = layout.pages[0]!.layers.paintOrder.find((entry) => entry.kind === 'drawing');
+    if (drawing?.kind !== 'drawing') throw new Error('expected drawing');
+    expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(expectedYPt
+      ?? (retainedTopLevelTables(layout).at(-1)!.rows[1]!.flowBounds.yPt + 4), 10);
+  });
+  it('retains ordinary blockers when rebasing the empty carrier', () => {
+    const layout = layoutDocument(gridCarrierFixture('', { ordinaryBlocker: true }));
+    const tables = retainedTopLevelTables(layout);
+    const drawing = layout.pages[0]!.layers.paintOrder.find((entry) => entry.kind === 'drawing');
+    if (drawing?.kind !== 'drawing') throw new Error('expected drawing');
+    // Overlap-permitted floats of other paragraphs do not displace the table
+    // (Windows Word 16.0.20430, #1896 float controls).
+    expect(tables.at(-1)!.flowBounds.yPt).toBeCloseTo(55, 10);
+    expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(34, 10);
+  });
+  it('preserves the reference of a horizontally merged leading carrier', () => {
+    const layout = layoutDocument(gridCarrierFixture('', { colSpan: 3 }));
+    const drawing = layout.pages[0]!.layers.paintOrder.find((entry) => entry.kind === 'drawing');
+    if (drawing?.kind !== 'drawing') throw new Error('expected drawing');
+    expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(24, 10);
+    expect(retainedTopLevelTables(layout).at(-1)!.columnWidthsPt).toHaveLength(3);
+    expect(retainedTopLevelTables(layout).at(-1)!.rows[0]!.cells).toHaveLength(1);
+  });
+  it('rebinds the empty carrier reference on a fresh page', () => {
+    const layout = layoutDocument(gridCarrierFixture('', { pageHeight: 70 }));
+    expect(layout.pages).toHaveLength(2);
+    const drawing = layout.pages[1]!.layers.paintOrder.find((entry) => entry.kind === 'drawing');
+    if (drawing?.kind !== 'drawing') throw new Error('expected drawing');
+    expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(14, 10);
+    expect(retainedTopLevelTables(layout).at(-1)!.flowBounds.yPt).toBeCloseTo(10, 10);
+  });
+  it('rebinds the empty carrier reference on the next authored column', () => {
+    const model = gridCarrierFixture('', { pageHeight: 70 });
+    model.section = { ...model.section, columns: {
+      count: 2, spacePt: 20, equalWidth: true, sep: false, cols: [],
+    } } as SectionProps;
+    const layout = layoutDocument(model);
+    expect(layout.pages).toHaveLength(1);
+    const drawing = layout.pages[0]!.layers.paintOrder.find((entry) => entry.kind === 'drawing');
+    if (drawing?.kind !== 'drawing') throw new Error('expected drawing');
+    expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(14, 10);
+    expect(retainedTopLevelTables(layout).at(-1)!.flowDomainId).toContain('column:1');
+  });
+  it('does not carry the initial reference or drawing into continued row fragments', () => {
+    const layout = layoutDocument(gridCarrierFixture('', { pageHeight: 100, longTail: true }));
+    expect(layout.pages.length).toBeGreaterThan(1);
+    const drawings = layout.pages.flatMap((page) => page.layers.paintOrder
+      .filter((entry) => entry.kind === 'drawing'));
+    expect(drawings).toHaveLength(1);
+    const drawing = drawings[0]!;
+    if (drawing.kind !== 'drawing') throw new Error('expected drawing');
+    expect(drawing.node.inkBounds.yPt + drawing.layoutTranslationPt.yPt).toBeCloseTo(24, 10);
+    expect(retainedTopLevelTables(layout).at(-1)!.rows[0]!.fragmentIndex).toBeGreaterThan(0);
+  });
+  it('places a cell-owned grid frame in the page margin band at the cell insertion cursor', () => {
+    for (const childWidth of [160, 260]) {
+      const nested = table([row([textCell('grid')], { rowHeight: 20, rowHeightRule: 'exact' })],
+        [childWidth], { widthPt: childWidth });
+      Object.assign(nested, { __tableLayout: {
+        effectiveStyleId: null, ordinaryFlow: false,
+        grid: { authored: true, columns: [{ width: String(childWidth * 20) }], requiredColumnCount: 1 },
+        preferredWidth: { kind: 'dxa', value: String(childWidth * 20) },
+        layout: { kind: 'fixed' }, cellSpacing: null,
+        cellFrame: { dropCap: 'none', lines: 1, wrap: 'around', hAnchor: 'margin',
+          vAnchor: 'text', hRule: 'auto', hSpace: 9, vSpace: 0, xAlign: 'center', y: 12 },
+      } });
+      const following = { ...paragraph(''), spaceBefore: 35 };
+      const host = table([row([cell([nested as CellElement, following as CellElement])],
+        { rowHeight: 70, rowHeightRule: 'exact' })], [100]);
+      const [fragment] = retainedTopLevelTables(layoutDocument(documentModel([host as BodyElement], 120)));
+      const placements = fragment?.resolvedFloatingTables ?? [];
+      expect(placements).toHaveLength(1);
+      const placed = placements[0]!;
+      const acquiredWidth = placed.child.columnWidthsPt.reduce((a, b) => a + b, 0);
+      expect(acquiredWidth).toBe(childWidth);
+      expect(placed.xPt).toBeCloseTo(50, 10);
+      expect(placed.exclusionBounds.widthPt).toBe(118);
+      expect(placed.yPt).toBeCloseTo(22, 10);
+      expect(fragment?.rows[0]?.cells[0]?.blocks.some((block) => block.layout.kind === 'table')).toBe(false);
+      expect(placed.child.rows[0]?.cells[0]?.blocks[0]?.layout.kind).toBe('paragraph');
+      expect(nested.tblpPr).toBeUndefined();
+    }
+  });
   it('retains nested page-split geometry as clone-safe immutable parser-independent data', () => {
     const nested = table(
       Array.from({ length: 4 }, (_unused, index) => row(
@@ -323,20 +545,22 @@ describe('retained table pagination contracts', () => {
     expect(fragments).toHaveLength(3);
     for (const fragment of fragments) {
       expect(fragment.rows).toHaveLength(1);
-      expect(fragment.rows[0]?.heightPt).toBe(24);
-      expect(fragment.advancePt).toBe(24);
+      // Each page-local slice adds its full 4pt top and bottom rules.
+      expect(fragment.rows[0]?.heightPt).toBe(28);
+      expect(fragment.advancePt).toBe(28);
       expect(fragment.borders.filter((border) => border.edge === 'top')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
       ]);
       expect(fragment.borders.filter((border) => border.edge === 'bottom')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
       ]);
-      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt - 2, 6);
-      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.flowBounds.heightPt + 4, 6);
+      // The rules lie inside the slice's own box.
+      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt, 6);
+      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.flowBounds.heightPt, 6);
     }
   });
 
-  it('charges thick collapsed outer half-rules only to page-local non-exact tracks', () => {
+  it('charges thick collapsed outer rules to page-local tracks, exact rows only at the table end', () => {
     const outer = singleBorder(12);
     const source = table(
       [
@@ -364,16 +588,50 @@ describe('retained table pagination contracts', () => {
     expect(tableFormatInput(source).rows.map((format) => format.height?.rule ?? 'auto'))
       .toEqual(['auto', 'exact', 'auto', 'exact', 'auto']);
 
+    // WORD_COLLAPSED_BORDER_ROW_TRACK_FOOTPRINT: an auto row adds its full
+    // top rule; the page-local last row adds the full bottom rule, which an
+    // exact row (holding its own top rule) adds alone. Rules lie inside.
     const fragments = retainedTopLevelTables(
-      layoutDocument(documentModel([source as unknown as BodyElement], 52)),
+      layoutDocument(documentModel([source as unknown as BodyElement], 68)),
     );
     expect(fragments).toHaveLength(2);
     expect(fragments.map((fragment) => fragment.rows.map((row) => row.logicalRowIndex)))
       .toEqual([[0, 1, 2, 3], [4]]);
     expect(fragments.map((fragment) => fragment.rows.map((row) => row.heightPt)))
-      .toEqual([[16, 1, 10, 1], [22]]);
-    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([28, 22]);
-    expect(fragments.map((fragment) => fragment.inkBounds.heightPt)).toEqual([40, 34]);
+      .toEqual([[22, 1, 10, 13], [34]]);
+    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([46, 34]);
+    expect(fragments.map((fragment) => fragment.inkBounds.heightPt)).toEqual([46, 34]);
+  });
+
+  it('charges a re-acquired exact row its in-table rule footprint, not a one-row table\'s', () => {
+    // Two 20pt exact rows with 6pt rules: 20 + 20 + the 6pt bottom rule fills
+    // a 46pt band exactly. A PAGE field makes the first row re-acquired per
+    // page; measured alone it would carry the table's bottom rule as well.
+    const rule = singleBorder(6);
+    const field = paragraph('');
+    (field.runs as unknown[]).push({
+      type: 'field', fieldType: 'page', instruction: 'PAGE', fallbackText: '1',
+      bold: false, italic: false, underline: false, strikethrough: false,
+      fontSize: 10, color: null, fontFamily: 'Times New Roman', background: null,
+    });
+    const source = table(
+      [
+        row([cell([{ type: 'paragraph', ...field } as unknown as CellElement])], {
+          rowHeight: 20, rowHeightRule: 'exact',
+        }),
+        row([cell(Array.from({ length: 4 }, () => (
+          { type: 'paragraph', ...paragraph('line') } as unknown as CellElement)))], {
+          rowHeight: 20, rowHeightRule: 'exact',
+        }),
+      ],
+      [120],
+      { borders: { top: rule, bottom: rule, left: null, right: null, insideH: rule, insideV: null } },
+    );
+    const layout = layoutDocument(documentModel([source as unknown as BodyElement], 66));
+    const fragments = retainedTopLevelTables(layout);
+    expect(layout.pages).toHaveLength(1);
+    expect(fragments).toHaveLength(1);
+    expect(fragments[0]!.rows.map((fragmentRow) => fragmentRow.heightPt)).toEqual([20, 26]);
   });
 
   it('re-resolves repeated atLeast header boundaries and row tracks on every slice', () => {
@@ -404,8 +662,9 @@ describe('retained table pagination contracts', () => {
 
     expect(fragments).toHaveLength(3);
     for (const [index, fragment] of fragments.entries()) {
-      expect(fragment.rows.map((fragmentRow) => fragmentRow.heightPt)).toEqual([22.5, 22.5]);
-      expect(fragment.advancePt).toBe(45);
+      // Header: 20 + 4pt top rule; body: 20 + 1pt inside rule + 4pt bottom rule.
+      expect(fragment.rows.map((fragmentRow) => fragmentRow.heightPt)).toEqual([24, 25]);
+      expect(fragment.advancePt).toBe(49);
       expect(fragment.rows[0]?.ownership).toBe(index === 0 ? 'source' : 'repeated-header');
       expect(fragment.borders.filter((border) => border.edge === 'top')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
@@ -419,7 +678,7 @@ describe('retained table pagination contracts', () => {
     }
   });
 
-  it('reserves the repeated header outer half-rule before admitting exact body rows', () => {
+  it('reserves the repeated header outer rule before admitting exact body rows', () => {
     const outer = singleBorder(4);
     const inside = singleBorder(1);
     const source = table(
@@ -446,7 +705,9 @@ describe('retained table pagination contracts', () => {
     );
     expect(fragments).toHaveLength(4);
     expect(fragments.map((fragment) => fragment.rows.length)).toEqual([2, 2, 2, 2]);
-    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([42.5, 42.5, 42.5, 42.5]);
+    // Header 20 + 4pt top rule; the exact row holds its inside rule and adds
+    // the 4pt bottom rule.
+    expect(fragments.map((fragment) => fragment.advancePt)).toEqual([48, 48, 48, 48]);
     for (const [index, fragment] of fragments.entries()) {
       expect(fragment.rows.map((fragmentRow) => fragmentRow.logicalRowIndex)).toEqual([0, index + 1]);
       expect(fragment.borders.filter((border) => border.edge === 'between')).toHaveLength(1);
@@ -482,7 +743,7 @@ describe('retained table pagination contracts', () => {
       const fragmentRow = fragment.rows[0];
       expect(fragmentRow?.logicalRowIndex).toBe(0);
       expect(fragmentRow?.fragmentIndex).toBe(fragmentIndex);
-      expect(fragment.advancePt).toBeCloseTo((fragmentRow?.contentHeightPt ?? 0) + 4, 8);
+      expect(fragment.advancePt).toBeCloseTo((fragmentRow?.contentHeightPt ?? 0) + 8, 8);
       expect(fragment.flowBounds.heightPt).toBeCloseTo(fragment.advancePt, 8);
       expect(fragment.borders.filter((border) => border.edge === 'top')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
@@ -490,8 +751,8 @@ describe('retained table pagination contracts', () => {
       expect(fragment.borders.filter((border) => border.edge === 'bottom')).toEqual([
         expect.objectContaining({ widthPt: 4 }),
       ]);
-      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt - 2, 8);
-      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.advancePt + 4, 8);
+      expect(fragment.inkBounds.yPt).toBeCloseTo(fragment.flowBounds.yPt, 8);
+      expect(fragment.inkBounds.heightPt).toBeCloseTo(fragment.advancePt, 8);
     }
     const lineRanges = fragments.map((fragment) => {
       const range = fragment.rows[0]?.cells[0]?.contentRanges.find(
@@ -505,7 +766,7 @@ describe('retained table pagination contracts', () => {
       expect(lineRanges[index]?.lineStart).toBe(lineRanges[index - 1]?.lineEnd);
     }
     expect(fragments.reduce((sum, fragment) => sum + fragment.advancePt, 0)).toBeCloseTo(
-      fragments.reduce((sum, fragment) => sum + (fragment.rows[0]?.contentHeightPt ?? 0) + 4, 0),
+      fragments.reduce((sum, fragment) => sum + (fragment.rows[0]?.contentHeightPt ?? 0) + 8, 0),
       8,
     );
   });

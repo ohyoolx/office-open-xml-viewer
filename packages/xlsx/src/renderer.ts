@@ -1,12 +1,29 @@
+import {
+  wrapSpreadsheetCellParagraph, layoutSpreadsheetCellRichLines,
+  type SpreadsheetCellRichSeg, type SpreadsheetCellRichLine,
+} from './spreadsheet-cell.js';
+import { ownValue } from '@silurus/ooxml-core/internal/own-key';
+import { inheritCellFontLanguage, usesJapaneseCellFonts } from './internal/cell-font-language.js';
+import { drawShapeStackedText } from './shape-stacked-text.js';
 import type { CjkLang } from '@silurus/ooxml-core';
+import { quoteCssFontFamily } from '@silurus/ooxml-core/internal/css-font-family';
+import { arabicFallbackFamilies, containsArabicFallbackText } from '@silurus/ooxml-core/internal/font-stack';
+import {
+  breakDrawingMlText, drawingMlTextRect, drawingMlLineHeight,
+  drawingMlSpacedLineBox, drawingMlParagraphSpacing, drawingMlBlockTop, drawingMlLineX, paintDrawingMlLine,
+  type DrawingMlInputRun,
+} from '@silurus/ooxml-core/internal/drawingml-text';
 import { containsHanScript } from '@silurus/ooxml-core/internal/script-preload-accumulator';
+import { activeFontSet, findReferenceFontMetrics, isHTMLCanvas, loadedGoogleRegularAliases } from '@silurus/ooxml-core';
+import { buildStructuredStyleMap, type StructuredCellFormat } from './pivot-style.js';
+import { buildMergeCoverageIndex } from './merge-coverage-index.js';
 import type {
   Worksheet, Styles, Cell, CellValue, CellFont, CellFill, Border, BorderEdge, CellXf,
   ViewportRange, RenderViewportOptions, XlsxTextRunInfo,
-  CfRule, CfStop, CfValue, Dxf, Hyperlink, DefinedName,
+  Dxf,
   Run, GradientFillSpec, ShapeInfo, ShapeAnchor, ImageAnchor, ChartAnchor,
   SlicerItem, SlicerStyle, SlicerElementStyle,
-  PhoneticRun, PhoneticProperties, PhoneticAlignment, Duotone,
+  PhoneticRun, PhoneticProperties, PhoneticAlignment, Duotone, PathInfo,
 } from './types.js';
 import type {
   Stroke,
@@ -14,10 +31,15 @@ import type {
   ChartRegionMapRenderer,
   ChartExRenderer,
 } from '@silurus/ooxml-core';
-import { chartImageFillKey, paintOptionalImagePlaceholder } from '@silurus/ooxml-core';
+import { blipEffectsMayExtendCoverage, blipPixelEffectsKey, imageEffectFrame, stretchedSourceFrame, type BlipEffect, type BlipPixelEffects } from '@silurus/ooxml-core';
+import { usesPathShade, trackPaintPath, currentStrokeBounds, chartImageFillStoreLookup, paintOptionalImagePlaceholder, pathFillModeOverlay, withDrawingMLShapeTransform, buildPresetGeometryFillPath } from '@silurus/ooxml-core';
 import { placePhoneticRuns } from './phonetic.js';
-import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, tintMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, kinsokuAdjustedSplit, DEFAULT_KINSOKU_RULES, isCjkBreakChar, isLatinWordCodePoint, isUax14NoBreakPair, containsSeaScript, isGraphemeFillText, seaMixedBreakOffsets, fitSeaWordPrefix, graphemeClusterOffsets, xlsxBorderDashArray, drawImageCropped, hexToRgba, intendedSingleLinePx, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
-import { evalFormulaToBool, todaySerial, nowSerial } from './formula.js';
+import { crispOffset, renderChart, renderSparkline, renderPresetShape, createAuxCanvas, PT_TO_PX, EMU_PER_PX, mathToMathML, rasterizeMathSvg, cachedTintedMathRaster, classifyCjkFont, classifyFontGeneric, googleCjkFontAlias, cjkFallbackChain, NON_CJK_SANS_FALLBACKS, NON_CJK_SERIF_FALLBACKS, isCjkBreakChar, xlsxBorderDashArray, drawImageCropped, hexToRgba, verticalTrLongMark, verticalVertGlyphReachable, applyStroke, resolveFill, type SparklineModel, type MathNode, type MathRenderer, type RasterizedMathSvg } from '@silurus/ooxml-core';
+import {
+  canvasShapeFontBoxProbe, excelShapeSpacing, officeRequestKey, shapeOfficeRouteKey, shapeRunLineRatios,
+  type ShapeRunLineRatios,
+} from './shape-office-line.js';
+import { XLSX_GOOGLE_FONTS } from './google-fonts.js';
 import { formatCellValueWithColor } from './number-format.js';
 import { type CfContext, type CfResult, compileCf, evaluateCf } from './conditional-format.js';
 import { computeLineVisualOrder, cellBaseRtl, resolveCellBidi } from './bidi-line.js';
@@ -31,9 +53,12 @@ import {
   type CoordinateIndexIdentity,
 } from './renderer-coordinate-index.js';
 import { GridGeometry, MAX_WORKSHEET_COL } from './internal/grid-geometry.js';
+import { rowResizeRanges, rowResizeContains } from './internal/worksheet-size-context.js';
 import type { GridAxisGeometry } from './internal/grid-axis-geometry.js';
-import { usesNativeOneCellExtent } from './internal/cell-anchor-geometry.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
 import { isOptionalImageUnavailable } from './internal/optional-image-fallback.js';
+import { getWorksheetPolicy, inheritWorksheetPolicy } from './worksheet-policy-context.js';
+import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
   MDW_FALLBACK,
   colWidthToPx,
@@ -53,25 +78,139 @@ export { colWidthToPx, pxToColWidth, rowHeightToPx, pxToRowHeight };
  *  synchronous lookup. Kept here (not in the orchestrator) so both the
  *  synchronous renderer and the async orchestrator share one definition without
  *  a circular import. */
-export function imageCacheKey(imagePath: string, duotone?: Duotone | null): string {
-  return duotone ? `${imagePath}|duo:${duotone.clr1}:${duotone.clr2}` : imagePath;
+/** Painted extent of an effect-grown source drawn into a frame rectangle,
+ *  or null when the source has no effect outset. */
+function effectOutsetRect(
+  img: CanvasImageSource, x: number, y: number, w: number, h: number,
+): { x: number; y: number; width: number; height: number } | null {
+  const frame = imageEffectFrame(img);
+  if (!frame || !(frame.width > 0) || !(frame.height > 0)) return null;
+  const size = img as { width: number; height: number };
+  const sx = w / frame.width, sy = h / frame.height;
+  return { x: x - frame.x * sx, y: y - frame.y * sy, width: size.width * sx, height: size.height * sy };
 }
 
-// Default font stack. Calibri is the workbook default font in Excel; on
-// systems without Office (macOS / Linux) the browser would otherwise fall
-// back to Arial / Helvetica, which is meaningfully wider than Calibri at
-// every weight/size combination. Carlito is the Google-released, metric-
-// compatible Calibri clone (same advance widths and ascender / descender
-// metrics) and is loaded opt-in by `XlsxWorkbook.load({ useGoogleFonts:
-// true })`. Listing it in the cascade means: Calibri (Windows / Office)
-// → Carlito (loaded webfont) → Arial → sans-serif. Caladea is the same
-// for Cambria.
-// The two trailing Noto Arabic faces are generic Arabic-script fallbacks:
-// when the primary Latin faces (Calibri / Carlito / Arial) lack a requested
-// glyph, the browser advances down the cascade per-glyph, so any Arabic
-// codepoint resolves to a real web font (loaded by `XlsxWorkbook.load`'s
-// useGoogleFonts path) instead of an oversized OS Arabic face. Latin glyphs
-// still bind to the earlier faces, so Latin rendering is unchanged.
+/** Axis-aligned bounds of `rect` after the picture's flips and rotation
+ *  about the authored frame centre (cx, cy) — the transform paint applies,
+ *  so an asymmetric effect outset is culled where it is actually painted. */
+function transformedBoundsAbout(
+  rect: { x: number; y: number; width: number; height: number },
+  cx: number, cy: number, rotationDeg: number, flipH: boolean, flipV: boolean,
+): { x: number; y: number; width: number; height: number } {
+  const r = rotationDeg * Math.PI / 180, cos = Math.cos(r), sin = Math.sin(r);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [px, py] of [[rect.x, rect.y], [rect.x + rect.width, rect.y],
+    [rect.x, rect.y + rect.height], [rect.x + rect.width, rect.y + rect.height]] as const) {
+    const dx = (px - cx) * (flipH ? -1 : 1), dy = (py - cy) * (flipV ? -1 : 1);
+    const x = cx + dx * cos - dy * sin, y = cy + dx * sin + dy * cos;
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+export function imageCacheKey(
+  imagePath: string,
+  transform?: Duotone | BlipPixelEffects | null,
+  frame?: XlsxPictureEffectFrame,
+): string {
+  if (!transform) return imagePath;
+  // An ordered CT_Blip chain (§20.1.8.13) is keyed by an unambiguous tuple of
+  // the path, the shared structural effect key (which includes the host
+  // orientation) and the physical frame, because spatial effects such as blur
+  // (§20.1.8.15) are measured in EMUs. A lone duotone keeps its established
+  // colour-suffixed key.
+  if ('effects' in transform) {
+    const { widthPt, heightPt } = blipEffectFramePt(frame);
+    return JSON.stringify(['blip', imagePath, blipPixelEffectsKey(transform), widthPt, heightPt]);
+  }
+  return `${imagePath}|duo:${transform.clr1}:${transform.clr2}`;
+}
+
+/** Authored geometry of a worksheet picture that its CT_Blip effects are
+ *  evaluated against: the picture's own extent in EMUs and its host
+ *  rotation/flips (§20.1.8.45/.49 rotWithShape semantics in core). */
+export interface XlsxPictureEffectFrame {
+  readonly cx: number;
+  readonly cy: number;
+  readonly srcRect?: Readonly<{ l: number; t: number; r: number; b: number }> | null;
+  readonly rotation?: number;
+  readonly flipH?: boolean;
+  readonly flipV?: boolean;
+}
+
+/** Physical effect frame in points. Library policy: the frame is the
+ *  authored picture extent (`a:xfrm/a:ext`, else the anchor `xdr:ext`), not
+ *  the zoom-dependent display rectangle, so a radius in EMUs covers the same
+ *  share of the picture at every zoom and the cache identity stays stable.
+ *  Without an authored extent the core falls back to 96 DPI source pixels. */
+export function blipEffectFramePt(frame?: XlsxPictureEffectFrame): { widthPt: number; heightPt: number } {
+  if (!(frame && Number.isFinite(frame.cx) && Number.isFinite(frame.cy) && frame.cx > 0 && frame.cy > 0)) {
+    return { widthPt: 0, heightPt: 0 };
+  }
+  // The srcRect window is stretched over the picture, so the full source
+  // frame is the picture extent divided by the visible source fraction.
+  const full = stretchedSourceFrame(frame.cx / 12700, frame.cy / 12700, frame.srcRect, null);
+  return { widthPt: full.width, heightPt: full.height };
+}
+
+/** Effect frame of a top-level picture anchor. */
+export function imageAnchorEffectFrame(anchor: ImageAnchor): XlsxPictureEffectFrame {
+  const native = anchor.nativeExtCx > 0 && anchor.nativeExtCy > 0;
+  return {
+    cx: native ? anchor.nativeExtCx : anchor.anchorExtCx ?? 0,
+    cy: native ? anchor.nativeExtCy : anchor.anchorExtCy ?? 0,
+    srcRect: anchor.srcRect ?? null,
+    rotation: anchor.rotation ?? 0,
+    flipH: anchor.flipH ?? false,
+    flipV: anchor.flipV ?? false,
+  };
+}
+
+/** Effect frame of a picture leaf inside a group: its normalized share of the
+ *  group's authored extent, with the leaf's own rotation/flips. */
+export function groupLeafEffectFrame(
+  group: { readonly nativeExtCx: number; readonly nativeExtCy: number },
+  shape: ShapeInfo,
+): XlsxPictureEffectFrame {
+  return {
+    cx: group.nativeExtCx * shape.w,
+    cy: group.nativeExtCy * shape.h,
+    srcRect: shape.geom.type === 'image' ? shape.geom.srcRect ?? null : null,
+    rotation: shape.rot,
+    flipH: shape.flipH,
+    flipV: shape.flipV,
+  };
+}
+
+/** Decode-time pixel transform of a worksheet picture: its ordered CT_Blip
+ *  effects (each duotone with its own palette, alpha effects in place) when it
+ *  carries any, otherwise just the lone duotone. Shared by the synchronous
+ *  lookup and the async decoder so both compute the same cache key. */
+export function imagePixelTransform(image: {
+  readonly duotone?: Duotone | null;
+  readonly blipEffects?: readonly BlipEffect[] | null;
+}, frame?: XlsxPictureEffectFrame): Duotone | BlipPixelEffects | null {
+  return image.blipEffects?.length
+    ? {
+        effects: image.blipEffects,
+        duotone: image.duotone ?? null,
+        hostRotation: frame?.rotation ?? 0,
+        hostFlipH: frame?.flipH ?? false,
+        hostFlipV: frame?.flipV ?? false,
+      }
+    : image.duotone ?? null;
+}
+
+// Calibri is the workbook default font in Excel. When absent, keep the
+// authored sans class rather than silently selecting another named face.
+// `useGoogleFonts` explicitly permits the legacy Calibri → Carlito webfont
+// substitute; that optional route is threaded per worksheet/canvas below.
+// Caladea is likewise an opt-in web alias for Cambria. No other named face
+// inherits these aliases merely because its authored font is unavailable.
+// Arabic fallbacks enter a run's stack only when its text contains Arabic;
+// Noto Naskh Arabic also carries Latin glyphs, so putting it in every sans
+// stack would change the fallback class of ordinary Latin text.
 // The trailing non-CJK Noto faces (Hebrew / Thai / Devanagari, plus "Noto Sans"
 // for Cyrillic) extend the same per-glyph fallback idea to the other
 // non-Latin, non-CJK scripts: any such codepoint resolves to a real web font
@@ -82,44 +221,202 @@ export function imageCacheKey(imagePath: string, duotone?: Duotone | null): stri
 const NON_CJK_SANS_TAIL = NON_CJK_SANS_FALLBACKS.map((n) => `"${n}"`).join(', ');
 const NON_CJK_SERIF_TAIL = NON_CJK_SERIF_FALLBACKS.map((n) => `"${n}"`).join(', ');
 const DEFAULT_FONT_FAMILY =
-  `"Calibri", "Carlito", "Cambria", "Caladea", Arial, "Noto Naskh Arabic", "Noto Sans Arabic", ${NON_CJK_SANS_TAIL}, sans-serif`;
-// Serif counterpart of DEFAULT_FONT_FAMILY. A Latin *serif* cell font the host
-// lacks (Century, Garamond, …) must degrade to a serif — Excel renders such a
-// cell with a serif, not the sans default. Cambria is Office's serif; Caladea is
-// its metric-compatible clone (loaded opt-in via useGoogleFonts), then web-safe
-// serifs, ending in the `serif` generic.
-const DEFAULT_SERIF_FONT_FAMILY =
-  `"Cambria", "Caladea", "Times New Roman", "Liberation Serif", "Noto Naskh Arabic", "Noto Sans Arabic", ${NON_CJK_SERIF_TAIL}, serif`;
+  `"Calibri", Arial, ${NON_CJK_SANS_TAIL}, sans-serif`;
+const GOOGLE_DEFAULT_FONT_FAMILY =
+  `"Calibri", "Carlito", Arial, ${NON_CJK_SANS_TAIL}, sans-serif`;
+// The authored face is prepended by fontStackFor. Only the corresponding base
+// text face gets its advance-width substitute; other named faces use the
+// generic chain for their font class. This is font-resource routing policy,
+// not a claim that the substitutes reproduce every Excel line break.
+const NAMED_SANS_TAIL =
+  `Arial, Helvetica, "Liberation Sans", ${NON_CJK_SANS_TAIL}, sans-serif`;
+const NAMED_SERIF_TAIL =
+  `"Times New Roman", "Liberation Serif", ${NON_CJK_SERIF_TAIL}, serif`;
+const CALIBRI_TAIL = `"Carlito", ${NAMED_SANS_TAIL}`;
+const CAMBRIA_TAIL = `"Caladea", ${NAMED_SERIF_TAIL}`;
+type OfficeRoutes = Readonly<Record<string, import('@silurus/ooxml-core').OfficeFontFallbackRoute>>;
+const officeRoutesByContext = new WeakMap<object, OfficeRoutes>();
+const officeRoutesByWorksheet = new WeakMap<Worksheet, OfficeRoutes>();
+type NormalFontBinding = {
+  tupleKey: string | null;
+  route: import('@silurus/ooxml-core').OfficeFontFallbackRoute | undefined;
+  hasDeclaredFace: boolean;
+  canvasMdw?: number;
+};
+const normalFontBindingByWorksheet = new WeakMap<Worksheet, NormalFontBinding>();
+const googleSubstitutesByContext = new WeakMap<object, boolean>();
+const googleSubstitutesByWorksheet = new WeakMap<Worksheet, boolean>();
+const regularAliasesByContext = new WeakMap<object, ReadonlyMap<string, string>>();
+const regularAliasesByWorksheet = new WeakMap<Worksheet, ReadonlyMap<string, string>>();
+type ResolvedThemeCellFont = {
+  family: string | null; weight: number; fallbackAlias?: string; syntheticBold?: true;
+};
+type ThemeCellFontState = Pick<Worksheet, 'themeJapaneseMajorFont' | 'themeJapaneseMinorFont'> & {
+  japanese: boolean;
+  cache: Map<string, ResolvedThemeCellFont>;
+};
+// A live caller-owned canvas must not retain a worksheet's cell/resource graph
+// after workbook destruction or cache eviction. Bind only two theme names, the
+// session language snapshot, and at most eight resolved style combinations.
+const themeCellFontByContext = new WeakMap<object, ThemeCellFontState>();
+const themeCellFontByWorksheet = new WeakMap<Worksheet, ThemeCellFontState>();
+
+function bindThemeCellFontState(ctx: CanvasRenderingContext2D, worksheet: Worksheet): void {
+  const japanese = usesJapaneseCellFonts(worksheet);
+  let state = themeCellFontByWorksheet.get(worksheet);
+  if (!state || state.japanese !== japanese
+      || state.themeJapaneseMajorFont !== worksheet.themeJapaneseMajorFont
+      || state.themeJapaneseMinorFont !== worksheet.themeJapaneseMinorFont) {
+    state = { themeJapaneseMajorFont: worksheet.themeJapaneseMajorFont,
+      themeJapaneseMinorFont: worksheet.themeJapaneseMinorFont, japanese, cache: new Map() };
+    inheritCellFontLanguage(worksheet, state);
+    themeCellFontByWorksheet.set(worksheet, state);
+  }
+  themeCellFontByContext.set(ctx, state);
+}
+
+function bindNormalFontState(
+  worksheet: Worksheet, routes: OfficeRoutes | undefined,
+  fontSet: FontFaceSet | null, googleSubstitutes: boolean,
+  measureCtx?: CanvasRenderingContext2D,
+  regularAliases: ReadonlyMap<string, string> = new Map(),
+): void {
+  const tupleKey = worksheet.defaultFontFamily
+    ? officeRequestKey({ family: worksheet.defaultFontFamily,
+      weight: worksheet.defaultFontBold ? 700 : 400,
+      style: worksheet.defaultFontItalic ? 'italic' : 'normal' })
+    : null;
+  const route = tupleKey === null ? undefined : routes?.[tupleKey];
+  const hasDeclaredFace = worksheet.defaultFontFamily
+    ? hasDeclaredFamilyFace(worksheet.defaultFontFamily, fontSet) : false;
+  const canvasMdw = measureCtx && worksheet.defaultFontFamily && worksheet.defaultFontSize
+    ? computeMdw(worksheet.defaultFontFamily, worksheet.defaultFontSize, route,
+      googleSubstitutes, worksheet.defaultFontBold ? 700 : 400,
+      worksheet.defaultFontItalic ? 'italic' : 'normal', measureCtx,
+      regularAliases.get(worksheet.defaultFontFamily.trim().toLocaleLowerCase('en-US')))
+    : undefined;
+  const next = { tupleKey, route, hasDeclaredFace, canvasMdw };
+  const old = normalFontBindingByWorksheet.get(worksheet);
+  // Retained route maps can gain entries in place, and a popup can use another
+  // FontFaceSet for the same worksheet. Either change can alter MDW while the
+  // worksheet's cached grid geometry still has the previous column widths.
+  if (!old || old.tupleKey !== next.tupleKey
+      || old.route !== next.route || old.hasDeclaredFace !== next.hasDeclaredFace
+      || old.canvasMdw !== next.canvasMdw) GridGeometry.invalidate(worksheet);
+  normalFontBindingByWorksheet.set(worksheet, next);
+}
+
+/** The renderer's exact-resource route is scoped to a canvas/worksheet, not a
+ * process-wide family alias: popups and workers have distinct FontFaceSets. */
+export function bindXlsxOfficeFontRoutes(
+  ctx: CanvasRenderingContext2D,
+  worksheet: Worksheet,
+  routes?: OfficeRoutes,
+  googleSubstitutes = false,
+): void {
+  bindThemeCellFontState(ctx, worksheet);
+  if (officeRoutesByWorksheet.get(worksheet) !== routes ||
+      googleSubstitutesByWorksheet.get(worksheet) !== googleSubstitutes) GridGeometry.invalidate(worksheet);
+  googleSubstitutesByContext.set(ctx, googleSubstitutes);
+  const fontSet = (isHTMLCanvas(ctx.canvas) ? ctx.canvas.ownerDocument?.fonts : undefined)
+    ?? activeFontSet();
+  const regularAliases = googleSubstitutes
+    ? loadedGoogleRegularAliases(fontSet, XLSX_GOOGLE_FONTS) : new Map<string, string>();
+  regularAliasesByContext.set(ctx, regularAliases);
+  regularAliasesByWorksheet.set(worksheet, regularAliases);
+  bindNormalFontState(worksheet, routes, fontSet, googleSubstitutes, ctx, regularAliases);
+  googleSubstitutesByWorksheet.set(worksheet, googleSubstitutes);
+  if (routes) {
+    officeRoutesByContext.set(ctx, routes);
+    officeRoutesByWorksheet.set(worksheet, routes);
+  } else {
+    officeRoutesByContext.delete(ctx);
+    officeRoutesByWorksheet.delete(worksheet);
+  }
+}
+
+function contextRegularAlias(ctx: CanvasRenderingContext2D, name: string | null | undefined): string | undefined {
+  return name ? regularAliasesByContext.get(ctx)?.get(name.trim().toLocaleLowerCase('en-US')) : undefined;
+}
+
+export function bindXlsxWorksheetOfficeFontRoutes(
+  worksheet: Worksheet, routes?: OfficeRoutes, googleSubstitutes = false,
+): void {
+  if (officeRoutesByWorksheet.get(worksheet) !== routes ||
+      googleSubstitutesByWorksheet.get(worksheet) !== googleSubstitutes) GridGeometry.invalidate(worksheet);
+  if (routes) officeRoutesByWorksheet.set(worksheet, routes);
+  else officeRoutesByWorksheet.delete(worksheet);
+  googleSubstitutesByWorksheet.set(worksheet, googleSubstitutes);
+  const fontSet = activeFontSet();
+  const regularAliases = googleSubstitutes
+    ? loadedGoogleRegularAliases(fontSet, XLSX_GOOGLE_FONTS) : new Map<string, string>();
+  regularAliasesByWorksheet.set(worksheet, regularAliases);
+  bindNormalFontState(worksheet, routes, fontSet, googleSubstitutes, undefined, regularAliases);
+}
+
+function officeRoute(
+  ctx: CanvasRenderingContext2D,
+  name: string | null | undefined,
+  bold = false,
+  italic = false,
+): import('@silurus/ooxml-core').OfficeFontFallbackRoute | undefined {
+  // A positively loaded exact local route must serve both the Normal-font
+  // digit measurement and matching cell paint. Restricting this lookup to
+  // Calibri let a non-Calibri Normal route narrow columns while its cells
+  // still painted with a wider CSS fallback.
+  const key = officeRequestKey({ family: name?.trim() || 'Calibri',
+    weight: bold ? 700 : 400, style: italic ? 'italic' : 'normal' });
+  return officeRoutesByContext.get(ctx)?.[key];
+}
+
+/** Keep a viewer-owned column metric after local font binding. The main realm
+ * owns hit testing; a worker may have a different FontFaceSet and must not
+ * silently replace the scalar while rendering the same worksheet. */
+export function pinXlsxGridGeometry(worksheet: Worksheet, mdw?: number): void {
+  if (mdw === undefined) return;
+  if (!Number.isFinite(mdw) || mdw <= 0) {
+    throw new Error('XLSX maximum digit width must be a finite positive number');
+  }
+  GridGeometry.forWorksheet(worksheet, mdw);
+}
 // Monospace counterpart: a monospaced cell font the host lacks degrades to a
 // monospace generic rather than the proportional sans default.
 const DEFAULT_MONO_FONT_FAMILY = `"Courier New", "Liberation Mono", monospace`;
 
 /**
  * CSS font-family TAIL (everything after the cell's named face) for an xlsx
- * cell. For a CJK cell font the matching Noto CJK leads (so shared Han glyphs
- * take the document language's shapes; see core/fonts/scripts.ts), followed by
- * the standard Latin/Arabic/non-CJK fallbacks. A non-CJK cell font picks the
- * default chain by its generic class ({@link classifyFontGeneric}) so a Latin
- * serif/mono face the host lacks degrades to the matching generic. Exported for
- * unit testing.
+ * cell. An unnamed cell keeps the workbook default chain. Named Calibri and
+ * Cambria get their corresponding web alias only with `useGoogleFonts`;
+ * other named faces use a fallback of the same generic class. For a CJK face the matching Noto CJK
+ * leads so shared Han glyphs take the document language's shapes; see
+ * core/fonts/scripts.ts. Exported for unit testing.
  */
-export function cssTailFor(name: string | null | undefined, fallback?: CjkLang): string {
-  const cjk = name ? classifyCjkFont(name) : null;
-  const generic = classifyFontGeneric(name); // 'serif' | 'sans' | 'mono'
-  if (!cjk) {
-    // Non-CJK (Latin) cell font: choose the default chain by generic class so a
-    // Latin serif/mono face the host lacks degrades to the matching generic
-    // (Excel renders serif/mono, not the sans default).
-    const base = generic === 'serif' ? DEFAULT_SERIF_FONT_FAMILY
-      : generic === 'mono' ? DEFAULT_MONO_FONT_FAMILY : DEFAULT_FONT_FAMILY;
-    if (!fallback) return base;
+export function cssTailFor(name: string | null | undefined, fallback?: CjkLang, googleSubstitutes = false, text = ''): string {
+  const authored = name?.trim() || null;
+  const cjk = authored ? classifyCjkFont(authored) : null;
+  const generic = classifyFontGeneric(authored); // 'serif' | 'sans' | 'mono'
+  const appendScriptFallbacks = (base: string, includeRegional = true): string => {
+    const families = [
+      ...(includeRegional && fallback
+        ? cjkFallbackChain(fallback, generic === 'serif' ? 'serif' : 'sans') : []),
+      ...(containsArabicFallbackText(text) ? arabicFallbackFamilies(generic === 'serif') : []),
+    ];
+    if (families.length === 0) return base;
     const split = base.lastIndexOf(',');
-    const families = cjkFallbackChain(fallback, generic === 'serif' ? 'serif' : 'sans');
-    return families.length === 0 ? base
-      : `${base.slice(0, split)}, ${families.map(n => `"${n}"`).join(', ')}${base.slice(split)}`;
+    return `${base.slice(0, split)}, ${families.map((family) => `"${family}"`).join(', ')}${base.slice(split)}`;
+  };
+  if (!cjk) {
+    // An explicit opt-in can use the legacy webfont substitute. Otherwise a
+    // missing authored Calibri face falls through to the same sans class.
+    const base = !authored ? (googleSubstitutes ? GOOGLE_DEFAULT_FONT_FAMILY : DEFAULT_FONT_FAMILY)
+      : authored.toLowerCase() === 'calibri' ? (googleSubstitutes ? CALIBRI_TAIL : NAMED_SANS_TAIL)
+      : authored.toLowerCase() === 'cambria' ? (googleSubstitutes ? CAMBRIA_TAIL : NAMED_SERIF_TAIL)
+      : generic === 'serif' ? NAMED_SERIF_TAIL
+      : generic === 'mono' ? DEFAULT_MONO_FONT_FAMILY : NAMED_SANS_TAIL;
+    return appendScriptFallbacks(base);
   }
   const serif = generic === 'serif';
-  const googleAlias = googleCjkFontAlias(name);
+  const googleAlias = googleCjkFontAlias(authored);
   const cjkFamilies = [
     ...(googleAlias ? [googleAlias] : []),
     ...cjkFallbackChain(cjk, serif ? 'serif' : 'sans')
@@ -129,10 +426,10 @@ export function cssTailFor(name: string | null | undefined, fallback?: CjkLang):
     .map((n) => `"${n}"`)
     .join(', ');
   const cjkPrefix = cjkPart ? `${cjkPart}, ` : '';
-  const tail = serif ? NON_CJK_SERIF_TAIL : NON_CJK_SANS_TAIL;
-  const genericKeyword = serif ? 'serif' : 'sans-serif';
-  // CJK Noto leads, then Latin/metric substitutes, Arabic, non-CJK scripts.
-  return `${cjkPrefix}"Calibri", "Carlito", "Cambria", "Caladea", Arial, "Noto Naskh Arabic", "Noto Sans Arabic", ${tail}, ${genericKeyword}`;
+  // CJK Noto leads for the authored region; if that face lacks a Latin glyph,
+  // use the matching generic Latin class without selecting an unrelated Office
+  // substitute. The named CJK face still leads the complete stack.
+  return appendScriptFallbacks(`${cjkPrefix}${serif ? NAMED_SERIF_TAIL : NAMED_SANS_TAIL}`, false);
 }
 
 /** Full CSS font-family list for a cell font name (named face first). The
@@ -142,20 +439,33 @@ export function fontStackFor(
   name: string | null | undefined,
   cjkFallback?: CjkLang,
   text = '',
+  route?: import('@silurus/ooxml-core').OfficeFontFallbackRoute,
+  googleSubstitutes = false,
+  fallbackAlias?: string,
+  regularAlias?: string,
 ): string {
   const normalized = name?.trim();
   const fallback = containsHanScript(text) ? cjkFallback : undefined;
-  return normalized ? `"${normalized}", ${cssTailFor(normalized, fallback)}` : cssTailFor(null, fallback);
+  const selected = route && (normalized?.toLocaleLowerCase('en-US') || 'calibri')
+    === route.requestedFamily.trim().toLocaleLowerCase('en-US') ? route : undefined;
+  const aliasPart = fallbackAlias && fallbackAlias.toLocaleLowerCase('en-US') !== normalized?.toLocaleLowerCase('en-US')
+    ? `${quoteCssFontFamily(fallbackAlias)}, ` : '';
+  const regularPart = regularAlias && regularAlias.toLocaleLowerCase('en-US') !== normalized?.toLocaleLowerCase('en-US')
+    ? `${quoteCssFontFamily(regularAlias)}, ` : '';
+  return selected
+    ? `${quoteCssFontFamily(selected.family)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}`
+    : normalized ? `${quoteCssFontFamily(normalized)}, ${aliasPart}${regularPart}${cssTailFor(normalized, fallback, googleSubstitutes, text)}` : cssTailFor(null, fallback, googleSubstitutes, text);
 }
 
 const DEFAULT_FONT_SIZE = 11;
-// Fallback Max Digit Width of the Normal-style font when the workbook's
-// default font isn't known. Calibri 11 pt at 96 DPI ≈ 8 px (Canvas2D
-// measurement), matching the EMU offsets Excel 365 writes into
-// <xdr:twoCellAnchor>. ECMA-376 §18.3.1.13 defines MDW as the maximum
-// rendered width among the digits 0-9 in the workbook's Normal-style font,
-// so the spec-correct value depends on which font and point size that style
-// resolves to (e.g. Meiryo UI 10 pt yields MDW ≈ 6 px).
+// Fallback Max Digit Width when the workbook's default font isn't known.
+// Calibri 11 pt at 96 DPI ≈ 8 px (Canvas2D measurement), matching the EMU
+// offsets Excel 365 writes into <xdr:twoCellAnchor>. ECMA-376 §18.3.1.13
+// defines MDW as the maximum rendered width among the digits 0-9 of the
+// workbook's default font; measured in Excel, that is `<fonts>[0]`, not the
+// Normal cell style's font (which only sets the automatic row-height
+// baseline). The value depends on that font and size (e.g. Meiryo UI 10 pt
+// yields MDW ≈ 6 px).
 export const HEADER_W = 50;
 export const HEADER_H = 22;
 
@@ -200,40 +510,84 @@ export function sheetAnchoredRectX(
 const FREEZE_LINE_COLOR = '#7a7a7a';
 
 /** Measure the Max Digit Width (ECMA-376 §18.3.1.13) for an arbitrary font
- *  using Canvas2D. The maximum of `measureText('0'..'9').width` is taken,
- *  rounded to the nearest pixel to match Excel's storage of integer pixel
- *  widths in `<col>` width values.
+ *  using Canvas2D. The maximum of `measureText('0'..'9').width` is taken.
+ *  Round to integer CSS pixels, using Windows Excel as the layout reference
+ *  independently of the viewer OS.
  *
- *  The value is deliberately measured from the current realm on each call.
- *  Font registration is lifecycle-managed and may change between workbooks;
- *  caching by family/size alone would retain fallback metrics after the real
- *  face loads or is released. */
-export function computeMdw(family: string, sizePt: number): number {
+ *  A bound worksheet caches the measured scalar for its current owner; each
+ *  rebind refreshes it after font preflight, without retaining that Canvas.
+ *  Direct calls measure afresh in the current realm. */
+export function computeMdw(
+  family: string, sizePt: number,
+  route?: import('@silurus/ooxml-core').OfficeFontFallbackRoute,
+  googleSubstitutes = false,
+  weight: 400 | 700 = 400,
+  style: 'normal' | 'italic' = 'normal',
+  ownerCtx?: CanvasRenderingContext2D,
+  regularAlias?: string,
+): number {
   const sizePx = sizePt * PT_TO_PX;
-  // Off-DOM canvas: avoids touching the document tree from background calls.
-  const canvas = (typeof OffscreenCanvas !== 'undefined')
+  // A viewer-owned context resolves CSS faces in its own Document (which may
+  // be a popup). Direct calls without an owner use an off-DOM canvas.
+  const canvas = ownerCtx ? null : (typeof OffscreenCanvas !== 'undefined')
     ? new OffscreenCanvas(1, 1)
     : (typeof document !== 'undefined' ? document.createElement('canvas') : null);
-  if (!canvas) return MDW_FALLBACK;
-  const ctx = canvas.getContext('2d');
+  const ctx = ownerCtx ?? canvas?.getContext('2d');
   if (!ctx) return MDW_FALLBACK;
   // Quote the family so multi-word names like "Meiryo UI" parse as one face.
-  ctx.font = `${sizePx}px ${fontStackFor(family)}`;
-  let mdw = 0;
-  for (const d of '0123456789') {
-    const w = ctx.measureText(d).width;
-    if (w > mdw) mdw = w;
+  const stylePrefix = weight !== 400 || style !== 'normal' ? `${style} ${weight} ` : '';
+  if (ownerCtx) ctx.save();
+  try {
+    ctx.font = `${stylePrefix}${sizePx}px ${fontStackFor(family, undefined, '', route, googleSubstitutes, undefined, regularAlias)}`;
+    let mdw = 0;
+    for (const d of '0123456789') {
+      const w = ctx.measureText(d).width;
+      if (w > mdw) mdw = w;
+    }
+    return quantizeMdw(mdw);
+  } finally {
+    // The caller may continue measuring or painting with this same context.
+    if (ownerCtx) ctx.restore();
   }
-  const out = Math.round(mdw) || MDW_FALLBACK;
-  return out;
 }
 
-/** Resolve the Max Digit Width for a worksheet's Normal-style font. Falls
- *  back to the Calibri 11 pt baseline (~8 px) when the parser couldn't
- *  determine the workbook's default font. */
-export function getMdwForWorksheet(ws: { defaultFontFamily?: string; defaultFontSize?: number }): number {
+function quantizeMdw(widthPx: number): number {
+  return Math.round(widthPx) || MDW_FALLBACK;
+}
+
+function hasDeclaredFamilyFace(family: string, fontSet: FontFaceSet | null): boolean {
+  if (!fontSet || typeof fontSet[Symbol.iterator] !== 'function') return false;
+  const requested = family.trim().toLocaleLowerCase('en-US');
+  for (const face of fontSet) {
+    if (face.family.trim().replace(/^(['"])(.*)\1$/u, '$2').toLocaleLowerCase('en-US') === requested) return true;
+  }
+  return false;
+}
+
+/** Resolve the Max Digit Width from the workbook's default font face
+ *  (`<fonts>[0]`, as Excel sizes columns). ECMA-376 §18.3.1.13 defines the
+ *  source digit metric; when that face is unavailable, its catalog hmtx digit
+ *  width cannot be used alongside a wider Canvas fallback without clipping
+ *  cell text. The retained
+ *  exact local/application face still wins when available. If the parser did
+ *  not identify a default font, use the conventional 8 px fallback. */
+export function getMdwForWorksheet(ws: Pick<Worksheet,
+  'defaultFontFamily' | 'defaultFontSize' | 'defaultFontBold' | 'defaultFontItalic'>): number {
   if (!ws.defaultFontFamily || !ws.defaultFontSize) return MDW_FALLBACK;
-  return computeMdw(ws.defaultFontFamily, ws.defaultFontSize);
+  const weight = ws.defaultFontBold ? 700 : 400;
+  const style = ws.defaultFontItalic ? 'italic' : 'normal';
+  const tupleKey = officeRequestKey({ family: ws.defaultFontFamily, weight, style });
+  const route = officeRoutesByWorksheet.get(ws as Worksheet)?.[tupleKey];
+  const boundFont = normalFontBindingByWorksheet.get(ws as Worksheet);
+  return boundFont?.canvasMdw ?? computeMdw(
+    ws.defaultFontFamily, ws.defaultFontSize,
+    route,
+    googleSubstitutesByWorksheet.get(ws as Worksheet) === true,
+    weight,
+    style,
+    undefined,
+    regularAliasesByWorksheet.get(ws as Worksheet)?.get(ws.defaultFontFamily.trim().toLocaleLowerCase('en-US')),
+  );
 }
 
 /** Worksheet-lifetime geometry snapshot. Font loading completes before a
@@ -436,7 +790,7 @@ function hatchPattern(
   const key = `${pt}|${fgHex}|${bgHex}|${sx}|${sy}`;
   if (PATTERN_CACHE.has(key)) return PATTERN_CACHE.get(key)!;
 
-  const rows = PATTERN_BITMAPS[pt];
+  const rows = ownValue(PATTERN_BITMAPS, pt);
   if (!rows) {
     PATTERN_CACHE.set(key, null);
     return null;
@@ -494,7 +848,7 @@ function hatchPattern(
  * the prior gate required a non-null fgColor.
  *
  * Returns true when the cell was painted so the caller can short-circuit
- * its tableStyle / banded fallbacks.
+ * the Table / PivotTable style fill beneath it.
  */
 function paintCellPatternFill(
   ctx: CanvasRenderingContext2D,
@@ -614,26 +968,152 @@ function blendHex(fgHex: string, bgHex: string, fgCoverage: number): string {
  *  offsets). Centralizes the `* cs` factor so a new vertical-metric draw site
  *  can't silently omit it. (Glyph SIZE uses buildFont's floored variant.)
  *
- *  `family` is passed ONLY at the single-line-height sites (factor 1.2) so the
- *  result is floored to the DOCUMENT font's design single-line height (ECMA-376
- *  §17.3.1.33, shared with docx/pptx via core's `intendedSingleLinePx`): Excel
- *  sizes single spacing as a flat 1.2×em, which understates a SUBSTITUTED
- *  Meiryo (1.596×em) / Sakkal Majalla (1.3965×em) line box and makes rows/lines
- *  too short. This is a FLOOR — `intendedSingleLinePx` returns 0 for every
- *  non-tabled family, so `max(base, 0) = base` leaves all other fonts on
- *  Excel's 1.2×em. Do NOT pass `family` at the base-size (no factor) or the 1.1
- *  super/sub sites — those must stay on the flat metric. */
-function vMetricPx(sizePt: number, cs: number, factor = 1, family?: string): number {
-  const base = Math.round(sizePt * PT_TO_PX * factor * cs);
-  if (!family) return base;
-  return Math.max(base, Math.round(intendedSingleLinePx(family, sizePt * PT_TO_PX * cs)));
+ *  An authored family name cannot establish the selected face's font tables.
+ *  Keep cell sizing independent of the former family-keyed correction table
+ *  until Excel resource identity and line allocation are established. */
+function vMetricPx(sizePt: number, cs: number, factor = 1): number {
+  return Math.round(sizePt * PT_TO_PX * factor * cs);
 }
 
-function buildFont(font: CellFont, cs = 1, cjkFallback?: CjkLang, text = ''): string {
+/** Excel for Mac 16.113.2 and Windows Excel 16.0.20430 (Japanese UI,
+ * with Japanese editing enabled on Windows) select the theme's Jpan face for
+ * the whole scheme-marked cell, including Latin glyphs. Controlled Excel PDFs
+ * covered minor/major, Calibri/Arial authored names, Latin/Japanese/mixed text,
+ * regular/bold/italic, Gothic/Mincho themes, absent Jpan, and absent scheme.
+ * Missing scheme or Jpan retained the authored name; major Light/Demibold
+ * retained their named weight even with bold. Italic retained the theme family.
+ *
+ * SpreadsheetML name/scheme (§18.8.29/§18.8.35) and DrawingML's supplemental
+ * font (CT_SupplementalFont) encode the choices, not Excel's UI/editing language.
+ * This is observed Office behavior, not a normative rule for every locale.
+ * Snapshot navigator.language starting with 'ja' when opening the workbook as
+ * the declared proxy on every OS. Layout and paint keep that choice until the
+ * workbook is re-opened, including sheets loaded later and worker projections.
+ * Non-Japanese Windows UI remains unverified. Keeping the authored name for
+ * non-ja viewers is library policy: default Office themes commonly include
+ * Jpan. The proxy cannot recover a producer's different UI/editing language
+ * from the workbook. */
+export function resolvedThemeCellFont(
+  font: Pick<CellFont, 'name' | 'scheme' | 'bold' | 'italic'>,
+  worksheet?: Pick<Worksheet, 'themeJapaneseMajorFont' | 'themeJapaneseMinorFont'>,
+): ResolvedThemeCellFont {
+  const fallback = { family: font.name, weight: font.bold ? 700 : 400 };
+  if (!usesJapaneseCellFonts(worksheet)) return fallback;
+  const themeFace = themeFaceForCellFont(font, worksheet);
+  if (!themeFace) return fallback;
+
+  // The pinned Office face catalog retains full/PostScript aliases. Keep the
+  // authored theme name first: an installed face must win. A catalog alias
+  // may follow for hosts that expose the same family under its PostScript
+  // base. Use this fixed catalog on every host; its source is not an OS gate.
+  // This is name-table metadata, not proof of the selected font bytes.
+  const profiles = findReferenceFontMetrics(themeFace, { source: 'office-mac' });
+  // Observed Japanese-UI Excel rule (not specified by CT_FontScheme): use
+  // the requested weight only if the theme name has that exact catalog face;
+  // otherwise retain its base weight. Regular families use 400; a name that
+  // identifies a single weight keeps that weight. Ambiguous names without a
+  // Regular face use CSS normal (400) as library policy; unknown names retain
+  // the authored bold request because the catalog supplies no face evidence.
+  // Weight selection is independent of italic availability: these controls
+  // have no italic faces, but italic cells still retain the selected weight.
+  const weights = new Set(profiles.map((profile) => profile.weight));
+  const baseWeight = weights.size === 1 ? profiles[0].weight : 400;
+  const weight = !profiles.length || weights.has(fallback.weight)
+    ? fallback.weight : baseWeight;
+  const weightMatches = profiles.filter((profile) => profile.weight === weight);
+  const styleMatches = weightMatches.filter((profile) => profile.style === (font.italic ? 'italic' : 'normal'));
+  const matches = styleMatches.length ? styleMatches : weightMatches;
+  // Office-produced controls covered Calibri/Arial, Latin/Japanese/mixed text:
+  // minor Gothic bold selects its 700 face; major Gothic Light, minor Mincho
+  // Regular, and major Mincho Demibold keep 300/400/600. PDF text mode 2 adds
+  // fill+stroke for bold Light and minor Mincho, but not Demibold or real
+  // Bold. Limit synthesis to catalog-proven Light/Regular weights (300/400);
+  // unknown faces keep the browser's bold request. Other retained weights are
+  // unverified. Do not request 700 to imitate the stroke: CSS may change face.
+  const postScriptBases = new Set(matches.flatMap((profile) => profile.aliases)
+    .filter((alias) => /-(?:Regular|Bold|Italic|BoldItalic|Light|Medium)$/i.test(alias))
+    .map((alias) => alias.replace(/-(?:Regular|Bold|Italic|BoldItalic|Light|Medium)$/i, '')));
+  const catalogFamilies = new Set(matches.map((profile) => profile.family));
+  const alias = postScriptBases.size === 1 ? [...postScriptBases][0]
+    : catalogFamilies.size === 1 ? [...catalogFamilies][0] : undefined;
+  return {
+    family: themeFace,
+    weight,
+    ...(font.bold && (weight === 300 || weight === 400) && profiles.length
+      ? { syntheticBold: true as const } : {}),
+    ...(alias && alias.toLocaleLowerCase('en-US') !== themeFace.toLocaleLowerCase('en-US')
+      ? { fallbackAlias: alias } : {}),
+  };
+}
+
+function themeFaceForCellFont(
+  font: Pick<CellFont, 'scheme'>,
+  worksheet?: Pick<Worksheet, 'themeJapaneseMajorFont' | 'themeJapaneseMinorFont'>,
+): string | undefined {
+  return font.scheme === 'major' ? worksheet?.themeJapaneseMajorFont
+    : font.scheme === 'minor' ? worksheet?.themeJapaneseMinorFont : undefined;
+}
+
+function cachedThemeCellFont(font: CellFont, state?: ThemeCellFontState): ResolvedThemeCellFont {
+  const themeFace = state?.japanese && themeFaceForCellFont(font, state);
+  if (!state || !themeFace) return { family: font.name, weight: font.bold ? 700 : 400 };
+  // Two theme faces × four requested bold/italic combinations. Neither the
+  // cached values nor the state contain a reference back to the worksheet.
+  const key = `${font.scheme}:${font.bold ? 1 : 0}:${font.italic ? 1 : 0}`;
+  let selected = state.cache.get(key);
+  if (!selected) {
+    selected = resolvedThemeCellFont(font, state);
+    if (state.cache.size < 8) state.cache.set(key, selected);
+  }
+  return selected;
+}
+
+/** Observed Japanese-UI Excel synthetic bold, separate from face selection.
+ * Windows Excel 16.0.20430 PDF controls (Calibri/Arial authored names,
+ * Latin/Japanese/mixed text) use 2 Tr and 0.31543 w at 11.04 pt for the retained
+ * Light/Regular faces: stroke width = em / 35, independent of font name.
+ * Demibold and real Bold are fill-only counterexamples. This is compatibility
+ * paint, not a stroke prescribed by SpreadsheetML §18.8.2 b.
+ *
+ * These PDFs also have glyph-dependent TJ advance differences: Light Latin
+ * deltas 0.002–0.011 em, Mincho mostly zero except b/space (~0.01 em), and CJK
+ * zero. They do not establish a common tracking/advance rule. Retain Canvas
+ * shaping rather than applying uniform spacing that would alter CJK and the
+ * unchanged Latin advances. Exact Excel synthetic advance metrics remain
+ * unsupported until a resource-based rule is established.
+ */
+function paintCellText(
+  ctx: CanvasRenderingContext2D, text: string, x: number, y: number,
+  font: CellFont, cs = 1,
+): void {
+  ctx.fillText(text, x, y);
+  if (!font.bold) return;
+  const state = themeCellFontByContext.get(ctx);
+  if (!state?.japanese || !cachedThemeCellFont(font, state).syntheticBold) return;
+  ctx.save();
+  ctx.strokeStyle = ctx.fillStyle;
+  ctx.lineWidth = Math.max(1, Math.round(font.size * PT_TO_PX * cs)) / 35;
+  // Borders/decorations may have left a dash or join on the context; PDF text
+  // mode 2 uses a solid stroke with the default PDF join/miter settings.
+  ctx.setLineDash([]);
+  ctx.lineJoin = 'miter';
+  ctx.miterLimit = 10;
+  ctx.strokeText(text, x, y);
+  ctx.restore();
+}
+
+function buildFont(ctx: CanvasRenderingContext2D, font: CellFont, cs = 1, cjkFallback?: CjkLang, text = ''): string {
   const style = font.italic ? 'italic ' : '';
-  const weight = font.bold ? 'bold ' : '';
   const sizePx = Math.max(1, Math.round(font.size * PT_TO_PX * cs));
-  return `${style}${weight}${sizePx}px ${fontStackFor(font.name, cjkFallback, text)}`;
+  const selected = cachedThemeCellFont(font, themeCellFontByContext.get(ctx));
+  const weight = selected.weight === 400 ? '' : `${selected.weight} `;
+  return `${style}${weight}${sizePx}px ${fontStackFor(
+    selected.family, cjkFallback, text,
+    officeRoute(ctx, selected.family, font.bold, font.italic),
+    googleSubstitutesByContext.get(ctx) === true,
+    selected.fallbackAlias,
+    contextRegularAlias(ctx, selected.family),
+  )}`;
 }
 
 /**
@@ -674,7 +1154,7 @@ export function drawPhoneticBand(
   const alignment: PhoneticAlignment = pr?.alignment ?? 'left';
 
   ctx.save();
-  ctx.font = buildFont(phFont, cs, cjkFallback, runs.map((run) => run.text).join(''));
+  ctx.font = buildFont(ctx, phFont, cs, cjkFallback, runs.map((run) => run.text).join(''));
   ctx.textBaseline = 'top';
   ctx.textAlign = 'left';
   ctx.fillStyle = color;
@@ -688,7 +1168,7 @@ export function drawPhoneticBand(
     // width, in run order. Measured with the reading font already active.
     let cursor = baseLeftX;
     for (const run of runs) {
-      ctx.fillText(run.text, cursor, y);
+      paintCellText(ctx, run.text, cursor, y, phFont, cs);
       cursor += ctx.measureText(run.text).width;
     }
     ctx.restore();
@@ -710,14 +1190,14 @@ export function drawPhoneticBand(
       // left edge and the last the right edge of the base span.
       const extra = (p.width - naturalW) / (cps.length - 1);
       try { (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = `${extra}px`; } catch { /* ignore */ }
-      ctx.fillText(p.text, p.x, y);
+      paintCellText(ctx, p.text, p.x, y, phFont, cs);
       try { (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = '0px'; } catch { /* ignore */ }
     } else if (p.spread === 'center') {
       // §18.18.56 center: centre the natural reading width over the base span.
-      ctx.fillText(p.text, p.x + (p.width - naturalW) / 2, y);
+      paintCellText(ctx, p.text, p.x + (p.width - naturalW) / 2, y, phFont, cs);
     } else {
       // §18.18.56 left: left-justified at the base span's left edge.
-      ctx.fillText(p.text, p.x, y);
+      paintCellText(ctx, p.text, p.x, y, phFont, cs);
     }
   }
   ctx.restore();
@@ -768,8 +1248,10 @@ function drawTextDecoLine(
 /**
  * Resolve a Run's font against a base Font. Per ECMA-376, a run's <rPr>
  * completely specifies bold/italic/underline/strike for that run, while
- * size/color/name fall back to the base when omitted. A run with no
- * <rPr> (run.font undefined) inherits the base entirely.
+ * size/name fall back to the base when omitted. A run with no <rPr>
+ * (run.font undefined) inherits the base entirely. An <rPr> without a
+ * <color> is automatic (black) rather than the cell's color: Excel draws
+ * such a run black even in a red cell.
  */
 function applyRunFont(base: CellFont, run: Run): CellFont {
   const rf = run.font;
@@ -781,7 +1263,7 @@ function applyRunFont(base: CellFont, run: Run): CellFont {
     underlineStyle: rf.underlineStyle,
     strike: rf.strike,
     size: rf.size ?? base.size,
-    color: rf.color ?? base.color,
+    color: rf.color ?? null,
     name: rf.name ?? base.name,
     vertAlign: rf.vertAlign,
   };
@@ -814,230 +1296,32 @@ function effectiveCellStyleIndex(
   return cell?.styleIndex ?? columnStyleIndex(worksheet, col);
 }
 
-function wrapTextLines(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+function wrapTextLines(
+  ctx: CanvasRenderingContext2D, text: string, maxWidth: number,
+  measureWidth?: (value: string) => number,
+): string[] {
   const lines: string[] = [];
   // Hard line breaks (\n from Alt+Enter) always split regardless of wrapText.
   for (const paragraph of text.split('\n')) {
-    lines.push(...wrapParagraphLines(ctx, paragraph, maxWidth));
+    lines.push(...wrapParagraphLines(ctx, paragraph, maxWidth, measureWidth));
   }
   return lines;
 }
 
-/**
- * Apply Japanese line-breaking (kinsoku, 禁則処理) at a wrap boundary.
- *
- * When the wrapper decides to break, it has the code points already committed
- * to the line being closed (`lineCps`) and the code points that will lead the
- * next line (`nextCps`, the overflowing token). Excel — like Word and
- * PowerPoint — forbids a wrapped line from STARTING with a 行頭禁則 char
- * (、。」）…) or ENDING with a 行末禁則 char (「（…), per ECMA-376
- * §17.15.1.58–.60. We delegate the retraction to the shared core engine
- * `kinsokuAdjustedSplit`, which pulls the offending boundary's preceding code
- * point(s) down onto the next line (追い出し).
- *
- * Returns the number of trailing code points of `lineCps` that must move down
- * to lead the next line (ahead of `nextCps`). `0` means the greedy break was
- * already legal — so plain CJK with no forbidden chars at the boundary is
- * unchanged (no regression). `minSplit = 1` keeps ≥1 code point on the closed
- * line; an all-forbidden run falls back to no retraction (never empties a line,
- * never hangs).
- */
-function kinsokuRetractCount(lineCps: string[], nextCps: string[]): number {
-  if (lineCps.length === 0 || nextCps.length === 0) return 0;
-  const combined = [...lineCps, ...nextCps];
-  const splitAt = lineCps.length;
-  const adj = kinsokuAdjustedSplit(combined, splitAt, DEFAULT_KINSOKU_RULES, 1);
-  return splitAt - adj;
+/** SpreadsheetML `wrapText` uses the shared cell host hook. It retains cell
+ * overflow and terminal-space policy; DrawingML text boxes use the distinct
+ * `a:txBody` break phase below in `drawShapeText`. */
+export function wrapParagraphLines(
+  ctx: CanvasRenderingContext2D, paragraph: string, maxWidth: number,
+  measureWidth: (value: string) => number = (value) => ctx.measureText(value).width,
+): string[] {
+  return wrapSpreadsheetCellParagraph(paragraph, maxWidth, measureWidth);
 }
 
-/**
- * Extend a per-code-point kinsoku retract so it never TEARS a Latin word.
- *
- * `kinsokuRetractCount` retracts glyph-by-glyph — correct for CJK, where every
- * character is a break opportunity, but wrong for Latin: a non-starter (comma,
- * period, …, UAX#14 LB13) overflowing after "system" retracts a single "m" →
- * "syste" / "m,". Latin has no mid-word break opportunity, so when the retract
- * boundary sits between two {@link isLatinWordCodePoint} characters, pull it back
- * to the last whitespace (the real break) so the WHOLE word moves down ahead of
- * the non-starter. If the line is one unbroken word (no whitespace to retract
- * to), keep the original retract rather than empty the line — an over-long
- * single word is handled by the normal overflow path. NOTE: the retract is still
- * capped at the last segment by the caller, so a word split across runs by a
- * formatting change splits at that seam (the comma stays glued to the tail).
- */
-function extendLatinWordRetract(lineCps: string[], retract: number): number {
-  let r = retract;
-  while (r < lineCps.length) {
-    const keep = lineCps[lineCps.length - r - 1]; // last char staying on the line
-    const move = lineCps[lineCps.length - r];     // first char moving down
-    const keepCp = keep?.codePointAt(0);
-    const moveCp = move?.codePointAt(0);
-    if (keepCp !== undefined && moveCp !== undefined
-        && isLatinWordCodePoint(keepCp) && isLatinWordCodePoint(moveCp)) r++;
-    else break;
-  }
-  return r >= lineCps.length ? retract : r;
-}
+type RichSeg = SpreadsheetCellRichSeg<CellFont>;
+type RichLine = SpreadsheetCellRichLine<CellFont>;
 
-/**
- * Return the supported UAX #14 no-break suffix of the current line that must
- * move before `nextCps`. The predicate is deliberately one-way: walking stops
- * on false even when a deferred rule might also prohibit that earlier boundary.
- * Returning zero for a whole-line sequence preserves the existing emergency
- * overflow behavior and avoids emitting an empty soft-wrapped line.
- */
-function uaxNoBreakRetractCount(lineCps: string[], nextCps: string[]): number {
-  if (lineCps.length === 0 || nextCps.length === 0) return 0;
-  const nextCp = nextCps[0].codePointAt(0);
-  let firstMoved = lineCps.length - 1;
-  const lastCp = lineCps[firstMoved].codePointAt(0);
-  if (
-    lastCp === undefined ||
-    nextCp === undefined ||
-    lastCp === 0x200b ||
-    nextCp === 0x200b ||
-    !isUax14NoBreakPair(lastCp, nextCp)
-  ) return 0;
-
-  while (firstMoved > 0) {
-    const prevCp = lineCps[firstMoved - 1].codePointAt(0);
-    const movedCp = lineCps[firstMoved].codePointAt(0);
-    if (
-      prevCp === undefined ||
-      movedCp === undefined ||
-      !isUax14NoBreakPair(prevCp, movedCp)
-    ) break;
-    firstMoved--;
-  }
-
-  return firstMoved === 0 ? 0 : lineCps.length - firstMoved;
-}
-
-/** Word-wrap a single paragraph (no embedded \n). Unlike a naive
- *  `split(' ')`, CJK characters are treated as individual break opportunities
- *  so that Japanese headings like "夏休みアクティビティ カレンダー 2026"
- *  actually wrap inside a merged cell. ECMA-376 doesn't spec the break
- *  algorithm but this matches what Excel renders on the same input.
- *
- *  At each break we additionally apply kinsoku (`kinsokuRetractCount`) so a
- *  wrapped line never starts with 、。」 or ends with 「（ (ECMA-376
- *  §17.15.1.58–.60), matching Excel's East-Asian wrapping. */
-export function wrapParagraphLines(ctx: CanvasRenderingContext2D, paragraph: string, maxWidth: number): string[] {
-  const lines: string[] = [];
-  // Tokenise: runs of non-space non-CJK, single ASCII-space runs, individual
-  // CJK characters. Then greedy-fit each token onto the current line.
-  const tokens: string[] = [];
-  let i = 0;
-  while (i < paragraph.length) {
-    const ch = paragraph[i];
-    const cp = ch.codePointAt(0) ?? 0;
-    if (isCjkBreakChar(cp)) {
-      tokens.push(ch);
-      i += cp > 0xFFFF ? 2 : 1;
-    } else if (ch === ' ') {
-      let j = i;
-      while (j < paragraph.length && paragraph[j] === ' ') j++;
-      tokens.push(paragraph.slice(i, j));
-      i = j;
-    } else {
-      let j = i;
-      while (j < paragraph.length) {
-        const c = paragraph[j];
-        const p = c.codePointAt(0) ?? 0;
-        if (c === ' ' || isCjkBreakChar(p)) break;
-        j += p > 0xFFFF ? 2 : 1;
-      }
-      const word = paragraph.slice(i, j);
-      // SEA (Thai/Lao/Khmer) dictionary breaking (issue #797): these scripts have
-      // no inter-word spaces, so this whole word-run is one token. Split it at
-      // segmenter word boundaries into sub-word tokens so the greedy fitter below
-      // wraps it at legal points. Wrapped lines re-concatenate into one drawn
-      // string, so this only ADDS break opportunities (measure==paint). Non-SEA
-      // words and SEA words with no usable break stay a single token.
-      // Issue #797 / #960 — dictionary word boundaries UNIONED with the no-space
-      // SEA↔non-SEA script transitions (Thai↔Latin/digit), so a price like
-      // "…1250…" or an embedded Latin word can wrap away from the surrounding
-      // Thai. CJK is already its own token here (split above), so the mixed CJK
-      // path is not needed.
-      const seaBreaks = containsSeaScript(word) ? seaMixedBreakOffsets(word) : null;
-      if (seaBreaks && seaBreaks.length > 0) {
-        let s = 0;
-        for (const b of seaBreaks) { tokens.push(word.slice(s, b)); s = b; }
-        tokens.push(word.slice(s));
-      } else {
-        tokens.push(word);
-      }
-      i = j;
-    }
-  }
-  let current = '';
-  for (const tok of tokens) {
-    if (current === '') { current = tok; continue; }
-    const candidate = current + tok;
-    if (ctx.measureText(candidate).width <= maxWidth) {
-      current = candidate;
-    } else {
-      // Token doesn't fit at the end of the current line — break here.
-      // Leading spaces at the start of the next line are dropped (matches
-      // Excel: wrapped-continuation lines don't preserve the space that
-      // caused the break).
-      let nextLead = tok.replace(/^ +/, '');
-      if (nextLead === '') nextLead = tok; // all-space token (preserve width on its own line)
-      // Apply kinsoku at the boundary: retract trailing code points of the
-      // line being closed so it does not end with a 行末禁則 char and the
-      // next line does not start with a 行頭禁則 char.
-      const lineCps = [...current];
-      const retract = kinsokuRetractCount(lineCps, [...nextLead]);
-      if (retract > 0) {
-        const keep = lineCps.length - retract;
-        lines.push(lineCps.slice(0, keep).join(''));
-        current = lineCps.slice(keep).join('') + nextLead;
-      } else {
-        lines.push(current);
-        current = nextLead;
-      }
-    }
-  }
-  lines.push(current);
-  return lines;
-}
-
-interface RichSeg {
-  text: string;
-  font: CellFont;
-  width: number; // px
-}
-
-interface RichLine {
-  segments: RichSeg[];
-  maxFontSize: number; // pt (line-height source)
-  /** Font family (name) of the run that set `maxFontSize` — the height source
-   *  run — so the wrap draw path can floor the single-line height to that
-   *  DOCUMENT font's design line box (Meiryo / Sakkal Majalla) via core's
-   *  `intendedSingleLinePx`. `null` when the height run named no family. */
-  maxFontFamily: string | null;
-  /** 0-based index of the LF-delimited paragraph (hard-break region) this line
-   *  belongs to. Soft-wrapped continuation lines share their paragraph's index;
-   *  it advances only at a hard break. Indexes the per-paragraph bidi base
-   *  direction the wrap draw path resolves — UAX#9: a soft wrap does NOT start a
-   *  new paragraph, but a hard break does. */
-  para: number;
-}
-
-/**
- * Layout rich text runs into wrapped lines. Each run is split into words (and
- * CJK characters for granular wrapping). Per-run font is preserved so measurement
- * and drawing use the correct font.
- *
- * Runs are inline and share the cell width (ECMA-376 §18.4.4 r / §18.4.8 si /
- * §18.4.9 sst); wrapText (§18.8.1) breaks at word boundaries (ASCII spaces) and
- * at any CJK code point boundary, and a hard break (LF) starts a new line.
- *
- * An empty value returns `[]` (no fabricated line). This deliberately differs
- * from the plain-text `wrapTextLines`, whose `split('\n')` yields `['']`: an
- * empty cell has no glyphs, so reserving a line for it would only mis-anchor the
- * (non-existent) text.
- */
+/** Font-resolving adapter for SpreadsheetML rich shared-string lines. */
 export function layoutRichTextLines(
   ctx: CanvasRenderingContext2D,
   runs: Run[],
@@ -1046,199 +1330,22 @@ export function layoutRichTextLines(
   maxWidth: number,
   cjkFallback?: CjkLang,
 ): RichLine[] {
-  const lines: RichLine[] = [];
-  let cur: RichSeg[] = [];
-  let curW = 0;
-  let curMaxSize = 0;
-  // Family of the run that currently sets `curMaxSize` on this line — carried so
-  // the line-height floor targets the height run's DOCUMENT font.
-  let curMaxFamily: string | null = null;
-  // Size (pt) of the nearest preceding text run — the height source for a blank
-  // line, which has no segment of its own. Mirrors drawShapeText's `lastTextPt`
-  // seed (PR #583); falls back to the cell's base font.
-  let lastTextPt = baseFont.size;
-  // Family paired with `lastTextPt`, so a blank line inherits the nearest
-  // preceding text run's family for its own single-line-height floor.
-  let lastTextFamily: string | null = baseFont.name;
-  // 0-based index of the current LF-delimited paragraph. Advances only at a hard
-  // break (not at a soft wrap), so every line records which paragraph it belongs
-  // to — the wrap draw path resolves a Context base direction per paragraph.
-  let paraIdx = 0;
+  return layoutSpreadsheetCellRichLines(
+    ctx, runs, baseFont, maxWidth, applyRunFont,
+    (font, text) => {
+      ctx.font = buildFont(ctx, vertAlignDrawFont(font), cs, cjkFallback, text);
+    },
+    DEFAULT_FONT_SIZE,
+  );
+}
 
-  // `flush` drops an empty region — used at soft-wrap (kinsoku) breaks, where a
-  // line carried wholly to the next line must not leave a blank behind.
-  const flush = () => {
-    if (cur.length === 0) return;
-    lines.push({ segments: cur, maxFontSize: curMaxSize, maxFontFamily: curMaxFamily, para: paraIdx });
-    cur = []; curW = 0; curMaxSize = 0; curMaxFamily = null;
-  };
-
-  // `flushRegion` emits an empty region as a blank line — used at a hard break
-  // (LF) or end-of-value. ECMA-376 §18.8.1 (wrapText): each line of a multi-line
-  // cell, including a blank one from consecutive / leading / trailing breaks,
-  // reserves one single-line height (the cell analog of PR #583 / docx #582).
-  const flushRegion = () => {
-    if (cur.length === 0) {
-      lines.push({ segments: [], maxFontSize: lastTextPt || DEFAULT_FONT_SIZE, maxFontFamily: lastTextFamily, para: paraIdx });
-      return;
-    }
-    flush();
-  };
-
-  const push = (text: string, font: CellFont) => {
-    if (!text) return;
-    lastTextPt = font.size; // nearest preceding text size, for the next blank line
-    lastTextFamily = font.name;
-    // Measure at the *draw* font so a super/subscript token reserves its reduced
-    // (~65%) glyph width; the segment keeps the run's full size for line height.
-    ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, text);
-    const w = ctx.measureText(text).width;
-    if (cur.length > 0 && curW + w > maxWidth) {
-      // Kinsoku at the wrap boundary (ECMA-376 §17.15.1.58–.60): retract
-      // trailing code points of the line being closed so it does not end with
-      // a 行末禁則 char and the next line (led by `text`) does not start with a
-      // 行頭禁則 char. The retracted code points live at the end of the last
-      // segment — split that segment (keeping its font), re-measure both parts
-      // with the segment's font, and carry the trailing part down to lead the
-      // next line.
-      const lineCps = cur.flatMap((s) => [...s.text]);
-      let retract = kinsokuRetractCount(lineCps, [...text]);
-      // UAX#14 LB13: a per-glyph retract would tear a Latin word (e.g. a comma in
-      // a separate run overflowing after "system" → "syste" / "m,"). Pull the
-      // retract back to the last whitespace so the whole word rides down with the
-      // non-starter; CJK boundaries (move char is CJK) are left untouched.
-      if (retract > 0) {
-        retract = extendLatinWordRetract(lineCps, retract);
-      } else if (
-        // SEA (Thai/Lao/Khmer) dictionary tailoring wins over the LB1 SA→AL
-        // default on BOTH sides: guard the incoming `text` AND the last segment
-        // that would be retracted, so the UAX #14 pair predicate never
-        // suppresses a SEA word boundary (mirror the DOCX buildSegments
-        // prev/cur guard). Retraction is capped to the last segment below, so
-        // checking it is the precise preceding-side test.
-        !containsSeaScript(text) &&
-        !containsSeaScript(cur[cur.length - 1]?.text ?? '') &&
-        !/^\s/u.test(text) &&
-        !/\s$/u.test(lineCps.at(-1) ?? '')
-      ) {
-        retract = uaxNoBreakRetractCount(lineCps, [...text]);
-      }
-      const last = cur[cur.length - 1];
-      const lastCps = [...last.text];
-      // Only retract within the last segment to preserve each run's font; the
-      // single-run CJK case (one segment per line region) is fully covered.
-      if (retract > lastCps.length) retract = lastCps.length;
-      let carry: RichSeg | null = null;
-      if (retract > 0) {
-        const keepCps = lastCps.slice(0, lastCps.length - retract);
-        const moveCps = lastCps.slice(lastCps.length - retract);
-        if (keepCps.length === 0) {
-          // The whole last segment moves down — drop it from the closing line.
-          cur.pop();
-        } else {
-          const keepText = keepCps.join('');
-          ctx.font = buildFont(vertAlignDrawFont(last.font), cs, cjkFallback, keepText);
-          last.text = keepText;
-          last.width = ctx.measureText(keepText).width;
-        }
-        const moveText = moveCps.join('');
-        ctx.font = buildFont(vertAlignDrawFont(last.font), cs, cjkFallback, moveText);
-        carry = { text: moveText, font: last.font, width: ctx.measureText(moveText).width };
-      }
-      flush();
-      if (carry) {
-        cur.push(carry);
-        curW += carry.width;
-        if (carry.font.size > curMaxSize) { curMaxSize = carry.font.size; curMaxFamily = carry.font.name; }
-      }
-      ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, text); // restore for the incoming token below
-    }
-    cur.push({ text, font, width: w });
-    curW += w;
-    if (font.size > curMaxSize) { curMaxSize = font.size; curMaxFamily = font.name; }
-  };
-
-  // Issue #797 — push a SEA (Thai/Lao/Khmer) token, breaking it at segmenter word
-  // boundaries. Unlike the plain `wrapParagraphLines`, the rich draw path paints
-  // every segment separately, so each fitted line-piece is pushed as ONE
-  // contiguous string (via `push`) to keep measure==paint. A single word wider
-  // than the cell falls back to a grapheme-safe emergency split.
-  const pushSeaToken = (text: string, font: CellFont): void => {
-    // #797 dictionary boundaries ∪ #960 SEA↔non-SEA transitions (CJK is a
-    // separate token in this path, so no mixed-CJK offsets are needed here).
-    const seaBreaks = seaMixedBreakOffsets(text);
-    if (seaBreaks.length === 0) { push(text, font); return; }
-    ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, text);
-    const measureSub = (sub: string): number => ctx.measureText(sub).width;
-    // Grapheme-fill runs (Myanmar/Tibetan, #961) have dense per-cluster offsets:
-    // O(log n) monotone binary-search fit. Dictionary runs keep the full scan.
-    const monotone = isGraphemeFillText(text);
-    const N = text.length;
-    let start = 0;
-    while (start < N) {
-      const avail = maxWidth - curW;
-      let end = fitSeaWordPrefix(text, seaBreaks, start, avail, measureSub, monotone);
-      if (end <= start) {
-        if (curW > 0) { flush(); continue; } // wrap first, retry on an empty line
-        const firstWordEnd = seaBreaks.find((b) => b > start) ?? N;
-        const firstWord = text.slice(start, firstWordEnd);
-        const graphemes = graphemeClusterOffsets(firstWord);
-        let g = fitSeaWordPrefix(firstWord, graphemes, 0, avail, measureSub, monotone);
-        if (g <= 0) g = graphemes.length > 0 ? graphemes[0] : firstWord.length;
-        end = start + g;
-      }
-      push(text.slice(start, end), font); // the piece fits → append (no re-split)
-      start = end;
-      if (start < N) flush();
-    }
-  };
-
-  for (const run of runs) {
-    const font = applyRunFont(baseFont, run);
-    // Tokenize: runs of non-space latin, spaces, or individual CJK chars
-    const tokens: string[] = [];
-    let i = 0;
-    while (i < run.text.length) {
-      const ch = run.text[i];
-      const cp = ch.codePointAt(0) ?? 0;
-      if (cp === 0x000A) {
-        // Explicit newline: force break
-        tokens.push('\n'); i += 1;
-      } else if (isCjkBreakChar(cp)) {
-        tokens.push(ch);
-        i += cp > 0xFFFF ? 2 : 1;
-      } else if (ch === ' ') {
-        let j = i;
-        while (j < run.text.length && run.text[j] === ' ') j++;
-        tokens.push(run.text.slice(i, j));
-        i = j;
-      } else {
-        let j = i;
-        while (j < run.text.length) {
-          const c = run.text[j];
-          const p = c.codePointAt(0) ?? 0;
-          if (c === ' ' || c === '\n' || isCjkBreakChar(p)) break;
-          j += p > 0xFFFF ? 2 : 1;
-        }
-        tokens.push(run.text.slice(i, j));
-        i = j;
-      }
-    }
-    for (const tok of tokens) {
-      // A hard break closes the current paragraph region and opens the next, so
-      // the following lines record the new paragraph index. A soft wrap (handled
-      // inside `push`) keeps the same index — UAX#9 P1: only a hard break starts
-      // a new bidi paragraph.
-      if (tok === '\n') { flushRegion(); paraIdx++; }
-      else if (containsSeaScript(tok)) pushSeaToken(tok, font);
-      else push(tok, font);
-    }
-  }
-  // Trailing region. If the value ended with a break, `cur` is empty but a line
-  // was already produced, so a trailing blank line is reserved; a value with no
-  // content and no breaks (no segments, no prior line) produces nothing.
-  if (cur.length > 0 || lines.length > 0) flushRegion();
-  return lines;
+/** ECMA-376 §18.18.40 `general` horizontal alignment: text is left-aligned,
+ *  numbers (including dates and times) right-aligned, and booleans centered.
+ *  Parsers represent `general` as an absent `alignH`. */
+export function generalHorizontalAlignment(type: CellValue['type']): 'left' | 'right' | 'center' {
+  if (type === 'number') return 'right';
+  if (type === 'bool') return 'center';
+  return 'left';
 }
 
 /** Cell geometry + alignment shared by the rich-text draw helpers (wrap and
@@ -1265,7 +1372,14 @@ export interface RichCellGeom {
  *  the underline sits a full text height below it and the strike near mid-height;
  *  `'middle'` / `'bottom'` shift relative to the centre / bottom baseline. The
  *  caller adds any super/subscript `yShift`. One function so the single-line and
- *  multi-line paths place decorations identically. */
+ *  multi-line paths place decorations identically.
+ *
+ *  The 0.55 / 0.35 / 0.5 font-size fractions (repeated by the single-run cell
+ *  path in renderQuadrant) are library policy dating from the initial xlsx
+ *  underline/strike support: SpreadsheetML `<u>` / `<strike>` (§18.4.13 /
+ *  §18.4.10) give no geometry, no Excel measurement is recorded, and the font
+ *  rule (OpenType post.underlinePosition / OS/2.yStrikeoutPosition) is not in
+ *  the reference-font-metrics table. */
 function decoYForBaseline(baseline: CanvasTextBaseline, textY: number, rSizePx: number): { underline: number; strike: number } {
   if (baseline === 'middle') return { underline: textY + Math.round(rSizePx * 0.55), strike: textY };
   if (baseline === 'bottom') return { underline: textY + 1, strike: textY - Math.round(rSizePx * 0.35) };
@@ -1329,7 +1443,7 @@ export function drawResolvedRichLine(
     if (vis) { try { dctx.direction = vis.rtl[i] ? 'rtl' : 'ltr'; } catch { /* ignore */ } }
     const seg = segs[i];
     const drawFont = vertAlignDrawFont(seg.font);
-    ctx.font = buildFont(drawFont, cs, cjkFallback, seg.text);
+    ctx.font = buildFont(ctx, drawFont, cs, cjkFallback, seg.text);
     const segColor = opts.fontColor ?? seg.font.color;
     ctx.fillStyle = segColor ? hexToRgba(segColor) : '#000000';
     // Baseline shift for super/subscript, relative to the run's *base* size: up
@@ -1338,7 +1452,7 @@ export function drawResolvedRichLine(
     let yShift = 0;
     if (seg.font.vertAlign === 'superscript') yShift = -Math.round(baseSizePx * 0.35);
     else if (seg.font.vertAlign === 'subscript') yShift = Math.round(baseSizePx * 0.10);
-    ctx.fillText(seg.text, x, textY + yShift);
+    paintCellText(ctx, seg.text, x, textY + yShift, drawFont, cs);
     const rSizePx = vMetricPx(drawFont.size, cs);
     if (seg.font.underline || seg.font.strike) {
       const deco = decoYForBaseline(baseline, textY, rSizePx);
@@ -1408,7 +1522,7 @@ function drawRichLine(
 ): void {
   const segs: RichSeg[] = lineRuns.map((r) => {
     const font = applyRunFont(baseFont, r);
-    ctx.font = buildFont(vertAlignDrawFont(font), cs, cjkFallback, r.text);
+    ctx.font = buildFont(ctx, vertAlignDrawFont(font), cs, cjkFallback, r.text);
     return { text: r.text, font, width: ctx.measureText(r.text).width };
   });
   drawRichSegments(ctx, segs, geom, cs, dpr, opts, textY, baseline, cjkFallback);
@@ -1471,6 +1585,31 @@ function drawMultiLineRichText(
   }
 }
 
+/** Invalid date/time display follows Excel's hash fill (issue #1710).
+ * Formatting APIs expose only '#'; painting repeats it in the visible cell
+ * width. Bound the allocation by the target canvas, including huge/offscreen
+ * merges, and keep the marker horizontal even for wrapped/rotated cells.
+ */
+function drawHashFill(
+  ctx: CanvasRenderingContext2D,
+  cx: number, cy: number, cellW: number, cellH: number,
+  alignV: string, font: CellFont, cs: number,
+): void {
+  const padding = 3;
+  const left = Math.max(0, cx) + padding;
+  const available = Math.min(cx + cellW, ctx.canvas.width) - padding - left;
+  if (available <= 0) return;
+  const hashWidth = ctx.measureText('#').width;
+  const count = hashWidth > 0 ? Math.max(1, Math.floor(available / hashWidth)) : 1;
+  ctx.textAlign = 'left';
+  const { baseline, textY } = singleLineVerticalAnchor({
+    alignH: 'left', alignV, cx, cy, cellW, cellH,
+    leftPad: padding, paddingX: padding, paddingY: 2,
+  });
+  ctx.textBaseline = baseline;
+  paintCellText(ctx, '#'.repeat(count), left, textY, font, cs);
+}
+
 /**
  * Draw rich text (mixed-font runs, ECMA-376 §18.4.4 r) in a NON-wrapped cell.
  * A break-free value is one alignV-anchored line ({@link drawSingleLineRichText});
@@ -1514,15 +1653,20 @@ export function drawWrappedPlainText(
   cs: number,
 ): void {
   const { alignV, cy, cellH, leftPad, paddingX, paddingY } = geom;
-  const lines = wrapTextLines(ctx, text, geom.cellW - leftPad - paddingX);
+  const available = geom.cellW - leftPad - paddingX;
+  // Wrap and paint with the same resolved Canvas face. A fixed-height cell
+  // may clip lines when a substitute is wider, as it would with any wider
+  // installed face; narrowing glyphs to an unrelated font's advances makes
+  // the substitute itself look distorted and can conceal overflow.
+  const lines = wrapTextLines(ctx, text, available);
   if (lines.length === 1) {
     const { baseline, textY } = singleLineVerticalAnchor(geom);
     ctx.textBaseline = baseline;
-    ctx.fillText(lines[0], textX, textY);
+    paintCellText(ctx, lines[0], textX, textY, font, cs);
     return;
   }
 
-  const lineH = vMetricPx(font.size, cs, 1.2, font.name ?? undefined);
+  const lineH = vMetricPx(font.size, cs, 1.2);
   const totalTextH = lines.length * lineH;
   let startY: number;
   if (alignV === 'top') startY = cy + paddingY;
@@ -1530,7 +1674,7 @@ export function drawWrappedPlainText(
   else startY = cy + cellH - totalTextH - paddingY;
   ctx.textBaseline = 'top';
   for (let li = 0; li < lines.length; li++) {
-    ctx.fillText(lines[li], textX, startY + li * lineH);
+    paintCellText(ctx, lines[li], textX, startY + li * lineH, font, cs);
   }
 }
 
@@ -1570,7 +1714,7 @@ export function drawWrappedRichText(
     drawRichSegments(ctx, rLines[0].segments, geom, cs, dpr, opts, textY, baseline, cjkFallback);
     return;
   }
-  const totalH = rLines.reduce((s, l) => s + vMetricPx(l.maxFontSize, cs, 1.2, l.maxFontFamily ?? undefined), 0);
+  const totalH = rLines.reduce((s, l) => s + vMetricPx(l.maxFontSize, cs, 1.2), 0);
   let yy: number;
   if (alignV === 'top') yy = cy + paddingY;
   else if (alignV === 'center') yy = cy + (cellH - totalH) / 2;
@@ -1590,7 +1734,7 @@ export function drawWrappedRichText(
     else xx = cx + leftPad;
     const { needBidi, baseRtl } = paraBidi[line.para];
     drawResolvedRichLine(ctx, line.segments, xx, yy, 'top', cs, dpr, { fontColor: opts.fontColor, needBidi, baseRtl }, cjkFallback);
-    yy += vMetricPx(line.maxFontSize, cs, 1.2, line.maxFontFamily ?? undefined);
+    yy += vMetricPx(line.maxFontSize, cs, 1.2);
   }
 }
 
@@ -1602,6 +1746,13 @@ function colToLetter(col: number): string {
     col = Math.floor((col - 1) / 26);
   }
   return result;
+}
+
+interface TextRunBuffer {
+  /** Runs reported by the pane that owns the cell, in paint order. */
+  owned: Map<string, XlsxTextRunInfo>;
+  /** Runs painted only as cross-pane overflow so far. */
+  foreign: Map<string, XlsxTextRunInfo>;
 }
 
 interface RenderContext {
@@ -1629,7 +1780,7 @@ interface RenderContext {
    *  red triangle in the top-right corner (ECMA-376 §18.7.3 commentList). */
   commentCells: Set<string>;
   /** row:col → table-style overlay (bold header, banded rows, borders). */
-  tableStyleMap: Map<string, TableCellStyle>;
+  structuredStyleMap: Map<string, StructuredCellFormat>;
   /** row:col → render-ready SparklineModel for cells that host an
    *  `x14:sparkline`. Built once at viewport start by flattening the
    *  parser's SparklineGroup + per-cell Sparkline pair. */
@@ -1638,11 +1789,25 @@ interface RenderContext {
    *  neighbours. These anchors bypass the ordinary cell-rectangle cull so the
    *  existing overflow clip can paint the still-visible portion of the text. */
   overflowTextAnchors: Set<string>;
-  /** Max Digit Width resolved for the worksheet's Normal-style font
+  /** Text-run reporting for this pane. Each pane paints the sheet in its own
+   *  coordinates, so a value can also be painted as overflow into the other
+   *  pane across the freeze line. `first..last` is the inclusive logical
+   *  column range this pane owns; `ownerShiftX` converts this pane's un-mirrored
+   *  canvas x into the owning pane's for any other column. */
+  textRunPane: { first: number; last: number; ownerShiftX: number };
+  /** Per-frame `onTextRun` buffer shared by all panes, so every painted value
+   *  is reported once with its owning pane's cell geometry. */
+  textRuns?: TextRunBuffer;
+  /** This pane's first viewport column, before any overflow overscan. */
+  firstViewportCol: number;
+  /** Last column a `centerContinuous` selection (§18.18.40) may span in this
+   *  pane. The frozen pane keeps its selections inside its own band whatever
+   *  overflow overscan another row adds to its column list. */
+  selectionLastCol: number;
+  /** Max Digit Width resolved for the workbook's default font, `<fonts>[0]`
    *  (ECMA-376 §18.3.1.13). Used by `colWidthToPx` to convert character-
    *  unit column widths into pixels. */
   mdw: number;
-  onTextRun?: (info: XlsxTextRunInfo) => void;
   /** Sheet-level right-to-left grid mirror (ECMA-376 §18.3.1.87
    *  `<sheetView rightToLeft>`). When true the whole grid is mirrored:
    *  column A sits at the right edge, columns flow right-to-left, and the
@@ -1685,6 +1850,18 @@ function drawCfIcon(ctx: CanvasRenderingContext2D, name: string, index: number, 
     }
     ctx.closePath();
     ctx.fill();
+  } else if (safeName === '3Signs' && index < 2) {
+    // ECMA-376 §18.18.42 3Signs: Excel draws a red diamond, a yellow
+    // triangle and a green circle (observed in Excel's PDF output).
+    ctx.beginPath();
+    if (index === 0) {
+      ctx.moveTo(x + sz / 2, y); ctx.lineTo(x + sz, y + sz / 2);
+      ctx.lineTo(x + sz / 2, y + sz); ctx.lineTo(x, y + sz / 2);
+    } else {
+      ctx.moveTo(x + sz / 2, y); ctx.lineTo(x + sz, y + sz); ctx.lineTo(x, y + sz);
+    }
+    ctx.closePath();
+    ctx.fill();
   } else if (safeName.includes('Flag')) {
     ctx.beginPath();
     ctx.moveTo(x, y); ctx.lineTo(x + sz, y); ctx.lineTo(x, y + sz);
@@ -1718,170 +1895,6 @@ function drawAutoFilterArrow(ctx: CanvasRenderingContext2D, cx: number, cy: numb
   ctx.restore();
 }
 
-// ────────────────────────────────────────────────────────────────
-// Excel Table style overlays (ECMA-376 §18.5 / §18.8.83)
-// ────────────────────────────────────────────────────────────────
-// Two distinct paths:
-//
-// 1. CUSTOM styles (defined in the file's `<tableStyles>` block, §18.5.1.2):
-//    rendered strictly from the dxfs of their declared `<tableStyleElement>`s.
-//    A custom style contributes ONLY what its elements define — if none carry
-//    a border, Excel draws no table-level border (the visible structure comes
-//    from theme borders baked into each cell `xf`, which we render separately).
-//    `isCustom` cells therefore never get accent synthesis.
-//
-// 2. BUILT-IN style names (`TableStyleLight18`, …) whose definitions are NOT
-//    in the file. We don't yet ship the preset catalog, so we approximate them
-//    from a single "accent" color: bold header + banded fills + horizontal
-//    rules, so those files render with visible structure rather than blank
-//    ranges. This is an approximation, kept until a real catalog ships
-//    (post-1.0).
-export interface TableCellStyle {
-  accent: string;
-  /** `true` for a custom `<tableStyle>` — disables all accent approximation. */
-  isCustom: boolean;
-  isHeader: boolean;
-  isTotals: boolean;
-  /** `true` when this is a banded data row that should get the stripe fill. */
-  isBanded: boolean;
-  isFirstCol: boolean;
-  isLastCol: boolean;
-  isTopEdge: boolean;
-  isBottomEdge: boolean;
-  /** Dxf for the whole-table element of a custom `<tableStyle>`
-   *  (ECMA-376 §18.8.83). Border/fill apply to every cell as a base layer. */
-  wholeTableDxf?: number;
-  /** Dxf for the header-row element of a custom `<tableStyle>`. Provides
-   *  header fill, font color/weight, and vertical separators. */
-  headerRowDxf?: number;
-  /** Dxf for the total-row element. */
-  totalRowDxf?: number;
-  /** Dxf for the first-column element (when `showFirstColumn`). */
-  firstColumnDxf?: number;
-  /** Dxf for the last-column element (when `showLastColumn`). */
-  lastColumnDxf?: number;
-  /** Dxf for the stripe (band1=odd, band2=even) that applies to this row when
-   *  `showRowStripes` is set; undefined when this row is not a stripe. */
-  stripeDxf?: number;
-}
-
-export function buildTableStyleMap(worksheet: Worksheet): Map<string, TableCellStyle> {
-  const map = new Map<string, TableCellStyle>();
-  const identity = coordinateIndexIdentity(
-    'worksheet-table-style-index',
-    'expand-styled-table-coordinates',
-  );
-  for (const t of worksheet.tables ?? []) {
-    // ECMA-376 §18.5.1.4: empty styleName means the table has "None" style —
-    // no visual table formatting overlay should be applied. Cell xf borders
-    // and fills are still rendered as defined (per §18.8.45); only the
-    // table-style overlay (banded fills, separator rules, etc.) is skipped.
-    if (!t.styleName) continue;
-    const { top, bottom, left, right } = t.range;
-    assertCoordinateRangeArea(t.range, identity);
-    const accent = t.accentColor || '#808080';
-    const isCustom = !!t.isCustom;
-    const hdr = Math.max(0, t.headerRowCount ?? 1);
-    const tot = Math.max(0, t.totalsRowCount ?? 0);
-    const headerEnd = top + hdr - 1;
-    const totalsStart = bottom - tot + 1;
-    for (let r = top; r <= bottom; r++) {
-      const isHeader = hdr > 0 && r <= headerEnd;
-      const isTotals = tot > 0 && r >= totalsStart;
-      const dataIdx = (!isHeader && !isTotals) ? (r - headerEnd - 1) : -1;
-      // Row banding stripes alternate band1 (odd) / band2 (even) over the data
-      // region (§18.18.93). For built-in approximation we only paint the odd
-      // stripe via `isBanded`; for custom styles we pick the matching dxf.
-      const isStripeRow = t.showRowStripes && dataIdx >= 0;
-      const stripeDxf = isStripeRow
-        ? (dataIdx % 2 === 1 ? t.band1HorizontalDxf : t.band2HorizontalDxf)
-        : undefined;
-      for (let c = left; c <= right; c++) {
-        setCoordinateIndexValue(map, `${r}:${c}`, {
-          accent,
-          isCustom,
-          isHeader,
-          isTotals,
-          isBanded: t.showRowStripes && dataIdx >= 0 && dataIdx % 2 === 1,
-          isFirstCol: t.showFirstColumn && c === left,
-          isLastCol: t.showLastColumn && c === right,
-          isTopEdge: r === top,
-          isBottomEdge: r === bottom,
-          wholeTableDxf: t.wholeTableDxf,
-          headerRowDxf: t.headerRowDxf,
-          totalRowDxf: t.totalRowDxf,
-          firstColumnDxf: t.firstColumnDxf,
-          lastColumnDxf: t.lastColumnDxf,
-          stripeDxf,
-        }, identity);
-      }
-    }
-  }
-  return map;
-}
-
-/**
- * Result of resolving a table cell's overlay *border* (ECMA-376 §18.8.83).
- *  - `none`   — draw nothing extra (custom style with no border dxf, or a
- *               built-in cell that has no rule on this edge).
- *  - `dxf`    — draw `border` exactly as the resolved dxf defines it.
- *  - `accent` — built-in approximation only: a synthesized accent-colored rule
- *               under the cell (plus the table top edge when `topEdge`).
- */
-export type TableOverlayBorder =
-  | { kind: 'none' }
-  | { kind: 'dxf'; border: Border }
-  | { kind: 'accent'; color: string; lineWidth: number; topEdge: boolean };
-
-/**
- * Decide the table-style overlay border for one cell.
- *
- * `dxfWhole` / `dxfHeader` are the already-resolved dxfs for the cell's
- * wholeTable / headerRow elements (undefined when the element is absent).
- * `colIndex` is the cell's column index *within the table* (0 = first column),
- * used to draw the table's outer-left edge only on the leftmost column.
- *
- * Custom styles (`ts.isCustom`) draw only from these dxfs and never synthesize
- * accent rules: when no border dxf is present they contribute nothing. Built-in
- * style names keep the accent approximation.
- */
-export function tableOverlayBorder(
-  ts: TableCellStyle,
-  dxfWhole: Dxf | undefined,
-  dxfHeader: Dxf | undefined,
-  colIndex: number,
-): TableOverlayBorder {
-  const horiz = dxfWhole?.border?.horizontal;
-  const wtTop = dxfWhole?.border?.top;
-  const wtBot = dxfWhole?.border?.bottom;
-  const wtLeft = dxfWhole?.border?.left;
-  const wtRight = dxfWhole?.border?.right;
-  const hdrBot = dxfHeader?.border?.bottom;
-  const hdrTop = dxfHeader?.border?.top;
-  const hasDxfBorder = !!(horiz || wtTop || wtBot || wtLeft || wtRight || hdrBot || hdrTop);
-
-  if (hasDxfBorder) {
-    // Compose per-edge from the table-style hierarchy
-    // (wholeTable < headerRow), §18.8.83. The inner `horizontal` rule fills
-    // top/bottom for interior rows; outer edges come from the table extents.
-    const overlay: Border = { left: null, right: null, top: null, bottom: null };
-    if (ts.isTopEdge) overlay.top = wtTop ?? null;
-    else if (horiz) overlay.top = horiz;
-    if (ts.isHeader && hdrBot) overlay.bottom = hdrBot;
-    else if (ts.isBottomEdge) overlay.bottom = wtBot ?? null;
-    else if (horiz) overlay.bottom = horiz;
-    if (ts.isFirstCol || colIndex === 0) overlay.left = wtLeft ?? null;
-    if (ts.isLastCol) overlay.right = wtRight ?? null;
-    return { kind: 'dxf', border: overlay };
-  }
-
-  // No border dxf. A custom style contributes nothing here (§18.5.1.2):
-  // Excel draws no table-level border, only the theme borders baked into the
-  // cell xf. Built-in names fall through to the accent approximation.
-  if (ts.isCustom) return { kind: 'none' };
-  return { kind: 'accent', color: ts.accent, lineWidth: ts.isHeader ? 1.5 : 1, topEdge: ts.isTopEdge };
-}
-
 /** Flatten the worksheet's parsed `sparklineGroups` into a per-cell render
  *  model. Each Sparkline inherits its group's formatting; min/max are
  *  computed from the values when the group's `*AxisType` is `individual`,
@@ -1891,6 +1904,7 @@ export function tableOverlayBorder(
 function buildSparklineMap(worksheet: Worksheet): Map<string, SparklineModel> {
   const map = new Map<string, SparklineModel>();
   const identity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-sparkline-index',
     'index-sparkline-coordinates',
   );
@@ -1948,18 +1962,6 @@ function buildSparklineMap(worksheet: Worksheet): Map<string, SparklineModel> {
     }
   }
   return map;
-}
-
-function stripeColorFor(accent: string): string {
-  // Light tint of the accent — mimics TableStyleLight* banded rows.
-  const hex = accent.replace('#', '');
-  if (hex.length < 6) return '#F2F2F2';
-  const r = parseInt(hex.slice(0, 2), 16);
-  const g = parseInt(hex.slice(2, 4), 16);
-  const b = parseInt(hex.slice(4, 6), 16);
-  const mix = (ch: number) => Math.round(ch * 0.2 + 255 * 0.8);
-  const toHex = (v: number) => v.toString(16).padStart(2, '0').toUpperCase();
-  return `#${toHex(mix(r))}${toHex(mix(g))}${toHex(mix(b))}`;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -2068,6 +2070,12 @@ function renderQuadrant(
       + rc.rowAxis.offsetOf(aRow) - rc.rowAxis.offsetOf(startRow);
 
     const cW = info.totalW, cH = info.totalH;
+    // Cull by the full merge rectangle, as the main loop culls merge anchors.
+    // A merge wholly outside the clip contributes nothing visible; its shared
+    // edge is left to the first-column edge handling of the visible cell.
+    if (aCx + cW <= clipX || aCx >= clipX + clipW || aCy + cH <= clipY || aCy >= clipY + clipH) {
+      continue;
+    }
     aCx = mirrorX(aCx, cW);
     const key = `${aRow}:${aCol}`;
     const cell = rc.cellMap.get(key);
@@ -2076,8 +2084,13 @@ function renderQuadrant(
     );
     const cf = evaluateCf(cell, aRow, aCol, cfContext, styles.dxfs ?? []);
     const effectiveFill = cf.fill ?? fill;
+    // Same layers as the main path's merged anchor: the Table / PivotTable
+    // style fill under the cell's own fill, and its font beneath CF.
+    const styleFormat = rc.structuredStyleMap.get(key);
 
-    paintCellPatternFill(ctx, effectiveFill, aCx, aCy, cW, cH);
+    if (!paintCellPatternFill(ctx, effectiveFill, aCx, aCy, cW, cH) && styleFormat?.fill) {
+      paintCellPatternFill(ctx, styleFormat.fill, aCx, aCy, cW, cH);
+    }
     if (cf.dataBar && cf.dataBar.ratio > 0) {
       const bInset = 2;
       const bW = Math.max(0, (cW - bInset * 2) * cf.dataBar.ratio);
@@ -2101,26 +2114,22 @@ function renderQuadrant(
     const text = formatted.text;
     if (!text || (text === '0' && rc.worksheet.showZeros === false)) continue;
 
-    const effectiveBold = font.bold || !!cf.fontBold;
-    const effectiveItalic = font.italic || !!cf.fontItalic;
-    const effectiveUnderline = font.underline || !!cf.fontUnderline;
-    const effectiveStrike = font.strike || !!cf.fontStrike;
-    const fontForDraw: CellFont = (
-      effectiveBold !== font.bold || effectiveItalic !== font.italic ||
-      effectiveUnderline !== font.underline || effectiveStrike !== font.strike
-    ) ? { ...font, bold: effectiveBold, italic: effectiveItalic, underline: effectiveUnderline, strike: effectiveStrike }
-      : font;
-    ctx.font = buildFont(fontForDraw, cs, cjkFallback, text);
+    const fontForDraw = layeredCellFont(font, cf, styleFormat);
+    ctx.font = buildFont(ctx, fontForDraw, cs, cjkFallback, text);
     const hyperlinkUrl = rc.hyperlinkMap.get(key);
-    // Colour precedence: hyperlink theme colour > conditional-formatting font
-    // colour > number-format section colour ([Red] etc., §18.8.30) > the cell's
-    // own font colour.
-    const textColor = hyperlinkUrl ? '#0563C1' : (cf.fontColor ?? formatted.color ?? font.color);
+    // Colour precedence (as the main path): hyperlink theme colour >
+    // conditional-formatting font colour > number-format section colour
+    // ([Red] etc., §18.8.30) > Table / PivotTable style colour > the cell's
+    // own font colour (a cell's own colour beats the style's; see
+    // styleFontColor).
+    const tableFontColor = styleFontColor(styleFormat, xf);
+    const textColor = hyperlinkUrl
+      ? '#0563C1'
+      : (cf.fontColor ?? formatted.color ?? tableFontColor ?? font.color);
     ctx.fillStyle = textColor ? hexToRgba(textColor) : '#000000';
 
     const paddingX = 3, paddingY = 2;
-    const isNumeric = cell.value.type === 'number';
-    const alignH = xf.alignH ?? (isNumeric ? 'right' : 'left');
+    const alignH = xf.alignH ?? generalHorizontalAlignment(cell.value.type);
     const alignV = xf.alignV ?? 'bottom';
     // Indent: ECMA-376 §18.8.1 alignment@indent — one level indents by 3
     // character widths (MDW) of the workbook's normal-style font.
@@ -2131,6 +2140,12 @@ function renderQuadrant(
     ctx.beginPath();
     ctx.rect(aCx, aCy, cW, cH);
     ctx.clip();
+
+    if (formatted.fill) {
+      drawHashFill(ctx, aCx, aCy, cW, cH, alignV, fontForDraw, cs);
+      ctx.restore();
+      continue;
+    }
 
     let textX: number;
     if (alignH === 'right') { textX = aCx + cW - paddingX; ctx.textAlign = 'right'; }
@@ -2143,7 +2158,12 @@ function renderQuadrant(
     // Using the same code keeps the off-screen-anchor pre-pass and the
     // in-viewport-anchor path identical, so a merged cell renders the same
     // text whether or not its top-left anchor cell is scrolled out of view.
-    const runs = cell.value.type === 'text' ? cell.value.runs : undefined;
+    // Rich runs take the table style's font color by the measured run rule
+    // (richRunsWithTableColor); runs without <rPr> through the base font.
+    const tableRunColor = tableRunFontColor(styleFormat, xf);
+    const rawRuns = cell.value.type === 'text' ? cell.value.runs : undefined;
+    const runs = rawRuns && richRunsWithTableColor(rawRuns, tableRunColor);
+    const richBaseFont = tableRunColor != null ? { ...fontForDraw, color: tableRunColor } : fontForDraw;
     const hasRichText = runs && runs.length > 0;
 
     if (xf.wrapText && hasRichText) {
@@ -2152,7 +2172,7 @@ function renderQuadrant(
       // underline/strike, and bidi (previously this pre-pass drew only plain
       // per-segment fonts).
       drawWrappedRichText(
-        ctx, runs, fontForDraw,
+        ctx, runs, richBaseFont,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
         cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
@@ -2170,7 +2190,7 @@ function renderQuadrant(
       // off-screen-anchored merge renders identical per-run text (single line, or
       // multiple lines on a hard break) instead of joined base-font text.
       drawNonWrapRichText(
-        ctx, runs, fontForDraw,
+        ctx, runs, richBaseFont,
         { alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY },
         cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
       );
@@ -2179,7 +2199,7 @@ function renderQuadrant(
         alignH, alignV, cx: aCx, cy: aCy, cellW: cW, cellH: cH, leftPad, paddingX, paddingY,
       });
       ctx.textBaseline = baseline;
-      ctx.fillText(text, textX, textY);
+      paintCellText(ctx, text, textX, textY, fontForDraw, cs);
     }
     ctx.restore();
   }
@@ -2225,7 +2245,7 @@ function renderQuadrant(
     for (let ci = 0; ci <= numCols; ci++) {
       let isCC = false;
       let hasValue = false;
-      if (ci < numCols) {
+      if (ci < numCols && colIndices[ci] <= rc.selectionLastCol) {
         const ckey = `${rowIndex}:${colIndices[ci]}`;
         if (!mergeSkipSet.has(ckey) && !mergeAnchorMap.has(ckey)) {
           const c = cellMap.get(ckey);
@@ -2247,14 +2267,26 @@ function renderQuadrant(
       }
     }
 
+    // Measured overflow overscan can prepend columns before the pane's first
+    // viewport column (off-screen anchors, or frozen-column anchors drawn in
+    // the scrollable pane). That first column keeps its first-column edge
+    // handling unless the prepended column beside it is painted, in which
+    // case that cell strokes the shared edge itself.
+    let leftNeighbourCulled = true;
     for (let ci = 0; ci < numCols; ci++) {
       const colIndex = colIndices[ci];
       const ltrCx = originX + colXs[ci];
       const cw = colWidths[ci];
+      const leftCulled = colIndex === rc.firstViewportCol && leftNeighbourCulled;
       // Cull against the (un-mirrored) clip band — visibility is preserved
       // by the mirror, so the LTR test is correct for both directions.
       const key = `${rowIndex}:${colIndex}`;
-      if (mergeSkipSet.has(key)) continue;
+      if (mergeSkipSet.has(key)) {
+        // A covered cell is painted (by its anchor or the pre-pass) only
+        // where its own band reaches the clip.
+        leftNeighbourCulled = ltrCx + cw <= clipX || ltrCx >= clipX + clipW;
+        continue;
+      }
 
       // Use the authored merge rectangle for virtualization. A merge anchor's
       // own row/column band may remain materialized while that single band is
@@ -2268,7 +2300,11 @@ function renderQuadrant(
       if (
         verticallyOutside ||
         (horizontallyOutside && !rc.overflowTextAnchors.has(key))
-      ) continue;
+      ) {
+        leftNeighbourCulled = true;
+        continue;
+      }
+      leftNeighbourCulled = false;
       // Mirror the cell's canvas x for RTL. Uses the *full* drawn width
       // (merge span included) so the rect lands at the correct mirror band.
       const cx = mirrorX(ltrCx, cellW);
@@ -2278,51 +2314,16 @@ function renderQuadrant(
       const { font, fill, border, xf } = resolveXf(styles, styleIndex);
       const cf = evaluateCf(cell, rowIndex, colIndex, cfContext, styles.dxfs ?? []);
       const effectiveFill = cf.fill ?? fill;
-      const tableStyle = rc.tableStyleMap.get(key);
-      // Custom `<tableStyle>` dxfs (ECMA-376 §18.8.83). When present, they
-      // drive fills / font color and borders strictly from the declared
-      // elements — no accent fallback for custom styles.
-      const dxfList = styles.dxfs ?? [];
-      const dxfAt = (i?: number) => (i != null ? dxfList[i] : undefined);
-      const tsDxfWhole = dxfAt(tableStyle?.wholeTableDxf);
-      const tsDxfHeader = dxfAt(tableStyle?.headerRowDxf);
-      const tsDxfTotal = dxfAt(tableStyle?.totalRowDxf);
-      const tsDxfFirstCol = dxfAt(tableStyle?.firstColumnDxf);
-      const tsDxfLastCol = dxfAt(tableStyle?.lastColumnDxf);
-      const tsDxfStripe = dxfAt(tableStyle?.stripeDxf);
-      // Per-cell table fill resolved from the element hierarchy
-      // (§18.8.83: wholeTable < band < column < header/total). The later a
-      // layer appears the higher its precedence; we pick the most specific
-      // fill that defines a fgColor.
-      const tableFillDxf =
-        (tableStyle?.isHeader && tsDxfHeader?.fill?.fgColor) ? tsDxfHeader :
-        (tableStyle?.isTotals && tsDxfTotal?.fill?.fgColor) ? tsDxfTotal :
-        (tableStyle?.isLastCol && tsDxfLastCol?.fill?.fgColor) ? tsDxfLastCol :
-        (tableStyle?.isFirstCol && tsDxfFirstCol?.fill?.fgColor) ? tsDxfFirstCol :
-        (tsDxfStripe?.fill?.fgColor) ? tsDxfStripe :
-        (!tableStyle?.isHeader && !tableStyle?.isTotals && tsDxfWhole?.fill?.fgColor) ? tsDxfWhole :
-        undefined;
-
       // Background fill (base or CF override). ECMA-376 §18.8.22 ST_PatternType.
       // - solid/gray*: blend fgColor with bgColor at the pattern's fg coverage.
       // - directional hatches (dark/light Horizontal/Vertical/Down/Up/Grid/
       //   Trellis): render via a small repeating tile using createPattern so
       //   the hatch actually shows, rather than approximating as a blend.
       let hasCellBackground = paintCellPatternFill(ctx, effectiveFill, cx, cy, cellW, cellH);
-      if (hasCellBackground) {
-        // own fill painted; tableStyle fallbacks intentionally skipped
-      } else if (tableStyle && tableFillDxf?.fill?.fgColor) {
-        // Custom or built-in: a resolved table-element dxf fill wins.
-        ctx.fillStyle = hexToRgba(tableFillDxf.fill.fgColor);
-        ctx.fillRect(cx, cy, cellW, cellH);
-        hasCellBackground = true;
-      } else if (tableStyle && !tableStyle.isCustom && tableStyle.isBanded) {
-        // Accent-tint banding is an approximation for built-in style names
-        // only. Custom styles with no stripe dxf get no banding fill (Excel
-        // draws none — §18.5.1.2).
-        ctx.fillStyle = stripeColorFor(tableStyle.accent);
-        ctx.fillRect(cx, cy, cellW, cellH);
-        hasCellBackground = true;
+      // Table / PivotTable style fill (§18.8.41) under the cell's own fill.
+      const styleFormat = rc.structuredStyleMap.get(key);
+      if (!hasCellBackground && styleFormat?.fill) {
+        hasCellBackground = paintCellPatternFill(ctx, styleFormat.fill, cx, cy, cellW, cellH);
       }
 
       // Comment indicator triangle — drawn above fill but below borders so
@@ -2373,7 +2374,7 @@ function renderQuadrant(
           ctx.moveTo(cx, ty);
           ctx.lineTo(cx + cellW, ty);
         }
-        if (ci === 0) {                            // left edge for first column
+        if (leftCulled) {                          // left edge for first column
           const lx = cx + crispOffset(cx, 0.5, dpr);
           ctx.moveTo(lx, cy);
           ctx.lineTo(lx, cy + cellH);
@@ -2388,6 +2389,17 @@ function renderQuadrant(
         ? resolveMergeBorder(border, rowIndex, colIndex, mergeInfo.right, mergeInfo.bottom, cellMap, styles)
         : border;
       let mergedBorder = mergeBorders(baseBorder, cf.border);
+      // Table / PivotTable style edges (§18.8.41) fill the edges the cell
+      // leaves unset.
+      if (styleFormat) {
+        mergedBorder = {
+          ...mergedBorder,
+          top: mergedBorder.top?.style ? mergedBorder.top : (styleFormat.top ?? mergedBorder.top),
+          bottom: mergedBorder.bottom?.style ? mergedBorder.bottom : (styleFormat.bottom ?? mergedBorder.bottom),
+          left: mergedBorder.left?.style ? mergedBorder.left : (styleFormat.left ?? mergedBorder.left),
+          right: mergedBorder.right?.style ? mergedBorder.right : (styleFormat.right ?? mergedBorder.right),
+        };
+      }
       // centerContinuous: hide internal vertical borders so the run reads as
       // one visual span (matches Excel — see precompute block above).
       if (suppressRightGridCol.has(ci) || suppressLeftGridCol.has(ci)) {
@@ -2409,7 +2421,8 @@ function renderQuadrant(
       // (sample-6). This replaces the old fill-repair (`paintedFill` gate +
       // `invertedTop` / `invertedLeft`), which is gone.
       //
-      // EXCEPTION — the quadrant's first rendered row/column (`ri`/`ci` === 0):
+      // EXCEPTION — the quadrant's first rendered row/column (`ri === 0` /
+      // `leftCulled`):
       // the upper / left neighbour lies OUTSIDE this quadrant (the viewport has
       // no top/left overscan — viewer.ts walks forward from startRow/startCol
       // with a +2 buffer only at the bottom/right), so when scrolled it is never
@@ -2435,50 +2448,15 @@ function renderQuadrant(
               styles, effectiveCellStyleIndex(rc.worksheet, leftCell, colIndex - 1),
             ).border.right
           : null;
-        if (leftRight?.style && (ci === 0 || mergedBorder.left?.style)) {
+        if (leftRight?.style && (leftCulled || mergedBorder.left?.style)) {
           mergedBorder = { ...mergedBorder, left: pickStrongerEdge(mergedBorder.left, leftRight) };
         }
       }
-      // Excel Table style overlay (ECMA-376 §18.8.83). Custom styles draw only
-      // their dxf-defined borders; built-in style names fall back to a
-      // synthesized accent rule. Drawn on top of the cell border so an
-      // empty-border data cell still shows the table structure the style
-      // defines. None-style tables produce no `tableStyleMap` entry, so this is
-      // skipped. (Excel forbids merging cells inside a structured Table, so a
-      // merged anchor never carries a `tableStyle`; for the merged branch only
-      // the AutoFilter arrow can apply.)
-      const overlay = tableStyle
-        ? tableOverlayBorder(tableStyle, tsDxfWhole, tsDxfHeader, colIndex)
-        : null;
       const drawArrow = rc.autoFilterCells.has(key);
-      // Paint the base cell border, then the table overlay on top of it, then
-      // the AutoFilter arrow — the original inline order, kept intact whether
-      // this runs deferred (non-merged) or inline (merged anchor).
-      const paintOverlayAndArrow = () => {
-        if (overlay) {
-          if (overlay.kind === 'dxf') {
-            renderBorder(ctx, overlay.border, cx, cy, cellW, cellH, dpr);
-          } else if (overlay.kind === 'accent') {
-            const hp = 0.5 / dpr;
-            ctx.strokeStyle = overlay.color;
-            ctx.lineWidth = overlay.lineWidth;
-            ctx.beginPath();
-            // perimeter inset (-hp) kept literal: snapping could push it
-            // outside the cell's bottom edge; dpr>=3 edge accepted
-            ctx.moveTo(cx, cy + cellH - hp);
-            ctx.lineTo(cx + cellW, cy + cellH - hp);
-            if (overlay.topEdge) {
-              const ty = cy + crispOffset(cy, overlay.lineWidth, dpr);
-              ctx.moveTo(cx, ty);
-              ctx.lineTo(cx + cellW, ty);
-            }
-            ctx.stroke();
-          }
-        }
-        // AutoFilter dropdown indicator
-        if (drawArrow) {
-          drawAutoFilterArrow(ctx, cx, cy, cw, cellH);
-        }
+      // The AutoFilter arrow paints above the cell border, whether this runs
+      // deferred (non-merged) or inline (merged anchor).
+      const paintArrow = () => {
+        if (drawArrow) drawAutoFilterArrow(ctx, cx, cy, cw, cellH);
       };
 
       if (mergeInfo) {
@@ -2487,21 +2465,18 @@ function renderQuadrant(
         // (`mergedBorder` is reassigned by the conflict-resolution above) so
         // the deferred closure draws the value as of *this* anchor; cx/cy/cellW/
         // cellH are already block `const` and safe to capture directly. The
-        // overlay/arrow paint inline (pass 1) here, matching the prior order
-        // where the deferred merge border sat above them.
+        // arrow paints inline (pass 1) here, below the deferred merge border.
         const mb = mergedBorder;
         mergeBorderTasks.push(() => renderBorder(ctx, mb, cx, cy, cellW, cellH, dpr));
-        paintOverlayAndArrow();
+        paintArrow();
       } else {
         // Non-merged borders are deferred to pass 2 (after every fill) so a
         // later neighbour's fill can never over-paint this cell's edges. The
-        // overlay + arrow ride in the SAME closure, after the base border, so
-        // their mutual base-border < overlay < arrow order is preserved exactly
-        // — only the whole trio shifts above every cell's gray gridline.
+        // arrow rides in the SAME closure, after the border.
         const mb = mergedBorder;
         borderTasks.push(() => {
           renderBorder(ctx, mb, cx, cy, cellW, cellH, dpr);
-          paintOverlayAndArrow();
+          paintArrow();
         });
       }
 
@@ -2511,41 +2486,16 @@ function renderQuadrant(
       if (!text || (text === '0' && rc.worksheet.showZeros === false)) continue;
 
       textTasks.push(() => {
-      // The table-element dxf that applies to this cell's font (header/total/
-      // column/stripe/wholeTable), resolved by the same §18.8.83 hierarchy as
-      // the fill above. Used for both bold and color of custom styles.
-      const tableFontDxf =
-        (tableStyle?.isHeader) ? tsDxfHeader :
-        (tableStyle?.isTotals) ? tsDxfTotal :
-        (tableStyle?.isLastCol && tsDxfLastCol) ? tsDxfLastCol :
-        (tableStyle?.isFirstCol && tsDxfFirstCol) ? tsDxfFirstCol :
-        (tsDxfStripe) ? tsDxfStripe :
-        (tableStyle ? tsDxfWhole : undefined);
-      // Built-in style names: synthesize bold header/total rows (approximation).
-      // Custom styles: bold comes strictly from the element dxf font (§18.5.1.2).
-      const tableBold = tableStyle
-        ? (tableStyle.isCustom
-            ? !!tableFontDxf?.font?.bold
-            : (tableStyle.isHeader || tableStyle.isTotals))
-        : false;
-      const effectiveBold = font.bold || !!cf.fontBold || tableBold;
-      const effectiveItalic = font.italic || !!cf.fontItalic;
-      const effectiveUnderline = font.underline || !!cf.fontUnderline;
-      const effectiveStrike = font.strike || !!cf.fontStrike;
-      const fontForDraw: CellFont = (
-        effectiveBold !== font.bold || effectiveItalic !== font.italic ||
-        effectiveUnderline !== font.underline || effectiveStrike !== font.strike
-      )
-        ? { ...font, bold: effectiveBold, italic: effectiveItalic, underline: effectiveUnderline, strike: effectiveStrike }
-        : font;
-      ctx.font = buildFont(fontForDraw, cs, cjkFallback, text);
+      // CF is the top layer: a matched rule's toggle, on or off, overrides
+      // the cell, table and PivotTable formatting beneath it (CfResult).
+      const fontForDraw = layeredCellFont(font, cf, styleFormat);
+      ctx.font = buildFont(ctx, fontForDraw, cs, cjkFallback, text);
       const hyperlinkUrl = rc.hyperlinkMap.get(key);
-      // Table-style element dxfs can override font color (ECMA-376 §18.8.83),
-      // following the same element hierarchy as the fill/bold above.
-      const tableFontColor = tableFontDxf?.font?.color ?? null;
       // Colour precedence: hyperlink > conditional-formatting font colour >
-      // number-format section colour ([Red] etc., §18.8.30) > table-style dxf
-      // colour > the cell's own font colour.
+      // number-format section colour ([Red] etc., §18.8.30) > Table /
+      // PivotTable style colour > the cell's own font colour (a cell's own
+      // colour beats the style's; see styleFontColor).
+      const tableFontColor = styleFontColor(styleFormat, xf);
       const textColor = hyperlinkUrl
         ? '#0563C1'
         : (cf.fontColor ?? formatted.color ?? tableFontColor ?? font.color);
@@ -2554,7 +2504,7 @@ function renderQuadrant(
       const paddingX = 3;
       const paddingY = 2;
       const isNumeric = cell.value.type === 'number';
-      const alignH = xf.alignH ?? (isNumeric ? 'right' : 'left');
+      const alignH = xf.alignH ?? generalHorizontalAlignment(cell.value.type);
       const alignV = xf.alignV ?? 'bottom';
       // Indent: ECMA-376 §18.8.1 alignment@indent — one level indents by 3
       // character widths (MDW) of the workbook's normal-style font.
@@ -2573,7 +2523,7 @@ function renderQuadrant(
       let centerContinuousW = cellW;
       let centerContinuousLastCi = ci;
       if (alignH === 'centerContinuous' && !mergeInfo) {
-        for (let oci = ci + 1; oci < numCols; oci++) {
+        for (let oci = ci + 1; oci < numCols && colIndices[oci] <= rc.selectionLastCol; oci++) {
           const adjKey = `${rowIndex}:${colIndices[oci]}`;
           if (mergeSkipSet.has(adjKey) || mergeAnchorMap.has(adjKey)) break;
           const adjCell = cellMap.get(adjKey);
@@ -2739,6 +2689,12 @@ function renderQuadrant(
       ctx.rect(drawX, cy, drawW, cellH);
       ctx.clip();
 
+      if (formatted.fill) {
+        drawHashFill(ctx, cx, cy, cellW, cellH, alignV, fontForDraw, cs);
+        ctx.restore();
+        return;
+      }
+
       // Stacked text (textRotation=255): draw each character on its own line
       if (isStacked) {
         const charH = vMetricPx(font.size, cs, 1.1);
@@ -2752,6 +2708,8 @@ function renderQuadrant(
           : cy + cellH - totalH - paddingY;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
+        const paintStacked = (value: string, x: number, y: number) =>
+          paintCellText(ctx, value, x, y, fontForDraw, cs);
         for (const ch of text) {
           // UAX#50 per-glyph orientation (issue #790): CJK/Latin stay upright,
           // 、。 substitute their vertical form, fullwidth brackets substitute
@@ -2759,7 +2717,7 @@ function renderQuadrant(
           const cp = ch.codePointAt(0) ?? 0;
           const vertCapable =
             verticalTrLongMark(cp) && verticalVertGlyphReachable(ctx, cp);
-          drawStackedVerticalChar(ctx, ch, cx + cellW / 2, charY, charH, vertCapable);
+          drawStackedVerticalChar(ctx, ch, cx + cellW / 2, charY, charH, vertCapable, paintStacked);
           charY += charH;
         }
         ctx.restore();
@@ -2775,7 +2733,7 @@ function renderQuadrant(
         ctx.rotate(angleRad);
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(text, 0, 0);
+        paintCellText(ctx, text, 0, 0, fontForDraw, cs);
         ctx.restore();
         return;
       }
@@ -2810,15 +2768,18 @@ function renderQuadrant(
           cellBaseRtl(xf.readingOrder, text) ? 'rtl' : 'ltr';
       } catch { /* ignore */ }
 
-      // Rich text: draw each run with its own font. Only supported for the
-      // non-wrap path (wrap with mixed fonts is significantly more complex).
-      const runs = cell.value.type === 'text' ? cell.value.runs : undefined;
+      // Rich text: draw each run with its own font. Rich runs take the table
+      // style's font color by the measured run rule (richRunsWithTableColor).
+      const tableRunColor = tableRunFontColor(styleFormat, xf);
+      const rawRuns = cell.value.type === 'text' ? cell.value.runs : undefined;
+      const runs = rawRuns && richRunsWithTableColor(rawRuns, tableRunColor);
+      const richBaseFont = tableRunColor != null ? { ...fontForDraw, color: tableRunColor } : fontForDraw;
       const hasRichText = runs && runs.length > 0;
 
       if (xf.wrapText && hasRichText) {
         // Rich text with wrapping — shared with the off-screen pre-pass.
         drawWrappedRichText(
-          ctx, runs, fontForDraw,
+          ctx, runs, richBaseFont,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
           cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
@@ -2838,7 +2799,7 @@ function renderQuadrant(
         // and a value with breaks as multiple lines, keeping this in-viewport
         // path and the off-screen-anchor pre-pass identical.
         drawNonWrapRichText(
-          ctx, runs, fontForDraw,
+          ctx, runs, richBaseFont,
           { alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY },
           cs, dpr, { fontColor: cf.fontColor, readingOrder: xf.readingOrder }, cjkFallback
         );
@@ -2857,7 +2818,7 @@ function renderQuadrant(
           ? { ...fontForDraw, size: fontForDraw.size * 0.65 }
           : fontForDraw;
         if (cellVertAlign) {
-          ctx.font = buildFont(drawFont, cs, cjkFallback, text);
+          ctx.font = buildFont(ctx, drawFont, cs, cjkFallback, text);
         }
 
         // Measure once for both underline and strike
@@ -2904,21 +2865,21 @@ function renderQuadrant(
         // when wrapText is false — this matches Excel's behavior.
         if (text.includes('\n')) {
           const lines = text.split('\n');
-          const lineH = vMetricPx(font.size, cs, 1.2, font.name ?? undefined);
+          const lineH = vMetricPx(font.size, cs, 1.2);
           const totalTextH = lines.length * lineH;
           let startY: number;
           if (alignV === 'top') { startY = cy + paddingY; ctx.textBaseline = 'top'; }
           else if (alignV === 'center') { startY = cy + (cellH - totalTextH) / 2; ctx.textBaseline = 'top'; }
           else { startY = cy + cellH - totalTextH - paddingY; ctx.textBaseline = 'top'; }
           for (let li = 0; li < lines.length; li++) {
-            ctx.fillText(lines[li], textX, startY + li * lineH + vaYShift);
+            paintCellText(ctx, lines[li], textX, startY + li * lineH + vaYShift, drawFont, cs);
           }
         } else {
           const { baseline, textY } = singleLineVerticalAnchor({
             alignH, alignV, cx, cy, cellW, cellH, leftPad, paddingX, paddingY,
           });
           ctx.textBaseline = baseline;
-          ctx.fillText(drawText, textX, textY + vaYShift);
+          paintCellText(ctx, drawText, textX, textY + vaYShift, drawFont, cs);
         }
       }
 
@@ -2933,7 +2894,7 @@ function renderQuadrant(
       // measured base width.
       const phRuns = cell.value.type === 'text' ? cell.value.phoneticRuns : undefined;
       if (cell.showPhonetic && phRuns && phRuns.length > 0 && !text.includes('\n')) {
-        const baseFontStr = buildFont(fontForDraw, cs, cjkFallback, text);
+        const baseFontStr = buildFont(ctx, fontForDraw, cs, cjkFallback, text);
         const baseTextW = measureInFont(ctx, text, baseFontStr);
         let baseLeftX: number;
         if (alignH === 'right') baseLeftX = cx + cellW - paddingX - baseTextW;
@@ -2956,18 +2917,22 @@ function renderQuadrant(
 
       ctx.restore();
 
-      if (text && rc.onTextRun) {
-        rc.onTextRun({
-          sheetName: rc.worksheet.name,
-          cellRef: formatA1(rowIndex, colIndex),
-          text,
-          x: cx,
-          y: cy,
-          width: cellW,
-          height: cellH,
-          row: rowIndex,
-          col: colIndex,
-        });
+      if (text && rc.textRuns) {
+        const owned = colIndex >= rc.textRunPane.first && colIndex <= rc.textRunPane.last;
+        const runs = owned ? rc.textRuns.owned : rc.textRuns.foreign;
+        if (!runs.has(key)) {
+          runs.set(key, {
+            sheetName: rc.worksheet.name,
+            cellRef: formatA1(rowIndex, colIndex),
+            text,
+            x: owned ? cx : mirrorX(ltrCx + rc.textRunPane.ownerShiftX, cellW),
+            y: cy,
+            width: cellW,
+            height: cellH,
+            row: rowIndex,
+            col: colIndex,
+          });
+        }
       }
       });
     }
@@ -2997,6 +2962,12 @@ function renderQuadrant(
  *  frame and only misses on a sheet switch / re-parse — avoiding a full-sheet
  *  cell-Map rebuild and a conditional-formatting recompile per frame. */
 interface SheetRenderCache {
+  rowCount: number;
+  /** Workbook dxfs the structured style map resolved legacy table fields
+   *  against (undefined when built without styles). */
+  styleDxfs: readonly Dxf[] | undefined;
+  /** Bound per-index entry limit these indexes were built under. */
+  coordinateIndexLimit: number;
   cellMap: Map<string, Cell>;
   nonEmptyColsByRow: Map<number, readonly number[]>;
   cfContext: CfContext;
@@ -3005,23 +2976,47 @@ interface SheetRenderCache {
   autoFilterCells: Set<string>;
   hyperlinkMap: Map<string, string>;
   commentCells: Set<string>;
-  tableStyleMap: Map<string, TableCellStyle>;
+  structuredStyleMap: Map<string, StructuredCellFormat>;
   sparklineMap: Map<string, SparklineModel>;
 }
 const sheetRenderCache = new WeakMap<Worksheet, SheetRenderCache>();
 
+/** @internal A provisional row graph grows between renders; its coordinate
+ * indexes must be rebuilt after every accepted chunk. */
+export function invalidateSheetRenderCache(worksheet: Worksheet): void {
+  sheetRenderCache.delete(worksheet);
+}
+
 function coordinateIndexIdentity(
+  worksheet: Worksheet,
   resource: string,
   operation: string,
 ): CoordinateIndexIdentity {
-  return { resource, operation };
+  return {
+    resource,
+    operation,
+    limit: getWorksheetPolicy(worksheet).maxCoordinateIndexEntries,
+  };
 }
 
-export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
+export function getSheetRenderCache(worksheet: Worksheet, styles?: Styles): SheetRenderCache {
+  const coordinateIndexLimit = getWorksheetPolicy(worksheet).maxCoordinateIndexEntries;
   const cached = sheetRenderCache.get(worksheet);
-  if (cached) return cached;
+  if (
+    cached &&
+    cached.rowCount === worksheet.rows.length &&
+    cached.coordinateIndexLimit === coordinateIndexLimit &&
+    (styles === undefined || cached.styleDxfs === styles.dxfs)
+  ) {
+    return cached;
+  }
+  if (cached) sheetRenderCache.delete(worksheet);
 
-  const cellIdentity = coordinateIndexIdentity('worksheet-cell-index', 'index-worksheet-cells');
+  const cellIdentity = coordinateIndexIdentity(
+    worksheet,
+    'worksheet-cell-index',
+    'index-worksheet-cells',
+  );
   const cellMap = buildCellCoordinateIndex(worksheet.rows, cellIdentity);
   const nonEmptyColsByRow = new Map<number, readonly number[]>();
   for (const row of worksheet.rows) {
@@ -3034,31 +3029,27 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   // Merge skip-set is pure topology (no scaled sizes) so it is cacheable; the
   // anchor map's pixel sizes depend on cellScale and stay per-frame.
-  const mergeSkipSet = new Set<string>();
-  const mergeAnchorSet = new Set<string>();
   const mergeAnchorIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-anchor-index',
     'index-merge-anchor-coordinates',
   );
   const mergeIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-skip-index',
     'expand-merged-cell-coordinates',
   );
-  for (const mc of worksheet.mergeCells ?? []) {
-    addCoordinateIndexEntry(mergeAnchorSet, `${mc.top}:${mc.left}`, mergeAnchorIdentity);
-    assertCoordinateRangeArea(mc, mergeIdentity, 1);
-    for (let r = mc.top; r <= mc.bottom; r++) {
-      for (let c = mc.left; c <= mc.right; c++) {
-        if (r === mc.top && c === mc.left) continue;
-        addCoordinateIndexEntry(mergeSkipSet, `${r}:${c}`, mergeIdentity);
-      }
-    }
-  }
+  const { anchors: mergeAnchorSet, continuations: mergeSkipSet } = buildMergeCoverageIndex(
+    worksheet.mergeCells ?? [],
+    mergeAnchorIdentity,
+    mergeIdentity,
+  );
 
   const autoFilterCells = new Set<string>();
   if (worksheet.autoFilter) {
     const af = worksheet.autoFilter;
     const filterIdentity = coordinateIndexIdentity(
+      worksheet,
       'worksheet-auto-filter-index',
       'expand-auto-filter-coordinates',
     );
@@ -3073,6 +3064,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const hyperlinkMap = new Map<string, string>();
   const hyperlinkIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-hyperlink-index',
     'index-hyperlink-coordinates',
   );
@@ -3082,6 +3074,7 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
 
   const commentCells = new Set<string>();
   const commentIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-comment-index',
     'index-comment-coordinates',
   );
@@ -3091,6 +3084,8 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
   }
 
   const entry: SheetRenderCache = {
+    rowCount: worksheet.rows.length,
+    coordinateIndexLimit,
     cellMap,
     nonEmptyColsByRow,
     cfContext: compileCf(worksheet, cellMap),
@@ -3099,7 +3094,8 @@ export function getSheetRenderCache(worksheet: Worksheet): SheetRenderCache {
     autoFilterCells,
     hyperlinkMap,
     commentCells,
-    tableStyleMap: buildTableStyleMap(worksheet),
+    structuredStyleMap: buildStructuredStyleMap(worksheet, styles?.dxfs),
+    styleDxfs: styles?.dxfs,
     sparklineMap: buildSparklineMap(worksheet),
   };
   sheetRenderCache.set(worksheet, entry);
@@ -3118,36 +3114,63 @@ interface AutoRowHeightState {
 
 const autoRowHeightState = new WeakMap<Worksheet, AutoRowHeightState>();
 
-function effectiveMeasurementFont(
+/** The Table style font color rich-text runs take (`richRunsWithTableColor`),
+ *  unless the cell's font color is its own formatting (`ownFontColor`,
+ *  resolved by the parser against the Normal style): Excel draws that color
+ *  over the table style's. The run rule was measured for Tables only. */
+function tableRunFontColor(format: StructuredCellFormat | undefined, xf: CellXf): string | null {
+  if (xf.ownFontColor || !format?.fontColorFromTable) return null;
+  return format.fontColorAuto ? AUTOMATIC_FONT_COLOR : format.fontColor ?? null;
+}
+
+/** The automatic font color (ECMA-376 §18.3.1.15 auto), the system window
+ *  text color, which Excel draws black. */
+const AUTOMATIC_FONT_COLOR = '#000000';
+
+/** The table or PivotTable style font color for a cell, or null when the
+ *  cell's font color is its own formatting. Measured in Excel for both: a
+ *  PivotTable cell given Automatic, RGB black or red keeps that color, while
+ *  one given the theme "Black, Text 1" (authored like Normal) shows the
+ *  PivotTable style's color. */
+function styleFontColor(
+  format: StructuredCellFormat | undefined,
+  xf: CellXf,
+): string | null {
+  if (xf.ownFontColor) return null;
+  return format?.fontColorAuto ? AUTOMATIC_FONT_COLOR : format?.fontColor ?? null;
+}
+
+/** Rich-text runs as Excel draws them under a table style font color
+ *  (measured): a run whose <rPr> color is confirmed to be authored like the
+ *  Normal style's (`normalColor`) takes the table color; any other run with
+ *  <rPr> keeps its own color (automatic when it has none). Runs without <rPr>
+ *  take the base font, whose color the caller sets to the table color.
+ *  `tableColor` null (no table color, or the cell's font color is its own)
+ *  leaves the runs unchanged. */
+function richRunsWithTableColor(runs: Run[], tableColor: string | null): Run[] {
+  if (tableColor == null) return runs;
+  return runs.map((run) => (run.font?.normalColor
+    ? { ...run, font: { ...run.font, color: tableColor } }
+    : run));
+}
+
+/** The cell font with its bold/italic/underline/strike composed from every
+ *  formatting layer: cell style, table style and PivotTable style beneath,
+ *  and conditional formatting on top, whose defined toggle (on or off) wins
+ *  (CfResult). Matches the main paint path. */
+function layeredCellFont(
   base: CellFont,
   cf: CfResult,
-  tableStyle: TableCellStyle | undefined,
-  styles: Styles,
+  styleFormat: StructuredCellFormat | undefined,
 ): CellFont {
-  const dxfList = styles.dxfs ?? [];
-  const tableFontDxf = tableStyle
-    ? tableStyle.isHeader
-      ? dxfList[tableStyle.headerRowDxf ?? -1]
-      : tableStyle.isTotals
-        ? dxfList[tableStyle.totalRowDxf ?? -1]
-        : tableStyle.isLastCol && tableStyle.lastColumnDxf != null
-          ? dxfList[tableStyle.lastColumnDxf]
-          : tableStyle.isFirstCol && tableStyle.firstColumnDxf != null
-            ? dxfList[tableStyle.firstColumnDxf]
-            : tableStyle.stripeDxf != null
-              ? dxfList[tableStyle.stripeDxf]
-              : dxfList[tableStyle.wholeTableDxf ?? -1]
-    : undefined;
-  const tableBold = tableStyle
-    ? tableStyle.isCustom
-      ? !!tableFontDxf?.font?.bold
-      : tableStyle.isHeader || tableStyle.isTotals
-    : false;
-  const bold = base.bold || !!cf.fontBold || tableBold;
-  const italic = base.italic || !!cf.fontItalic;
-  return bold === base.bold && italic === base.italic
+  const bold = cf.fontBold ?? (base.bold || !!styleFormat?.bold);
+  const italic = cf.fontItalic ?? (base.italic || !!styleFormat?.italic);
+  const underline = cf.fontUnderline ?? (base.underline || !!styleFormat?.underline);
+  const strike = cf.fontStrike ?? (base.strike || !!styleFormat?.strike);
+  return bold === base.bold && italic === base.italic &&
+    underline === base.underline && strike === base.strike
     ? base
-    : { ...base, bold, italic };
+    : { ...base, bold, italic, underline, strike };
 }
 
 function richHardBreakLineMetrics(
@@ -3165,28 +3188,24 @@ function richHardBreakLineMetrics(
   }
 
   let lastTextPt = baseFont.size;
-  let lastTextFamily: string | null = baseFont.name;
   return lineRuns.map((line) => {
     if (line.length === 0) {
       return {
         runs: line,
-        heightPx: vMetricPx(lastTextPt || DEFAULT_FONT_SIZE, cs, 1.2, lastTextFamily ?? undefined),
+        heightPx: vMetricPx(lastTextPt || DEFAULT_FONT_SIZE, cs, 1.2),
       };
     }
     let maxPt = 0;
-    let maxFamily: string | null = null;
     for (const run of line) {
       const font = applyRunFont(baseFont, run);
       if (font.size > maxPt) {
         maxPt = font.size;
-        maxFamily = font.name;
       }
       lastTextPt = font.size;
-      lastTextFamily = font.name;
     }
     return {
       runs: line,
-      heightPx: vMetricPx(maxPt, cs, 1.2, maxFamily ?? undefined),
+      heightPx: vMetricPx(maxPt, cs, 1.2),
     };
   });
 }
@@ -3205,7 +3224,7 @@ function requiredAutoCellHeightPx(
 ): number {
   const paddingX = 3;
   const paddingY = 2;
-  const alignH = xf.alignH ?? (cell.value.type === 'number' ? 'right' : 'left');
+  const alignH = xf.alignH ?? generalHorizontalAlignment(cell.value.type);
   const indentPx = xf.indent ? Math.round(xf.indent * 3 * mdw) : 0;
   // Keep the wrapping width identical to paint: icon-set cells reserve their
   // current icon square plus 4px. The icon itself scales with the row height,
@@ -3220,7 +3239,7 @@ function requiredAutoCellHeightPx(
   const hasRichText = !!runs?.length;
   const rotation = xf.textRotation ?? 0;
 
-  ctx.font = buildFont(font, 1, cjkFallback, text);
+  ctx.font = buildFont(ctx, font, 1, cjkFallback, text);
   if (rotation === 255) {
     // Paint deliberately uses the compact 1.1 slot without a document-family
     // design-line floor for stacked glyphs; auto-fit must use the same metric.
@@ -3230,7 +3249,7 @@ function requiredAutoCellHeightPx(
     const angle = rotation <= 90
       ? rotation * Math.PI / 180
       : (rotation - 90) * Math.PI / 180;
-    const lineHeight = vMetricPx(font.size, 1, 1.2, font.name ?? undefined);
+    const lineHeight = vMetricPx(font.size, 1, 1.2);
     const textWidth = ctx.measureText(text.replace(/\n/g, ' ')).width;
     return Math.abs(Math.sin(angle)) * textWidth
       + Math.abs(Math.cos(angle)) * lineHeight
@@ -3240,16 +3259,16 @@ function requiredAutoCellHeightPx(
   let lineHeights: number[];
   if (xf.wrapText && hasRichText) {
     lineHeights = layoutRichTextLines(ctx, runs, font, 1, availableWidth, cjkFallback)
-      .map((line) => vMetricPx(line.maxFontSize, 1, 1.2, line.maxFontFamily ?? undefined));
+      .map((line) => vMetricPx(line.maxFontSize, 1, 1.2));
   } else if (xf.wrapText) {
-    ctx.font = buildFont(font, 1, cjkFallback, text);
-    const lineHeight = vMetricPx(font.size, 1, 1.2, font.name ?? undefined);
+    ctx.font = buildFont(ctx, font, 1, cjkFallback, text);
+    const lineHeight = vMetricPx(font.size, 1, 1.2);
     lineHeights = wrapTextLines(ctx, text, availableWidth).map(() => lineHeight);
   } else if (hasRichText) {
     lineHeights = richHardBreakLineMetrics(runs, font, 1).map((line) => line.heightPx);
   } else {
     const lineCount = Math.max(1, text.split('\n').length);
-    const lineHeight = vMetricPx(font.size, 1, 1.2, font.name ?? undefined);
+    const lineHeight = vMetricPx(font.size, 1, 1.2);
     lineHeights = Array.from({ length: lineCount }, () => lineHeight);
   }
 
@@ -3271,7 +3290,7 @@ function cellCanGrowAutomaticRow(
     if (cell.value.text.includes('\n')) return true;
     for (const run of cell.value.runs ?? []) {
       const runFont = applyRunFont(font, run);
-      if (vMetricPx(runFont.size, 1, 1.2, runFont.name ?? undefined) > defaultFontLineHeightPx) {
+      if (vMetricPx(runFont.size, 1, 1.2) > defaultFontLineHeightPx) {
         return true;
       }
     }
@@ -3282,7 +3301,7 @@ function cellCanGrowAutomaticRow(
   // 14.25pt default row rounds to 19px while Calibri 11pt plus cell inset is
   // 20px). Only a font whose design line box exceeds the workbook Normal font
   // can make an otherwise unwrapped, single-line cell eligible for auto-fit.
-  return vMetricPx(font.size, 1, 1.2, font.name ?? undefined) > defaultFontLineHeightPx;
+  return vMetricPx(font.size, 1, 1.2) > defaultFontLineHeightPx;
 }
 
 /**
@@ -3312,13 +3331,15 @@ export function applyAutoRowHeights(
 
   const geometry = getGridGeometryForWorksheet(worksheet);
   const defaultHeightPx = rowHeightToPx(worksheet.defaultRowHeight);
+  // Row auto-fit compares against the Normal style's font; column MDW uses
+  // the default font (`<fonts>[0]`), which may differ.
   const defaultFontLineHeightPx = vMetricPx(
-    worksheet.defaultFontSize ?? DEFAULT_FONT_SIZE,
+    worksheet.normalFontSize ?? worksheet.defaultFontSize ?? DEFAULT_FONT_SIZE,
     1,
     1.2,
-    worksheet.defaultFontFamily,
   );
-  const { cfContext, mergeAnchorSet, mergeSkipSet, tableStyleMap } = getSheetRenderCache(worksheet);
+  const { cfContext, mergeAnchorSet, mergeSkipSet, structuredStyleMap } =
+    getSheetRenderCache(worksheet, styles);
   const derived = new Map<number, number>();
   let changed = false;
   ctx.save();
@@ -3331,6 +3352,7 @@ export function applyAutoRowHeights(
         row.hidden ||
         row.customHeight === true ||
         row.height !== null ||
+        rowResizeContains(rowResizeRanges(worksheet), row.index) ||
         Object.hasOwn(worksheet.rowHeights, row.index)
       ) continue;
       let requiredPx = defaultHeightPx;
@@ -3356,7 +3378,7 @@ export function applyAutoRowHeights(
         // O(cells) with a small constant even on a dense virtualized sheet.
         if (!cellCanGrowAutomaticRow(cell, font, xf, defaultFontLineHeightPx)) continue;
         const cf = evaluateCf(cell, row.index, cell.col, cfContext, styles.dxfs ?? []);
-        const measuredFont = effectiveMeasurementFont(font, cf, tableStyleMap.get(key), styles);
+        const measuredFont = layeredCellFont(font, cf, structuredStyleMap.get(key));
         const formatted = formatCellValueWithColor(cell, styles, cf.numFmt, worksheet.date1904);
         const text = formatted.text;
         if (!text || (text === '0' && worksheet.showZeros === false)) continue;
@@ -3467,6 +3489,7 @@ export function invalidateAutoRowHeights(
   const preserved = new Set(preserveRows);
   let changed = false;
   for (const [row, derived] of state.derived) {
+    if (rowResizeContains(rowResizeRanges(worksheet), row)) continue;
     if (preserved.has(row)) continue;
     if (worksheet.rowHeights[row] !== derived) continue;
     delete worksheet.rowHeights[row];
@@ -3482,7 +3505,34 @@ interface OverflowColumnOverscan {
   anchorKeys: Set<string>;
 }
 
-function precedingColumn(cols: readonly number[], boundary: number): number | undefined {
+// Paint walks only materialized (non-hidden) column bands, so a value in a
+// hidden column neither paints nor blocks a neighbour's spill. The overscan
+// search skips hidden columns the same way. A row's visible value columns
+// depend only on the (memoized, per-scale) axis, so they are filtered once per
+// row and axis and only when the nearest value is actually hidden.
+const visibleValueColsByAxis = new WeakMap<
+  GridAxisGeometry,
+  WeakMap<readonly number[], readonly number[]>
+>();
+
+function visibleValueCols(
+  cols: readonly number[],
+  colAxis: GridAxisGeometry,
+): readonly number[] {
+  let byRow = visibleValueColsByAxis.get(colAxis);
+  if (!byRow) {
+    byRow = new WeakMap();
+    visibleValueColsByAxis.set(colAxis, byRow);
+  }
+  let visible = byRow.get(cols);
+  if (!visible) {
+    visible = cols.filter((col) => colAxis.sizeOf(col) > 0);
+    byRow.set(cols, visible);
+  }
+  return visible;
+}
+
+function precedingIndex(cols: readonly number[], boundary: number): number {
   let low = 0;
   let high = cols.length;
   while (low < high) {
@@ -3490,10 +3540,10 @@ function precedingColumn(cols: readonly number[], boundary: number): number | un
     if (cols[middle] < boundary) low = middle + 1;
     else high = middle;
   }
-  return low > 0 ? cols[low - 1] : undefined;
+  return low - 1;
 }
 
-function followingColumn(cols: readonly number[], boundary: number): number | undefined {
+function followingIndex(cols: readonly number[], boundary: number): number {
   let low = 0;
   let high = cols.length;
   while (low < high) {
@@ -3501,7 +3551,29 @@ function followingColumn(cols: readonly number[], boundary: number): number | un
     if (cols[middle] <= boundary) low = middle + 1;
     else high = middle;
   }
-  return low < cols.length ? cols[low] : undefined;
+  return low;
+}
+
+function precedingColumn(
+  cols: readonly number[],
+  boundary: number,
+  colAxis: GridAxisGeometry,
+): number | undefined {
+  const nearest = cols[precedingIndex(cols, boundary)];
+  if (nearest == null || colAxis.sizeOf(nearest) > 0) return nearest;
+  const visible = visibleValueCols(cols, colAxis);
+  return visible[precedingIndex(visible, boundary)];
+}
+
+function followingColumn(
+  cols: readonly number[],
+  boundary: number,
+  colAxis: GridAxisGeometry,
+): number | undefined {
+  const nearest = cols[followingIndex(cols, boundary)];
+  if (nearest == null || colAxis.sizeOf(nearest) > 0) return nearest;
+  const visible = visibleValueCols(cols, colAxis);
+  return visible[followingIndex(visible, boundary)];
 }
 
 function mergeBlocksOverflow(
@@ -3509,11 +3581,15 @@ function mergeBlocksOverflow(
   row: number,
   left: number,
   right: number,
+  colAxis: GridAxisGeometry,
 ): boolean {
-  return (worksheet.mergeCells ?? []).some((merge) => (
-    row >= merge.top && row <= merge.bottom &&
-    merge.right >= left && merge.left <= right
-  ));
+  return (worksheet.mergeCells ?? []).some((merge) => {
+    if (row < merge.top || row > merge.bottom) return false;
+    const first = Math.max(left, merge.left);
+    const last = Math.min(right, merge.right);
+    // A merge blocks only where it covers a visible column.
+    return first <= last && colAxis.offsetOf(last + 1) > colAxis.offsetOf(first);
+  });
 }
 
 /**
@@ -3527,6 +3603,17 @@ function mergeBlocksOverflow(
  * any earlier cell is necessarily blocked by that nearer value. A candidate is
  * admitted only when its measured overflow crosses the sheet-space viewport
  * boundary, so this does not introduce an arbitrary overscan column count.
+ *
+ * The band is one pane's column band. Excel paints each freeze pane as its own
+ * window onto the sheet (observed in Excel 16.114 with frozen columns, both
+ * unscrolled and scrolled): the frozen pane shows columns 1..xSplit at their
+ * sheet offsets, the scrollable pane shows the sheet from its first scrolled
+ * column, and in each pane a value spills through empty neighbours in that
+ * pane's sheet coordinates regardless of which side of the freeze line the
+ * value lies on. A frozen-column value therefore continues into the
+ * scrollable pane (and moves with its scroll), and a right-aligned or centred
+ * value right of the freeze line spills into the frozen pane, even after its
+ * own column has scrolled out of view.
  */
 function virtualizedTextOverflowOverscan(
   ctx: CanvasRenderingContext2D,
@@ -3535,14 +3622,13 @@ function virtualizedTextOverflowOverscan(
   cellMap: Map<string, Cell>,
   nonEmptyColsByRow: Map<number, readonly number[]>,
   cfContext: CfContext,
-  tableStyleMap: Map<string, TableCellStyle>,
+  structuredStyleMap: Map<string, StructuredCellFormat>,
   mergeAnchorMap: Map<string, { totalW: number; totalH: number; right: number; bottom: number }>,
   colAxis: GridAxisGeometry,
   rowAxis: GridAxisGeometry,
   rowIndices: readonly number[],
   visibleStartCol: number,
   visibleEndCol: number,
-  firstScrollableCol: number,
   cs: number,
   mdw: number,
   rtl: boolean,
@@ -3562,7 +3648,9 @@ function virtualizedTextOverflowOverscan(
     const cell = cellMap.get(key);
     if (!cell || cell.value.type === 'empty' || mergeAnchorMap.has(key)) return false;
 
-    const { font, xf } = resolveXf(styles, cell.styleIndex ?? 0);
+    // Resolve the style exactly as paint does (a cell without its own `s`
+    // inherits the column style, §18.3.1.13).
+    const { font, xf } = resolveXf(styles, effectiveCellStyleIndex(worksheet, cell, col));
     const cf = evaluateCf(cell, row, col, cfContext, styles.dxfs ?? []);
     const formatted = formatCellValueWithColor(cell, styles, cf.numFmt, worksheet.date1904);
     const text = formatted.text;
@@ -3575,26 +3663,15 @@ function virtualizedTextOverflowOverscan(
       text.includes('\n')
     ) return false;
 
-    const tableStyle = tableStyleMap.get(key);
-    const tableFontDxfId = tableStyle?.isHeader
-      ? tableStyle.headerRowDxf
-      : tableStyle?.isTotals
-        ? tableStyle.totalRowDxf
-        : tableStyle?.isLastCol && tableStyle.lastColumnDxf != null
-          ? tableStyle.lastColumnDxf
-          : tableStyle?.isFirstCol && tableStyle.firstColumnDxf != null
-            ? tableStyle.firstColumnDxf
-            : tableStyle?.stripeDxf ?? tableStyle?.wholeTableDxf;
-    const tableFontDxf = tableFontDxfId != null ? styles.dxfs?.[tableFontDxfId] : undefined;
-    const builtInTableBold = !!tableStyle && !tableStyle.isCustom && (tableStyle.isHeader || tableStyle.isTotals);
-    const effectiveBold = font.bold || !!cf.fontBold || builtInTableBold || !!tableFontDxf?.font?.bold;
-    const effectiveItalic = font.italic || !!cf.fontItalic;
+    const styleFormat = structuredStyleMap.get(key);
+    const effectiveBold = cf.fontBold ?? (font.bold || !!styleFormat?.bold);
+    const effectiveItalic = cf.fontItalic ?? (font.italic || !!styleFormat?.italic);
     const effectiveFont = (effectiveBold !== font.bold || effectiveItalic !== font.italic)
       ? { ...font, bold: effectiveBold, italic: effectiveItalic }
       : font;
-    ctx.font = buildFont(effectiveFont, cs, cjkFallback, text);
+    ctx.font = buildFont(ctx, effectiveFont, cs, cjkFallback, text);
 
-    const alignH = xf.alignH ?? 'left';
+    const alignH = xf.alignH ?? generalHorizontalAlignment(cell.value.type);
     const paddingX = 3;
     const indentPx = xf.indent ? Math.round(xf.indent * 3 * mdw) : 0;
     const cellW = colAxis.sizeOf(col);
@@ -3621,13 +3698,12 @@ function virtualizedTextOverflowOverscan(
     const nonEmptyCols = nonEmptyColsByRow.get(row);
     if (!nonEmptyCols) continue;
 
-    const before = precedingColumn(nonEmptyCols, visibleStartCol);
+    const before = precedingColumn(nonEmptyCols, visibleStartCol, colAxis);
     const visibleStartCell = cellMap.get(`${row}:${visibleStartCol}`);
     if (
       before != null &&
-      before >= firstScrollableCol &&
       (!visibleStartCell || visibleStartCell.value.type === 'empty') &&
-      !mergeBlocksOverflow(worksheet, row, before + 1, visibleStartCol) &&
+      !mergeBlocksOverflow(worksheet, row, before + 1, visibleStartCol, colAxis) &&
       reaches(
         row,
         before,
@@ -3639,13 +3715,13 @@ function virtualizedTextOverflowOverscan(
       anchorKeys.add(`${row}:${before}`);
     }
 
-    const after = followingColumn(nonEmptyCols, visibleEndCol);
+    const after = followingColumn(nonEmptyCols, visibleEndCol, colAxis);
     const visibleEndCell = cellMap.get(`${row}:${visibleEndCol}`);
     if (
       after != null &&
       after <= MAX_WORKSHEET_COL &&
       (!visibleEndCell || visibleEndCell.value.type === 'empty') &&
-      !mergeBlocksOverflow(worksheet, row, visibleEndCol, after - 1) &&
+      !mergeBlocksOverflow(worksheet, row, visibleEndCol, after - 1, colAxis) &&
       reaches(
         row,
         after,
@@ -3665,6 +3741,8 @@ function virtualizedTextOverflowOverscan(
  * The projection may differ only in row/column sizing and outline flags; cells,
  * merges, formatting, tables, links, comments, and sparklines remain source-owned. */
 export function inheritSheetRenderCache(source: Worksheet, projection: Worksheet): void {
+  inheritCellFontLanguage(source, projection);
+  inheritWorksheetPolicy(source, projection);
   sheetRenderCache.set(projection, getSheetRenderCache(source));
 }
 
@@ -3676,11 +3754,13 @@ export function renderViewport(
   opts: RenderViewportOptions = {},
   cjkFallback?: CjkLang,
 ): void {
+  bindXlsxOfficeFontRoutes(ctx, worksheet, opts.officeFontRoutes, opts.googleSubstitutes === true);
+  pinXlsxGridGeometry(worksheet, opts.authoritativeMdw);
   const dpr = opts.dpr ?? 1;
   const cs = opts.cellScale ?? 1;
   const chartSheet = worksheet.isChartSheet === true;
   // Resolve MDW once per render — workbook-wide value derived from the
-  // Normal-style font (ECMA-376 §18.3.1.13).
+  // default font, `<fonts>[0]` (ECMA-376 §18.3.1.13).
   const geometry = getGridGeometryForWorksheet(worksheet);
   const mdw = geometry.maximumDigitWidth;
   const canvasW = ctx.canvas.width / dpr;
@@ -3697,7 +3777,13 @@ export function renderViewport(
   const hw = chartSheet ? 0 : sp(HEADER_W);  // scaled header column width
   const hh = chartSheet ? 0 : sp(HEADER_H);  // scaled header row height
 
-  const { row: startRow, col: startCol, rows: numRows, cols: numCols } = viewport;
+  // Viewport rows and columns are 1-based. The grid bands already clamp a
+  // start below 1 to the first row/column; clamp it once here so anchored
+  // drawings (positioned from the same start) stay registered with the grid
+  // instead of shifting by one default column width / row height.
+  const { rows: numRows, cols: numCols } = viewport;
+  const startRow = Math.max(1, Math.trunc(viewport.row) || 1);
+  const startCol = Math.max(1, Math.trunc(viewport.col) || 1);
   const scrollOffsetX = (opts.scrollOffsetX ?? 0) * cs;
   const scrollOffsetY = (opts.scrollOffsetY ?? 0) * cs;
   const { col: colAxis, row: rowAxis } = geometry.axesAtScale(cs);
@@ -3742,13 +3828,14 @@ export function renderViewport(
   // ── Viewport-independent lookups (memoized per Worksheet) ────
   const {
     cellMap, cfContext, mergeSkipSet, autoFilterCells,
-    hyperlinkMap, commentCells, tableStyleMap, sparklineMap,
+    hyperlinkMap, commentCells, structuredStyleMap, sparklineMap,
     nonEmptyColsByRow,
-  } = getSheetRenderCache(worksheet);
+  } = getSheetRenderCache(worksheet, styles);
 
   // Merge anchor sizes are cellScale-scaled, so they stay per-frame.
   const mergeAnchorMap = new Map<string, { totalW: number; totalH: number; right: number; bottom: number }>();
   const mergeAnchorIdentity = coordinateIndexIdentity(
+    worksheet,
     'worksheet-merge-anchor-index',
     'index-merge-anchor-coordinates',
   );
@@ -3778,18 +3865,44 @@ export function renderViewport(
     cellMap,
     nonEmptyColsByRow,
     cfContext,
-    tableStyleMap,
+    structuredStyleMap,
     mergeAnchorMap,
     colAxis,
     rowAxis,
     overflowRows,
     visibleStartCol,
     visibleEndCol,
-    freezeCols + 1,
     cs,
     mdw,
     worksheet.rightToLeft === true, cjkFallback
   );
+  // The frozen pane has the same rule on its own fixed band 1..freezeCols:
+  // only values to its right can reach it, through leftward or centred spill.
+  const frozenOverflowOverscan = freezeCols > 0
+    ? virtualizedTextOverflowOverscan(
+      ctx,
+      worksheet,
+      styles,
+      cellMap,
+      nonEmptyColsByRow,
+      cfContext,
+      structuredStyleMap,
+      mergeAnchorMap,
+      colAxis,
+      rowAxis,
+      overflowRows,
+      1,
+      freezeCols,
+      cs,
+      mdw,
+      worksheet.rightToLeft === true, cjkFallback
+    )
+    : { startCol: 1, endCol: 0, anchorKeys: new Set<string>() };
+  const renderFrozenColBands = frozenOverflowOverscan.endCol > freezeCols
+    ? colAxis.bandsToCover(1, frozenOverflowOverscan.endCol)
+    : frozenColBands;
+  const renderFrozenColIndices = renderFrozenColBands.map(({ index }) => index);
+  const renderFrozenColWidths = renderFrozenColBands.map(({ size }) => size);
   const renderScrollColBands = colAxis.bandsToCover(
     overflowOverscan.startCol,
     overflowOverscan.endCol,
@@ -3814,11 +3927,14 @@ export function renderViewport(
     autoFilterCells,
     hyperlinkMap,
     commentCells,
-    tableStyleMap,
+    structuredStyleMap,
     sparklineMap,
     overflowTextAnchors: overflowOverscan.anchorKeys,
+    textRunPane: { first: freezeCols + 1, last: Number.POSITIVE_INFINITY, ownerShiftX: 0 },
+    firstViewportCol: visibleStartCol,
+    selectionLastCol: Number.POSITIVE_INFINITY,
+    textRuns: opts.onTextRun ? { owned: new Map(), foreign: new Map() } : undefined,
     mdw,
-    onTextRun: opts.onTextRun,
     rtl: worksheet.rightToLeft === true,
     canvasW,
     threeD: opts.threeD,
@@ -3832,11 +3948,38 @@ export function renderViewport(
   const scrollAreaW = Math.max(0, canvasW - scrollAreaX);
   const scrollAreaH = Math.max(0, canvasH - scrollAreaY);
 
+  // Un-mirrored canvas x of sheet offset 0 in each pane; their difference maps
+  // a cell painted as cross-pane overflow back to its owning pane.
+  const frozenPaneOrigin = cellAreaX - colAxis.offsetOf(1);
+  const scrollPaneOrigin = scrollAreaX - scrollOffsetX - colAxis.offsetOf(visibleStartCol);
+  // Ownership follows the authored freeze: columns frozen but beyond the
+  // canvas still belong to the frozen pane.
+  const authoredFreezeCols = chartSheet ? 0 : Math.max(0, Math.trunc(opts.freezeCols ?? 0));
+  const scrollRc: RenderContext = {
+    ...rc,
+    textRunPane: {
+      first: authoredFreezeCols + 1,
+      last: Number.POSITIVE_INFINITY,
+      ownerShiftX: frozenPaneOrigin - scrollPaneOrigin,
+    },
+  };
+  const frozenRc: RenderContext = {
+    ...rc,
+    overflowTextAnchors: frozenOverflowOverscan.anchorKeys,
+    textRunPane: {
+      first: 1,
+      last: authoredFreezeCols,
+      ownerShiftX: scrollPaneOrigin - frozenPaneOrigin,
+    },
+    firstViewportCol: frozenColIndices[0] ?? 1,
+    selectionLastCol: freezeCols,
+  };
+
   // ── Q1: frozen rows × frozen cols ───────────────────────────
   if (freezeRows > 0 && freezeCols > 0) {
-    renderQuadrant(ctx, rc,
-      1, 1, frozenColWidths, frozenRowHeights,
-      frozenColIndices, frozenRowIndices,
+    renderQuadrant(ctx, frozenRc,
+      1, 1, renderFrozenColWidths, frozenRowHeights,
+      renderFrozenColIndices, frozenRowIndices,
       0, 0,
       cellAreaX, cellAreaY,
       cellAreaX, cellAreaY, frozenW, frozenH, cjkFallback
@@ -3845,7 +3988,7 @@ export function renderViewport(
 
   // ── Q2: frozen rows × scrollable cols ───────────────────────
   if (freezeRows > 0) {
-    renderQuadrant(ctx, rc,
+    renderQuadrant(ctx, scrollRc,
       1, overflowOverscan.startCol, renderScrollColWidths, frozenRowHeights,
       renderScrollColIndices, frozenRowIndices,
       renderScrollOffsetX, 0,
@@ -3856,9 +3999,9 @@ export function renderViewport(
 
   // ── Q3: scrollable rows × frozen cols ───────────────────────
   if (freezeCols > 0) {
-    renderQuadrant(ctx, rc,
-      startRow, 1, frozenColWidths, scrollRowHeights,
-      frozenColIndices, scrollRowIndices,
+    renderQuadrant(ctx, frozenRc,
+      startRow, 1, renderFrozenColWidths, scrollRowHeights,
+      renderFrozenColIndices, scrollRowIndices,
       0, scrollOffsetY,
       cellAreaX, scrollAreaY,
       cellAreaX, scrollAreaY, frozenW, scrollAreaH, cjkFallback
@@ -3867,13 +4010,22 @@ export function renderViewport(
 
   // ── Q4: scrollable rows × scrollable cols (main area) ───────
   if (!chartSheet) {
-    renderQuadrant(ctx, rc,
+    renderQuadrant(ctx, scrollRc,
       startRow, overflowOverscan.startCol, renderScrollColWidths, scrollRowHeights,
       renderScrollColIndices, scrollRowIndices,
       renderScrollOffsetX, scrollOffsetY,
       scrollAreaX, scrollAreaY,
       scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH, cjkFallback
     );
+  }
+
+  // Report each painted value once: owned runs in paint order, then values
+  // painted only as cross-pane overflow (their owning pane culled them).
+  if (rc.textRuns && opts.onTextRun) {
+    for (const run of rc.textRuns.owned.values()) opts.onTextRun(run);
+    for (const [key, run] of rc.textRuns.foreign) {
+      if (!rc.textRuns.owned.has(key)) opts.onTextRun(run);
+    }
   }
 
   // ── Anchored DrawingML objects, in authored z-order ───────────
@@ -4223,7 +4375,7 @@ function renderAnchoredDrawings(
         startRow, startCol, scrollOffsetX, scrollOffsetY,
         scrollAreaX, scrollAreaY, scrollAreaW, scrollAreaH,
         loadedImages, rtl, canvasW,
-        [{ ...drawing.anchor, shapes: [drawing.shape] }], cjkFallback
+        [drawing.anchor], cjkFallback, drawing.shape,
       );
     } else {
       renderCharts(
@@ -4291,41 +4443,19 @@ function renderImages(
   for (const anchor of anchors) {
     // A `<a:duotone>` picture was recoloured at decode time and cached under a
     // colour-suffixed key (§20.1.8.23); look it up with the same key.
-    const lookupKey = imageCacheKey(anchor.imagePath, anchor.duotone);
+    const effectFrame = imageAnchorEffectFrame(anchor);
+    const lookupKey = imageCacheKey(anchor.imagePath, imagePixelTransform(anchor, effectFrame), effectFrame);
     const img = loadedImages.get(lookupKey);
     const tiffUnavailable = isOptionalImageUnavailable(loadedImages, lookupKey, 'tiff');
     if (!img && !tiffUnavailable) continue;
 
-    // xdr col/row are 0-indexed; our widths map is 1-indexed.
-    const fromCol1 = anchor.fromCol + 1;
-    const fromRow1 = anchor.fromRow + 1;
-
-    // Image sheet-space top-left (always derived from the `from` anchor)
-    const imgSheetX1 = sheetXForCol(colAxis, fromCol1) + (anchor.fromColOff * cs) / EMU_PER_PX;
-    const imgSheetY1 = sheetYForRow(rowAxis, fromRow1) + (anchor.fromRowOff * cs) / EMU_PER_PX;
-
-    // ECMA-376 §20.5.2.33 + "Move but don't size with cells": when the
-    // anchor was saved with editAs="oneCell" Excel preserves the picture's
-    // saved EMU size (<xdr:spPr><a:xfrm><a:ext>) regardless of cell
-    // resizing, and the to anchor is only updated to track that fixed size.
-    // Use the native ext directly so the rendered image matches Excel even
-    // when our column-width / row-height computation diverges slightly from
-    // Excel's (e.g. row ht is stored as px in this viewer but Excel applies
-    // pt→px for some files). Falls back to the from/to-derived rect for
-    // editAs="twoCell" (default, image resizes with cells) and absolute
-    // anchors, or when the parser couldn't capture the native ext.
-    let imgW: number, imgH: number;
-    if (usesNativeOneCellExtent(anchor)) {
-      imgW = (anchor.nativeExtCx * cs) / EMU_PER_PX;
-      imgH = (anchor.nativeExtCy * cs) / EMU_PER_PX;
-    } else {
-      const toCol1 = anchor.toCol + 1;
-      const toRow1 = anchor.toRow + 1;
-      const imgSheetX2 = sheetXForCol(colAxis, toCol1) + (anchor.toColOff * cs) / EMU_PER_PX;
-      const imgSheetY2 = sheetYForRow(rowAxis, toRow1) + (anchor.toRowOff * cs) / EMU_PER_PX;
-      imgW = imgSheetX2 - imgSheetX1;
-      imgH = imgSheetY2 - imgSheetY1;
-    }
+    // One resolver owns the display rectangle for paint, hit-testing and
+    // culling/decode. The normative anchor facts and the library policies
+    // (tagged initial rect, untagged compatibility) are documented in
+    // internal/cell-anchor-geometry.ts.
+    const {
+      x: imgSheetX1, y: imgSheetY1, width: imgW, height: imgH,
+    } = resolveWorksheetAnchorRect(ws, anchor, colAxis, rowAxis, cs);
     if (imgW <= 0 || imgH <= 0) continue;
 
     // Translate to canvas coordinates of the scrollable viewport
@@ -4333,9 +4463,17 @@ function renderImages(
     const canvasX = sheetAnchoredRectX(logicalCanvasX, imgW, canvasW, rtl);
     const canvasY = scrollAreaY + (imgSheetY1 - scrollOriginSheetY) - scrollOffsetY;
 
-    // Early out when entirely off-screen
-    if (canvasX + imgW < clipX || canvasX > clipX + scrollAreaW) continue;
-    if (canvasY + imgH < scrollAreaY || canvasY > scrollAreaY + scrollAreaH) continue;
+    // A rotated rectangle can intersect the viewport even when its unrotated
+    // box does not. Flips preserve the same axis-aligned bounds.
+    // A prepared CT_Blip effect can extend beyond the authored frame (blur
+    // grow, glow, shadow); cull by the painted extent, not the frame alone.
+    const outset = img && !anchor.srcRect ? effectOutsetRect(img, canvasX, canvasY, imgW, imgH) : null;
+    const bounds = outset
+      ? transformedBoundsAbout(outset, canvasX + imgW / 2, canvasY + imgH / 2,
+        anchor.rotation ?? 0, anchor.flipH ?? false, anchor.flipV ?? false)
+      : rotatedImageBounds({ x: canvasX, y: canvasY, width: imgW, height: imgH }, anchor.rotation);
+    if (bounds.x + bounds.width < clipX || bounds.x > clipX + scrollAreaW) continue;
+    if (bounds.y + bounds.height < scrollAreaY || bounds.y > scrollAreaY + scrollAreaH) continue;
 
     // ECMA-376 §20.1.8.6 `<a:alphaModFix>`: scale the picture's opacity so it
     // composites over the cells beneath it. Saved/restored so it never leaks
@@ -4349,13 +4487,32 @@ function renderImages(
         });
       }
     };
-    if (anchor.alpha != null && anchor.alpha < 1) {
-      ctx.save();
-      ctx.globalAlpha = anchor.alpha;
-      paint();
-      ctx.restore();
+    const paintWithAlpha = () => {
+      if (anchor.alpha != null && anchor.alpha < 1) {
+        ctx.save();
+        try {
+          ctx.globalAlpha = anchor.alpha;
+          paint();
+        } finally {
+          ctx.restore();
+        }
+      } else {
+        paint();
+      }
+    };
+    const rotation = anchor.rotation ?? 0;
+    const flipH = anchor.flipH ?? false;
+    const flipV = anchor.flipV ?? false;
+    if (rotation === 0 && !flipH && !flipV) {
+      paintWithAlpha();
     } else {
-      paint();
+      withDrawingMLShapeTransform(ctx, {
+        rect: { x: canvasX, y: canvasY, w: imgW, h: imgH },
+        geometry: { kind: 'preset', name: 'rect', adjustments: [] },
+        fill: null,
+        stroke: null,
+        transform: { rotationDeg: rotation, flipH, flipV },
+      }, paintWithAlpha);
     }
   }
 
@@ -4381,6 +4538,9 @@ function renderShapeGroups(
   canvasW: number,
   anchors: readonly ShapeAnchor[] = ws.shapeGroups ?? [],
   cjkFallback?: CjkLang,
+  // Paint only this leaf of the (single) anchor. The anchor itself must stay
+  // the worksheet's own object: retained initial sizes are keyed by identity.
+  onlyShape?: ShapeInfo,
 ): void {
   if (scrollAreaW <= 0 || scrollAreaH <= 0) return;
   if (anchors.length === 0) return;
@@ -4395,47 +4555,115 @@ function renderShapeGroups(
   ctx.clip();
 
   for (const anchor of anchors) {
-    const fromCol1 = anchor.fromCol + 1;
-    const fromRow1 = anchor.fromRow + 1;
-
-    const x1 = sheetXForCol(colAxis, fromCol1) + (anchor.fromColOff * cs) / EMU_PER_PX;
-    const y1 = sheetYForRow(rowAxis, fromRow1) + (anchor.fromRowOff * cs) / EMU_PER_PX;
-
-    // editAs="oneCell" preserves the group's saved grpSpPr/xfrm/ext EMU
-    // size regardless of cell resizing (ECMA-376 §20.5.2.33). See
-    // renderImages for the same handling on stand-alone <xdr:pic>.
-    let w: number, h: number;
-    if (usesNativeOneCellExtent(anchor)) {
-      w = (anchor.nativeExtCx * cs) / EMU_PER_PX;
-      h = (anchor.nativeExtCy * cs) / EMU_PER_PX;
-    } else {
-      const toCol1 = anchor.toCol + 1;
-      const toRow1 = anchor.toRow + 1;
-      const x2 = sheetXForCol(colAxis, toCol1) + (anchor.toColOff * cs) / EMU_PER_PX;
-      const y2 = sheetYForRow(rowAxis, toRow1) + (anchor.toRowOff * cs) / EMU_PER_PX;
-      w = x2 - x1;
-      h = y2 - y1;
-    }
+    // Same resolver as renderImages. Normalized child transforms below are
+    // raw and only scale into this rectangle.
+    const { x: x1, y: y1, width: w, height: h } = resolveWorksheetAnchorRect(
+      ws, anchor, colAxis, rowAxis, cs,
+    );
     if (w <= 0 || h <= 0) continue;
 
     const logicalCanvasX = scrollAreaX + (x1 - scrollOriginSheetX) - scrollOffsetX;
     const canvasX = sheetAnchoredRectX(logicalCanvasX, w, canvasW, rtl);
     const canvasY = scrollAreaY + (y1 - scrollOriginSheetY) - scrollOffsetY;
 
-    if (canvasX + w < clipX || canvasX > clipX + scrollAreaW) continue;
-    if (canvasY + h < scrollAreaY || canvasY > scrollAreaY + scrollAreaH) continue;
+    // A picture leaf with a CT_Blip chain may paint an effect outset beyond
+    // the group rectangle; such groups are not culled by that rectangle.
+    const shapes = onlyShape ? [onlyShape] : anchor.shapes;
+    const effectLeaf = shapes.some(shape => shape.geom?.type === 'image' && blipEffectsMayExtendCoverage(shape.geom.blipEffects ?? []));
+    if (!effectLeaf && (canvasX + w < clipX || canvasX > clipX + scrollAreaW)) continue;
+    if (!effectLeaf && (canvasY + h < scrollAreaY || canvasY > scrollAreaY + scrollAreaH)) continue;
 
-    for (const shape of anchor.shapes) {
+    for (const shape of shapes) {
       const sx = canvasX + shape.x * w;
       const sy = canvasY + shape.y * h;
       const sw = shape.w * w;
       const sh = shape.h * h;
       if (sw <= 0 || sh <= 0) continue;
-      drawShape(ctx, shape, sx, sy, sw, sh, cs, loadedImages, cjkFallback);
+      drawShape(ctx, shape, sx, sy, sw, sh, cs, loadedImages, cjkFallback, anchor);
     }
   }
 
   ctx.restore();
+}
+
+// XLSX custom coordinates remain path-local until this format boundary.
+// Both ordinary painting and gradient outlines use the same arc/Bezier rules.
+function appendSpreadsheetCustomPath(
+  ctx: CanvasRenderingContext2D, path: PathInfo,
+  x: number, y: number, w: number, h: number,
+): void {
+  if (path.w <= 0 || path.h <= 0) return;
+  const kx = w / path.w;
+  const ky = h / path.h;
+  // Track pen position for arcTo center computation.
+  let penX = x, penY = y;
+  // Track subpath start for close lineTo.
+  let subX = x, subY = y;
+  for (const cmd of path.commands) {
+    switch (cmd.op) {
+      case 'moveTo': {
+        const px = x + cmd.x * kx, py = y + cmd.y * ky;
+        ctx.moveTo(px, py);
+        penX = subX = px; penY = subY = py;
+        break;
+      }
+      case 'lineTo': {
+        const px = x + cmd.x * kx, py = y + cmd.y * ky;
+        ctx.lineTo(px, py);
+        penX = px; penY = py;
+        break;
+      }
+      case 'cubicBezTo': {
+        const ex = x + cmd.x3 * kx, ey = y + cmd.y3 * ky;
+        ctx.bezierCurveTo(
+          x + cmd.x1 * kx, y + cmd.y1 * ky,
+          x + cmd.x2 * kx, y + cmd.y2 * ky,
+          ex, ey,
+        );
+        penX = ex; penY = ey;
+        break;
+      }
+      case 'quadBezTo': {
+        const ex = x + cmd.x2 * kx, ey = y + cmd.y2 * ky;
+        ctx.quadraticCurveTo(x + cmd.x1 * kx, y + cmd.y1 * ky, ex, ey);
+        penX = ex; penY = ey;
+        break;
+      }
+      case 'arcTo': {
+        // ECMA-376 §20.1.9.3: pen lies on ellipse at stAng;
+        // derive center from pen + stAng, then sweep swAng.
+        const rx = cmd.wr * kx, ry = cmd.hr * ky;
+        if (rx <= 0 || ry <= 0) break;
+        const stRad = (cmd.stAng / 60000) * (Math.PI / 180);
+        const swRad = (cmd.swAng / 60000) * (Math.PI / 180);
+        const cx = penX - Math.cos(stRad) * rx;
+        const cy = penY - Math.sin(stRad) * ry;
+        const endRad = stRad + swRad;
+        ctx.ellipse(cx, cy, rx, ry, 0, stRad, endRad, swRad < 0);
+        penX = cx + Math.cos(endRad) * rx;
+        penY = cy + Math.sin(endRad) * ry;
+        break;
+      }
+      case 'close':
+        ctx.closePath();
+        penX = subX; penY = subY;
+        break;
+    }
+  }
+}
+
+function appendSpreadsheetShapeOutline(
+  ctx: CanvasRenderingContext2D, shape: ShapeInfo,
+  x: number, y: number, w: number, h: number,
+): void {
+  if (shape.geom.type === 'custom') {
+    for (const path of shape.geom.paths) {
+      if (path.fill !== 'none') appendSpreadsheetCustomPath(ctx, path, x, y, w, h);
+    }
+  } else if (shape.geom.type !== 'preset'
+    || !buildPresetGeometryFillPath(ctx, shape.geom.name, x, y, w, h, shape.geom.adj ?? [])) {
+    ctx.rect(x, y, w, h);
+  }
 }
 
 function drawShape(
@@ -4445,7 +4673,9 @@ function drawShape(
   cs: number,
   loadedImages?: Map<string, CanvasImageSource | null>,
   cjkFallback?: CjkLang,
+  group?: { readonly nativeExtCx: number; readonly nativeExtCy: number },
 ): void {
+  if (usesPathShade(shape.strokeFill)) ctx = trackPaintPath(ctx);
   ctx.save();
   if (shape.rot !== 0 || shape.flipH || shape.flipV) {
     ctx.translate(sx + sw / 2, sy + sh / 2);
@@ -4457,67 +4687,23 @@ function drawShape(
   }
 
   if (shape.geom.type === 'custom') {
+    const fill = resolveSpreadsheetShapeFill(ctx, shape, sw, sh, cs);
     for (const path of shape.geom.paths) {
       if (path.w <= 0 || path.h <= 0) continue;
-      const kx = sw / path.w;
-      const ky = sh / path.h;
       ctx.beginPath();
-      // Track pen position for arcTo center computation.
-      let penX = 0, penY = 0;
-      // Track subpath start for close lineTo.
-      let subX = 0, subY = 0;
-      for (const cmd of path.commands) {
-        switch (cmd.op) {
-          case 'moveTo': {
-            const px = cmd.x * kx, py = cmd.y * ky;
-            ctx.moveTo(px, py);
-            penX = subX = px; penY = subY = py;
-            break;
-          }
-          case 'lineTo': {
-            const px = cmd.x * kx, py = cmd.y * ky;
-            ctx.lineTo(px, py);
-            penX = px; penY = py;
-            break;
-          }
-          case 'cubicBezTo': {
-            const ex = cmd.x3 * kx, ey = cmd.y3 * ky;
-            ctx.bezierCurveTo(
-              cmd.x1 * kx, cmd.y1 * ky,
-              cmd.x2 * kx, cmd.y2 * ky,
-              ex, ey,
-            );
-            penX = ex; penY = ey;
-            break;
-          }
-          case 'quadBezTo': {
-            const ex = cmd.x2 * kx, ey = cmd.y2 * ky;
-            ctx.quadraticCurveTo(cmd.x1 * kx, cmd.y1 * ky, ex, ey);
-            penX = ex; penY = ey;
-            break;
-          }
-          case 'arcTo': {
-            // ECMA-376 §20.1.9.3: pen lies on ellipse at stAng;
-            // derive center from pen + stAng, then sweep swAng.
-            const rx = cmd.wr * kx, ry = cmd.hr * ky;
-            if (rx <= 0 || ry <= 0) break;
-            const stRad = (cmd.stAng / 60000) * (Math.PI / 180);
-            const swRad = (cmd.swAng / 60000) * (Math.PI / 180);
-            const cx = penX - Math.cos(stRad) * rx;
-            const cy = penY - Math.sin(stRad) * ry;
-            const endRad = stRad + swRad;
-            ctx.ellipse(cx, cy, rx, ry, 0, stRad, endRad, swRad < 0);
-            penX = cx + Math.cos(endRad) * rx;
-            penY = cy + Math.sin(endRad) * ry;
-            break;
-          }
-          case 'close':
-            ctx.closePath();
-            penX = subX; penY = subY;
-            break;
+      appendSpreadsheetCustomPath(ctx, path, 0, 0, sw, sh);
+      // ECMA-376 §20.1.9.15: each custom path carries its own fill mode and
+      // stroke flag. `fill="none"` leaves the path unfilled and `stroke="0"`
+      // unstroked. The lighten/darken modes shade the fill by the amounts
+      // measured from PowerPoint's output (shared with the preset engine).
+      if (path.fill !== 'none' && fillShape(ctx, shape, sw, sh, cs, fill)) {
+        const overlay = pathFillModeOverlay(path.fill);
+        if (overlay) {
+          ctx.fillStyle = overlay;
+          ctx.fill();
         }
       }
-      fillAndStroke(ctx, shape, sw, sh);
+      if (path.stroke !== false) strokeShapePath(ctx, shape, sw, sh, cs);
     }
   } else if (shape.geom.type === 'preset') {
     // Drive the shape off the ECMA-376 §20.1.9 spec-driven preset engine
@@ -4526,19 +4712,9 @@ function drawShape(
     // renders with its true outline instead of the old rect fallback. The
     // engine returns false for presets it doesn't carry; only then do we fall
     // back to a plain rectangle.
-    const baseFill = resolveFill(
-      shape.fill ?? (shape.fillColor
-        ? { fillType: 'solid' as const, color: shape.fillColor }
-        : null),
-      ctx,
-      0,
-      0,
-      sw,
-      sh,
-      shape.rot,
-    );
+    const baseFill = resolveSpreadsheetShapeFill(ctx, shape, sw, sh, cs);
     const applyAndStroke = shape.strokeColor && shape.strokeWidth > 0
-      ? () => strokeShapePath(ctx, shape, sw, sh)
+      ? () => strokeShapePath(ctx, shape, sw, sh, cs)
       : null;
     const drawn = renderPresetShape(
       ctx,
@@ -4557,7 +4733,7 @@ function drawShape(
     if (!drawn) {
       ctx.beginPath();
       ctx.rect(0, 0, sw, sh);
-      fillAndStroke(ctx, shape, sw, sh);
+      fillAndStroke(ctx, shape, sw, sh, cs);
     }
   } else if (shape.geom.type === 'image') {
     // Image leaf inside a group (e.g. a sun-emoji clip-art nested in the
@@ -4568,7 +4744,8 @@ function drawShape(
     // optional codec cannot provide carries an explicit frame-local placeholder
     // mark.
     const imageGeom = shape.geom;
-    const lookupKey = imageCacheKey(imageGeom.imagePath, imageGeom.duotone);
+    const effectFrame = group ? groupLeafEffectFrame(group, shape) : undefined;
+    const lookupKey = imageCacheKey(imageGeom.imagePath, imagePixelTransform(imageGeom, effectFrame), effectFrame);
     const img = loadedImages?.get(lookupKey);
     const tiffUnavailable = isOptionalImageUnavailable(loadedImages, lookupKey, 'tiff');
     if (img || tiffUnavailable) {
@@ -4596,7 +4773,21 @@ function drawShape(
   // Shape text body (ECMA-376 §20.5.2.34 `<xdr:txBody>`). Drawn after
   // fill/stroke so it sits on top of the shape's background.
   if (shape.text) {
-    drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+    const stacked = shape.text.vert === 'wordArtVert' || shape.text.vert === 'wordArtVertRtl';
+    if (stacked && (shape.flipH || shape.flipV)) {
+      // Issue #1668 Excel controls: WordArt stays readable under flipH;
+      // flipV turns its unmirrored frame 180 degrees. Cancel the shape mirror
+      // first, keeping the authored rotation and physical text insets.
+      ctx.save();
+      ctx.translate(sw / 2, sh / 2);
+      ctx.scale(shape.flipH ? -1 : 1, shape.flipV ? -1 : 1);
+      if (shape.flipV) ctx.rotate(Math.PI);
+      ctx.translate(-sw / 2, -sh / 2);
+      drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+      ctx.restore();
+    } else {
+      drawShapeText(ctx, shape.text, sw, sh, cs, cjkFallback);
+    }
   }
   ctx.restore();
 }
@@ -4609,9 +4800,9 @@ function drawShape(
  * single column of paragraphs, per-run bold/italic/size/color/font, paragraph
  * align (`l`/`ctr`/`r`), body anchor (`t`/`ctr`/`b`). Text wrapping uses
  * canvas measurements when `bodyPr@wrap="square"` (the default), and the
- * inset is the OOXML default (`lIns=91440 EMU` ≈ 7.2 pt on each side, plus
- * `tIns=45720 EMU` ≈ 3.6 pt top/bottom). We approximate inset as a fixed
- * 7 px / 4 px since `bodyPr@*Ins` is rarely overridden in practice.
+ * inset is taken from `<a:bodyPr>` (the OOXML defaults are 91440 EMU left/right
+ * and 45720 EMU top/bottom). Only independently verified single-resource,
+ * single-line shapes receive the Office-observed natural line projection.
  */
 // ── Math (OMML) rendering in shapes ─────────────────────────────────────────
 // Equations are converted to SVG by MathJax once, cached by their MathNode[]
@@ -4630,15 +4821,6 @@ interface MathRender {
   tinted: Map<string, CanvasImageSource | null>;
 }
 const mathRenders = new WeakMap<MathNode[], MathRender>();
-
-/** Tint the cached black equation image to `color` via source-in (cached). */
-function tintedMathImage(render: MathRender, color: string): CanvasImageSource {
-  const cached = render.tinted.get(color);
-  if (cached) return cached;
-  const tinted = tintMathRaster(render.raster, color);
-  render.tinted.set(color, tinted);
-  return tinted;
-}
 
 /** Gather every math run reachable from a worksheet's shapes. Equations live
  *  only in shape text bodies (ECMA-376 §22.1) — never in cell values. */
@@ -4717,31 +4899,87 @@ export function drawShapeText(
   // former empirical padX=7 / padY=4 constants with the real, per-side insets —
   // the box is inset asymmetrically when the shape authors distinct lIns/rIns or
   // tIns/bIns.
-  const padLeft = (txt.lIns / EMU_PER_PX) * cs;
-  const padRight = (txt.rIns / EMU_PER_PX) * cs;
-  const padTop = (txt.tIns / EMU_PER_PX) * cs;
-  const padBottom = (txt.bIns / EMU_PER_PX) * cs;
-  const innerW = Math.max(0, sw - padLeft - padRight);
-  const innerH = Math.max(0, sh - padTop - padBottom);
+  const rect = drawingMlTextRect(sw, sh, {
+    lIns: txt.lIns, rIns: txt.rIns, tIns: txt.tIns, bIns: txt.bIns,
+  }, cs / EMU_PER_PX);
+  const padLeft = rect.left;
+  const innerW = rect.width;
+  const innerH = rect.height;
   if (innerW <= 0 || innerH <= 0) return;
+
+  // Font string + px size for a text run (math runs have no run-level font).
+  const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>, fontScale = 1): { font: string; px: number } => {
+    const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
+    const px = size * PT_TO_PX * cs * fontScale;
+    const family = fontStackFor(run.fontFace, cjkFallback, run.text,
+      officeRoute(ctx, run.fontFace, run.bold, run.italic),
+      googleSubstitutesByContext.get(ctx) === true,
+      undefined, contextRegularAlias(ctx, run.fontFace));
+    return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
+  };
+
+  if (txt.vert === 'wordArtVert' || txt.vert === 'wordArtVertRtl') {
+    // ECMA-376 §21.1.2.1.3: scale each run's original font size before
+    // measuring its stacked cell. An omitted scale means 100%.
+    const fontScale = txt.autoFit === 'norm' ? txt.fontScale ?? 1 : 1;
+    if (fontScale === 0) return; // A zero font scale has no glyph ink.
+    drawShapeStackedText(ctx, txt, txt.vert, rect, PT_TO_PX * cs, (run, text) => {
+      const face = isCjkBreakChar(text.codePointAt(0) ?? 0)
+        ? run.fontFaceEa ?? run.fontFace : run.fontFace;
+      return { ...textFont({ ...run, text, fontFace: face }, fontScale), face };
+    }, (run, precedingSizePt) => {
+      const render = mathRenders.get(run.nodes);
+      // Match horizontal input: optional/failed equations contribute neither
+      // ink nor a display break; preparation deliberately leaves them uncached.
+      if (!render) return undefined;
+      const pxSize = (run.fontSize ?? precedingSizePt) * PT_TO_PX * cs * fontScale;
+      const width = render.widthEm * pxSize;
+      const height = (render.ascentEm + render.descentEm) * pxSize;
+      return { width, height, draw: (x, y) => {
+        if (width > 0 && height > 0) ctx.drawImage(cachedTintedMathRaster(render, run.color ?? '#000000'), x, y, width, height);
+      } };
+    });
+    return;
+  }
+
+  // Excel's natural line box follows each run's font metrics (see
+  // excelDrawingMlLineRatios): Arial 1.150 em, Calibri 1.221 em, Meiryo
+  // 1.95 em, and so on, instead of a flat 1.2 em. A name alone cannot identify
+  // the selected bytes or their geometry. Use the metric box only when every
+  // text run's exact local face has loaded with unambiguous reference metrics.
+  // Otherwise the whole body keeps the ordinary 1.2 em Canvas line box, so one
+  // body never mixes two line-box models.
+  const runLineRatios = new Map<object, ShapeRunLineRatios>();
+  let metricBody = !txt.paragraphs.some((p) => p.runs.some((run) => run.type === 'math'));
+  const routes = officeRoutesByContext.get(ctx);
+  const fontBoxProbe = canvasShapeFontBoxProbe(ctx);
+  for (const paragraph of txt.paragraphs) for (const run of paragraph.runs) {
+    if (!metricBody) break;
+    if (run.type !== 'text') continue;
+    const ratios = run.fontFace
+      ? shapeRunLineRatios(run, routes?.[shapeOfficeRouteKey(run)], fontBoxProbe)
+      : undefined;
+    if (!ratios) metricBody = false;
+    else runLineRatios.set(run, ratios);
+  }
+  if (!txt.paragraphs.some((p) => p.runs.some((run) => run.type === 'text'))) metricBody = false;
 
   // A laid-out segment: measured text or a rasterized equation. `w` is the
   // advance width (px); math also carries baseline-relative ascent/descent.
   type Seg =
     | { kind: 'text'; text: string; font: string; color: string; w: number }
+    | { kind: 'tab'; w: number }
     | { kind: 'math'; render: MathRender; color: string; w: number; ascent: number; descent: number };
   // `leftInset` = px from padLeft to this line's left edge (paragraph left
   // margin, plus the first-line indent on a paragraph's first line). `availW` = the
   // width of the alignment region for this line (paraW, minus the first-line
   // indent on the first line). ECMA-376 §21.1.2.2.7 (marL/marR/indent).
-  type Line = { segs: Seg[]; align: string; height: number; ascent: number; hasMath: boolean; leftInset: number; availW: number };
-
-  // Font string + px size for a text run (math runs have no run-level font).
-  const textFont = (run: Extract<import('./types.js').ShapeTextRun, { type: 'text' }>): { font: string; px: number } => {
-    const size = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
-    const px = size * PT_TO_PX * cs;
-    const family = fontStackFor(run.fontFace, cjkFallback, run.text);
-    return { font: `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${px}px ${family}`, px };
+  // `height`/`ascent` are the spaced line box. `gapBefore` is the paragraph
+  // spacing (spcAft of the previous paragraph plus spcBef of this one) that
+  // precedes a paragraph's first line.
+  type Line = {
+    segs: Seg[]; align: string; height: number; ascent: number; hasMath: boolean;
+    leftInset: number; availW: number; gapBefore: number;
   };
 
   // Real font ascent for a line's alphabetic baseline (used on lines that mix
@@ -4762,240 +5000,260 @@ export function drawShapeText(
   // Wrap each paragraph into lines (segments preserve run order).
   const wrap = txt.wrap !== 'none';
   const lines: Line[] = [];
+  // Natural (unspaced) height of each line, indexed like `lines`.
+  const naturalHeights: number[] = [];
+  let previousParagraph: { spaceAfter: import('./types.js').ShapeParagraph['spaceAfter']; lastNaturalHeight: number } | undefined;
+  // The shared DrawingML break phase owns every soft opportunity. Excel keeps
+  // the resource resolver, equation raster, line-box policy, and paint here.
   for (const p of txt.paragraphs) {
     const align = p.align || 'l';
-    // ECMA-376 §21.1.2.2.7 direct paragraph indent (EMU → px, scaled by cs).
-    // Mirrors the pptx renderer (marLPx/marRPx/indentPx + firstLineIndent).
-    // Direct-attribute-only: xlsx text boxes have no lstStyle/level cascade, so
-    // the spec's literal implied defaults (marL=347663, indent=−342900) are
-    // deliberately NOT applied — there is no list-style tier to feed them, and
-    // pptx's resolver leaves a plain bulletless paragraph at 0 too. Absent ⇒ 0.
     const marLpx = ((p.marL ?? 0) / EMU_PER_PX) * cs;
     const marRpx = ((p.marR ?? 0) / EMU_PER_PX) * cs;
-    const indentPx = ((p.indent ?? 0) / EMU_PER_PX) * cs;
-    // First-line indent eats into available width only when positive; a hanging
-    // (negative) indent has no bullet gutter in xlsx, so it is clamped to 0.
-    const firstLineIndent = Math.max(0, indentPx);
+    const firstLineIndent = Math.max(0, ((p.indent ?? 0) / EMU_PER_PX) * cs);
     const paraW = Math.max(0, innerW - marLpx - marRpx);
-    // First line of the paragraph carries marLpx + firstLineIndent; continuation
-    // lines carry only marLpx. Flipped to true on the first flush within the
-    // paragraph (and on a display-math line, which is its own line).
-    let firstLineDone = false;
-    const lineLeftInset = () => (firstLineDone ? marLpx : marLpx + firstLineIndent);
-    const lineAvailW = () => (firstLineDone ? paraW : paraW - firstLineIndent);
-    let segs: Seg[] = [];
-    let lineW = 0;
-    let lineHeight = 0;
-    let lineAscent = 0;
-    let hasMath = false;
-    // ECMA-376 §21.1.2.2.5 <a:lnSpc> + §21.1.2.1.3 normAutofit lnSpcReduction.
-    // An explicitly authored spcPct uses the natural 1.2×em line base; the
-    // document-font design floor is reserved for omitted line spacing. spcPts
-    // remains an absolute per-line height (cs-scaled, like the cell/run px sizes).
-    const hasExplicitPct = p.spaceLine?.type === 'pct';
-    const applyLineSpacing = (h: number): number => {
-      let out = h;
-      if (p.spaceLine) {
-        if (p.spaceLine.type === 'pct') out = out * (p.spaceLine.val / 100000);
-        else out = p.spaceLine.val * PT_TO_PX * cs;
-      }
-      // normAutofit lnSpcReduction (§21.1.2.1.3): apply the STORED reduction
-      // only, and ONLY to paragraphs with PERCENTAGE line spacing — the spec's
-      // normative note reads "This attribute applies only to paragraphs with
-      // percentage line spacing." So pct and the implicit single (= 100 %
-      // percentage) get it; an absolute spcPts height does NOT. fontScale
-      // font-shrink and spAutoFit shape-grow are runtime layout behaviors
-      // intentionally out of scope (modeled but not applied) — the repo requires
-      // explicit user approval for reverse-engineered autofit.
-      if (txt.autoFit === 'norm' && txt.lnSpcReduction != null && p.spaceLine?.type !== 'pts') {
-        out *= 1 - txt.lnSpcReduction;
-      }
-      return out;
+    type ShapeStyle = {
+      kind: 'text' | 'math';
+      font: string;
+      color: string;
+      pxSize: number;
+      render?: MathRender;
+      ascent?: number;
+      descent?: number;
+      /** m:oMathPara display equation (own line, no first-line indent). */
+      display?: boolean;
+      /** Authored face of a text run, for an empty line's fallback ascent. */
+      face?: string;
+      /** Excel's natural line box of a text run, when the body uses it. */
+      ratios?: ShapeRunLineRatios;
     };
-    const flushLine = () => {
-      // An empty paragraph (no runs) or a blank line produced by a standalone /
-      // trailing <a:br> contributes no text or math segment, so lineHeight is
-      // still 0. ECMA-376 §21.1.2.1 / §21.1.2.2: such a line still reserves ONE
-      // single-line height — as tall as a one-character line of the paragraph's
-      // effective font. Without this the empty line reserved zero height, so the
-      // block under-measured and vertical anchoring ('ctr'/'b') drifted. Mirror
-      // the text-line formula (pxSize * 1.2, floored by the font's design line —
-      // see the run sites) using the nearest preceding text size AND face in
-      // this paragraph, falling back to the body default.
-      if (lineHeight === 0) {
-        const fallbackPx = (lastTextPt || DEFAULT_FONT_SIZE) * PT_TO_PX * cs;
-        const designFloor = Math.max(
-          intendedSingleLinePx(lastTextFace, fallbackPx),
-          intendedSingleLinePx(lastTextFaceEa, fallbackPx),
-        );
-        const naturalSingle = fallbackPx * 1.2;
-        lineHeight = hasExplicitPct
-          ? naturalSingle
-          : Math.max(naturalSingle, designFloor);
-        // An empty line carries no segment, so this ascent is never consumed by
-        // the draw pass (no text/math to place on the baseline); it is set only
-        // to keep the Line shape consistent. Measure it the same way as text
-        // runs — the nearest preceding face at the fallback size — rather than
-        // the old 0.85×em constant.
-        // No glyph is painted for an empty line, so a regional Han fallback
-        // must not perturb its generic line metric.
-        lineAscent = measuredAscent(`${fallbackPx}px ${fontStackFor(lastTextFace)}`, fallbackPx);
-      }
-      lineHeight = applyLineSpacing(lineHeight);
-      lines.push({ segs, align, height: lineHeight, ascent: lineAscent, hasMath, leftInset: lineLeftInset(), availW: lineAvailW() });
-      firstLineDone = true;
-      segs = []; lineW = 0; lineHeight = 0; lineAscent = 0; hasMath = false;
-    };
-    // Nearest preceding text size (pt) in this paragraph — inline math with no
-    // explicit rPr@sz inherits it (then falls back to the default).
+    const input: DrawingMlInputRun<ShapeStyle>[] = [];
     let lastTextPt = 0;
-    // Nearest preceding text AUTHORED faces — used to floor an empty/blank
-    // line's reserved single-line height by the tallest design line among the
-    // declared latin / ea faces (intendedSingleLinePx), matching the text-run
-    // floor below (cs is excluded from the line-box floor — see there).
-    let lastTextFace: string | undefined;
-    let lastTextFaceEa: string | undefined;
-
     for (const run of p.runs) {
-      if (run.type === 'break') { flushLine(); continue; }
-
+      if (run.type === 'break') { input.push({ type: 'break' }); continue; }
       if (run.type === 'math') {
         const render = mathRenders.get(run.nodes);
-        if (!render) continue; // engine not supplied / conversion failed → skip
-        const px = (run.fontSize ?? (lastTextPt || DEFAULT_FONT_SIZE)) * PT_TO_PX * cs;
-        const w = render.widthEm * px;
-        const ascent = render.ascentEm * px;
-        const descent = render.descentEm * px;
-        const color = run.color ?? '#000000';
-        if (run.display) {
-          // Block equation occupies its own line (centered per paragraph align).
-          // It takes the paragraph left margin (marLpx) but NOT the first-line
-          // indent — `indent` is a run-in indent for the first line of TEXT, not
-          // for a block equation — so use marLpx/paraW regardless of line position.
-          flushLine();
-          // Apply the paragraph's line spacing to a display equation's own line
-          // too (a block equation in a pct-spaced paragraph). ascent is kept
-          // unchanged; the alphabetic-baseline draw distributes the extra leading.
-          lines.push({ segs: [{ kind: 'math', render, color, w, ascent, descent }], align, height: applyLineSpacing(ascent + descent), ascent, hasMath: true, leftInset: marLpx, availW: paraW });
-          firstLineDone = true;
-          continue;
-        }
-        // Inline equation: treat as an atomic, non-breaking "word". Budget is
-        // this line's available width (paraW, minus first-line indent on the
-        // first line) rather than the full innerW.
-        if (wrap && lineW + w > lineAvailW() && segs.length > 0) flushLine();
-        segs.push({ kind: 'math', render, color, w, ascent, descent });
-        lineW += w;
-        lineHeight = Math.max(lineHeight, ascent + descent);
-        lineAscent = Math.max(lineAscent, ascent);
-        hasMath = true;
+        if (!render) continue;
+        const pxSize = (run.fontSize ?? (lastTextPt || DEFAULT_FONT_SIZE)) * PT_TO_PX * cs;
+        const ascent = render.ascentEm * pxSize;
+        const descent = render.descentEm * pxSize;
+        const style: ShapeStyle = {
+          kind: 'math', font: '', color: run.color ?? '#000000', pxSize,
+          render, ascent, descent, display: run.display === true,
+        };
+        input.push({ type: 'object', width: render.widthEm * pxSize, style, payload: style, display: run.display });
         continue;
       }
-
-      // Text run.
       lastTextPt = run.size > 0 ? run.size : DEFAULT_FONT_SIZE;
-      lastTextFace = run.fontFace;
-      lastTextFaceEa = run.fontFaceEa;
-      const { font, px: pxSize } = textFont(run);
-      const color = run.color ?? '#000000';
-      // When line spacing is omitted, floor the natural single line (Excel's
-      // flat 1.2×em) by the AUTHORED font's design line box (OS/2 win metrics,
-      // ECMA-376 §21.1.2.1.1) via core's intendedSingleLinePx — same floor
-      // docx/pptx apply. An explicit spcPct bypasses this floor per
-      // §21.1.2.2.5 / §21.1.2.2.11. intendedSingleLinePx returns 0 for every
-      // untabled face (Calibri etc. stay on 1.2×em); a substituted Meiryo
-      // (1.596×em) / Sakkal Majalla must measure to its taller design line when
-      // spacing is omitted. Floor by the tallest of the LATIN and EAST-ASIAN
-      // faces (the common Japanese encoding sets Meiryo only on `<a:ea>` while
-      // leaving `<a:latin>` default, §21.1.2.3.1). `<a:cs>` is parsed
-      // (see fontFaceCs) but deliberately NOT in this line-box floor: per the
-      // font-slot rules
-      // (§21.1.2.3.1 / §17.3.2.26) the complex-script face renders ONLY
-      // complex-script glyphs (Arabic/Hebrew/Thai), so an unconditional
-      // line-box floor by cs would over-grow a run whose glyphs are Latin/CJK
-      // (e.g. a Japanese run that merely also declares a tabled cs face). Getting
-      // cs right needs per-glyph/per-script handling (deferred, like pptx's
-      // per-glyph floor). Pass the authored names (the metric table keys on
-      // them), NOT the fallback stack. FLOOR, not a replace; matches the docx
-      // shape-text floor's max(latin, ea).
-      const designFloor = Math.max(
-        intendedSingleLinePx(run.fontFace, pxSize),
-        intendedSingleLinePx(run.fontFaceEa, pxSize),
-      );
-      const naturalSingle = pxSize * 1.2;
-      const singleLinePx = hasExplicitPct
-        ? naturalSingle
-        : Math.max(naturalSingle, designFloor);
-      lineHeight = Math.max(lineHeight, singleLinePx);
-      lineAscent = Math.max(lineAscent, measuredAscent(font, pxSize));
-      ctx.font = font;
-      // Defensive: a run's text may still contain a literal "\n".
-      const pieces = run.text.split('\n');
-      for (let s = 0; s < pieces.length; s++) {
-        if (s > 0) flushLine();
-        const piece = pieces[s];
-        if (!piece) continue;
-        if (!wrap) {
-          const w = ctx.measureText(piece).width;
-          segs.push({ kind: 'text', text: piece, font, color, w });
-          lineW += w;
+      const { font, px } = textFont(run);
+      input.push({ type: 'text', text: run.text,
+        style: { kind: 'text', font, color: run.color ?? '#000000', pxSize: px, face: run.fontFace,
+          ratios: metricBody ? runLineRatios.get(run) : undefined } });
+    }
+    const broken = breakDrawingMlText(input, {
+      maxWidth: wrap ? paraW : Infinity,
+      firstLineIndent,
+      measureText(text, style) {
+        ctx.font = style.font;
+        return ctx.measureText(text).width;
+      },
+      sameStyle: (left, right) => left.kind === right.kind
+        && left.font === right.font && left.color === right.color
+        && left.pxSize === right.pxSize,
+      tabStops: p.tabStops?.map((tab) => ({
+        pos: tab.pos / EMU_PER_PX * cs, algn: tab.algn,
+      })),
+      defaultTabSize: (p.defTabSz ?? 914400) / EMU_PER_PX * cs,
+      tabStartPen: (index) => marLpx + (index === 0 ? firstLineIndent : 0),
+    });
+    // A display equation always closes the pending line first. When nothing
+    // is pending (paragraph start, after <a:br>, a line feed or another display
+    // equation) that closed line is empty but still reserves one line height.
+    // An empty run is already a (blank) line of its own in the break phase.
+    const blankBeforeDisplay: boolean[] = [];
+    let pending = false;
+    for (const item of input) {
+      if (item.type === 'break') { pending = false; continue; }
+      if (item.type === 'object') {
+        if (item.display) { blankBeforeDisplay.push(!pending); pending = false; } else pending = true;
+        continue;
+      }
+      if (item.text === '') { pending = true; continue; }
+      item.text.split('\n').forEach((piece, s) => {
+        if (s > 0) pending = false;
+        if (piece.replace(/\r/gu, '') !== '') pending = true;
+      });
+    }
+    let displayIndex = 0;
+    // Empty lines take the nearest preceding text run's size and face.
+    const runIndexOf = new Map<ShapeStyle, number>();
+    input.forEach((item, idx) => { if (item.type === 'text') runIndexOf.set(item.style, idx); });
+    let fallback: ShapeStyle | undefined;
+    let fallbackIndex = -1;
+    const noteText = (style: ShapeStyle): void => {
+      const idx = runIndexOf.get(style) ?? -1;
+      if (idx >= fallbackIndex) { fallback = style; fallbackIndex = idx; }
+    };
+    const emptyLineBox = (): { height: number; ascent: number } => {
+      const pxSize = fallback?.pxSize ?? DEFAULT_FONT_SIZE * PT_TO_PX * cs;
+      const face = fallback?.face;
+      if (fallback?.ratios) {
+        return {
+          height: pxSize * (fallback.ratios.ascentRatio + fallback.ratios.descentRatio),
+          ascent: pxSize * fallback.ratios.ascentRatio,
+        };
+      }
+      return {
+        height: pxSize * 1.2,
+        ascent: measuredAscent(`${pxSize}px ${fontStackFor(face, undefined, '',
+          officeRoute(ctx, face), googleSubstitutesByContext.get(ctx) === true,
+          undefined, contextRegularAlias(ctx, face))}`, pxSize),
+      };
+    };
+    const reduction = txt.autoFit === 'norm' ? txt.lnSpcReduction ?? 0 : 0;
+    const spaceLine = excelShapeSpacing(p.spaceLine);
+    const lineHeightOf = (natural: number): number => drawingMlLineHeight(
+      natural, spaceLine, PT_TO_PX * cs, reduction,
+    );
+    // A metric line box keeps its natural ascent/descent split, which
+    // a:lnSpc then re-divides (drawingMlSpacedLineBox).
+    const metricLine = (ascent: number, descent: number): { height: number; ascent: number } => {
+      const box = drawingMlSpacedLineBox({ ascent, descent }, spaceLine, PT_TO_PX * cs, reduction);
+      return { height: box.ascent + box.descent, ascent: box.ascent };
+    };
+    const firstLineIndex = lines.length;
+    for (const [index, brokenLine] of broken.entries()) {
+      const segs: Seg[] = [];
+      let naturalHeight = 0;
+      let ascent = 0;
+      let metricAscent = 0;
+      let metricDescent = 0;
+      let hasMath = false;
+      let displayMath = false;
+      for (const part of brokenLine.segments) {
+        if (part.type === 'tab') {
+          segs.push({ kind: 'tab', w: part.width });
           continue;
         }
-        // Greedy character-level wrap (adequate for Latin + CJK). The wrap
-        // budget is the CURRENT line's available width — paraW on continuation
-        // lines, paraW − firstLineIndent on the paragraph's first line — not the
-        // full innerW (ECMA-376 §21.1.2.2.7 marL/marR/indent).
-        let buf = '';
-        for (const ch of piece) {
-          const candidate = buf + ch;
-          const cw = ctx.measureText(candidate).width;
-          if (lineW + cw > lineAvailW() && (buf.length > 0 || segs.length > 0)) {
-            if (buf) {
-              const w = ctx.measureText(buf).width;
-              segs.push({ kind: 'text', text: buf, font, color, w });
-              lineW += w;
-            }
-            flushLine();
-            buf = ch;
-            ctx.font = font;
-            // Re-seed this continuation line with the same design-line-floored
-            // single-line height as the run's first line (see singleLinePx above).
-            lineHeight = Math.max(lineHeight, singleLinePx);
-            lineAscent = Math.max(lineAscent, measuredAscent(font, pxSize));
-          } else {
-            buf = candidate;
-          }
+        if (part.type === 'object') {
+          const style = part.style;
+          if (!style.render) continue;
+          const mathAscent = style.ascent ?? 0;
+          const mathDescent = style.descent ?? 0;
+          segs.push({ kind: 'math', render: style.render, color: style.color,
+            w: part.width, ascent: mathAscent, descent: mathDescent });
+          naturalHeight = Math.max(naturalHeight, mathAscent + mathDescent);
+          ascent = Math.max(ascent, mathAscent);
+          hasMath = true;
+          if (style.display) displayMath = true;
+          continue;
         }
-        if (buf) {
-          const w = ctx.measureText(buf).width;
-          segs.push({ kind: 'text', text: buf, font, color, w });
-          lineW += w;
+        const style = part.style;
+        segs.push({ kind: 'text', text: part.text, font: style.font,
+          color: style.color, w: part.width });
+        naturalHeight = Math.max(naturalHeight, style.pxSize * 1.2);
+        ascent = Math.max(ascent, measuredAscent(style.font, style.pxSize));
+        if (style.ratios) {
+          metricAscent = Math.max(metricAscent, style.pxSize * style.ratios.ascentRatio);
+          metricDescent = Math.max(metricDescent, style.pxSize * style.ratios.descentRatio);
         }
+        noteText(style);
       }
+      if (displayMath && blankBeforeDisplay[displayIndex++]) {
+        const blank = emptyLineBox();
+        lines.push({ segs: [], align, height: lineHeightOf(blank.height), ascent: blank.ascent,
+          hasMath: false, leftInset: marLpx, availW: paraW, gapBefore: 0 });
+        naturalHeights.push(blank.height);
+      }
+      // Runs that paint nothing (trimmed or wrapped spaces) still size their line.
+      for (const idx of brokenLine.hiddenRuns ?? []) {
+        const item = input[idx];
+        if (item.type !== 'text') continue;
+        naturalHeight = Math.max(naturalHeight, item.style.pxSize * 1.2);
+        ascent = Math.max(ascent, measuredAscent(item.style.font, item.style.pxSize));
+        if (item.style.ratios) {
+          metricAscent = Math.max(metricAscent, item.style.pxSize * item.style.ratios.ascentRatio);
+          metricDescent = Math.max(metricDescent, item.style.pxSize * item.style.ratios.descentRatio);
+        }
+        noteText(item.style);
+      }
+      let height: number;
+      if (metricBody) {
+        // Office shares one baseline across the runs of a line and unions their
+        // ascents and descents (#1604 controls: Arial+Meiryo, Arial+MS Gothic,
+        // 11+40 pt runs in one line).
+        if (metricAscent + metricDescent === 0) {
+          const blank = emptyLineBox();
+          metricAscent = blank.ascent;
+          metricDescent = blank.height - blank.ascent;
+        }
+        naturalHeight = metricAscent + metricDescent;
+        ({ height, ascent } = metricLine(metricAscent, metricDescent));
+      } else {
+        if (naturalHeight === 0) ({ height: naturalHeight, ascent } = emptyLineBox());
+        height = lineHeightOf(naturalHeight);
+      }
+      // Classify this line by its own equation: an inline equation on a
+      // paragraph's first line keeps the first-line indent even when a later
+      // equation in the paragraph is display math.
+      const isDisplayMath = displayMath;
+      lines.push({
+        segs, align, height, ascent, hasMath,
+        leftInset: isDisplayMath ? marLpx : marLpx + (index === 0 ? firstLineIndent : 0),
+        availW: isDisplayMath ? paraW : paraW - (index === 0 ? firstLineIndent : 0),
+        gapBefore: 0,
+      });
+      naturalHeights.push(naturalHeight);
     }
-    flushLine();
+    // §21.1.2.2.10 spcBef / §21.1.2.2.9 spcAft. Excel adds the previous
+    // paragraph's spcAft and this paragraph's spcBef (#1604: 12 + 18 pt gave
+    // 30 pt), and ignores spcBef on the body's first paragraph. A percentage
+    // refers to the natural single-line height of the adjacent line. Each
+    // value is first rounded to a whole unit (excelShapeSpacing).
+    if (lines.length > firstLineIndex) {
+      if (previousParagraph && firstLineIndex > 0) {
+        lines[firstLineIndex].gapBefore = drawingMlParagraphSpacing(
+          excelShapeSpacing(previousParagraph.spaceAfter), previousParagraph.lastNaturalHeight, PT_TO_PX * cs,
+        ) + drawingMlParagraphSpacing(excelShapeSpacing(p.spaceBefore), naturalHeights[firstLineIndex], PT_TO_PX * cs);
+      }
+      previousParagraph = { spaceAfter: p.spaceAfter, lastNaturalHeight: naturalHeights[lines.length - 1] };
+    }
   }
 
+  // Canvas px size of a CSS font string built by textFont.
+  const fontPx = (font: string): number => Number(/(\d+(?:\.\d+)?)px/u.exec(font)?.[1] ?? 0);
+  // Offset from a 'middle' paint position to that run's alphabetic baseline.
+  const middleToAlphabetic = (seg: { font: string; text: string }): number => {
+    const prevFont = ctx.font;
+    const prevBaseline = ctx.textBaseline;
+    ctx.font = seg.font;
+    ctx.textBaseline = 'alphabetic';
+    const alphabetic = ctx.measureText(seg.text).actualBoundingBoxAscent;
+    ctx.textBaseline = 'middle';
+    const middle = ctx.measureText(seg.text).actualBoundingBoxAscent;
+    ctx.font = prevFont;
+    ctx.textBaseline = prevBaseline;
+    const offset = alphabetic - middle;
+    return Number.isFinite(offset) ? offset : 0;
+  };
+
   // Total text block height
-  const blockH = lines.reduce((s, l) => s + l.height, 0);
+  const blockH = lines.reduce((s, l) => s + l.gapBefore + l.height, 0);
 
   // Vertical anchor — ECMA-376 §20.1.7.2 <a:bodyPr anchor>.
   // For 'ctr' we intentionally skip Math.max(0,...) so the block stays
   // visually centered even when blockH exceeds innerH (text clips at edge).
-  let y0 = padTop;
-  if (txt.anchor === 'ctr') y0 = padTop + (innerH - blockH) / 2;
-  else if (txt.anchor === 'b') y0 = padTop + Math.max(0, innerH - blockH);
+  const y0 = drawingMlBlockTop(txt.anchor, rect, blockH);
 
   let lineTop = y0;
   for (const line of lines) {
+    lineTop += line.gapBefore;
     const totalW = line.segs.reduce((s, seg) => s + seg.w, 0);
     // Per-line region: the left edge is padLeft + the paragraph's left inset
     // (marL, plus first-line indent on the first line), and alignment happens
     // within the line's available width (paraW). ECMA-376 §21.1.2.2.7.
     const base = padLeft + line.leftInset;
-    let x = base;
-    if (line.align === 'ctr') x = base + Math.max(0, (line.availW - totalW) / 2);
-    else if (line.align === 'r') x = base + Math.max(0, line.availW - totalW);
+    const x = drawingMlLineX(line.align, base, line.availW, totalW);
+    const paintSegments = line.segs.map((seg) => ({ type: 'object' as const, style: seg, width: seg.w }));
 
     if (line.hasMath) {
       // A line containing an equation aligns text AND the math raster to a
@@ -5019,28 +5277,50 @@ export function drawShapeText(
       // the measurement comment there before re-litigating.
       ctx.textBaseline = 'alphabetic';
       const baseline = lineTop + line.ascent;
-      for (const seg of line.segs) {
+      paintDrawingMlLine(paintSegments, x, baseline, (part, penX) => {
+        const seg = part.style;
         if (seg.kind === 'text') {
           ctx.font = seg.font;
           ctx.fillStyle = seg.color;
-          ctx.fillText(seg.text, x, baseline);
-        } else {
-          const img = tintedMathImage(seg.render, seg.color);
-          ctx.drawImage(img, x, baseline - seg.ascent, seg.w, seg.ascent + seg.descent);
+          ctx.fillText(seg.text, penX, baseline);
+        } else if (seg.kind === 'math') {
+          const img = cachedTintedMathRaster(seg.render, seg.color);
+          ctx.drawImage(img, penX, baseline - seg.ascent, seg.w, seg.ascent + seg.descent);
         }
-        x += seg.w;
-      }
+      });
+    } else if (metricBody) {
+      // Excel's metric line box: one alphabetic baseline at the line ascent.
+      ctx.textBaseline = 'alphabetic';
+      const baseline = lineTop + line.ascent;
+      paintDrawingMlLine(paintSegments, x, baseline, (part, penX) => {
+        const seg = part.style;
+        if (seg.kind === 'text') {
+          ctx.font = seg.font;
+          ctx.fillStyle = seg.color;
+          ctx.fillText(seg.text, penX, baseline);
+        }
+      });
     } else {
-      ctx.textBaseline = 'middle';
+      // Ordinary 1.2 em line box, centred on the line's largest run. Office
+      // puts every run of a line on one baseline (#1604 mixed-run controls),
+      // so runs in another font or size share that run's alphabetic baseline
+      // instead of each being centred on its own em box.
       const drawY = lineTop + line.height / 2;
-      for (const seg of line.segs) {
+      const textSegs = line.segs.filter((seg): seg is Extract<Seg, { kind: 'text' }> => seg.kind === 'text');
+      const lead = textSegs.reduce<Extract<Seg, { kind: 'text' }> | undefined>((best, seg) => (
+        !best || fontPx(seg.font) > fontPx(best.font) ? seg : best), undefined);
+      const shared = lead && textSegs.some((seg) => seg.font !== lead.font)
+        ? drawY + middleToAlphabetic(lead) : undefined;
+      ctx.textBaseline = shared === undefined ? 'middle' : 'alphabetic';
+      const y = shared ?? drawY;
+      paintDrawingMlLine(paintSegments, x, y, (part, penX) => {
+        const seg = part.style;
         if (seg.kind === 'text') {
           ctx.font = seg.font;
           ctx.fillStyle = seg.color;
-          ctx.fillText(seg.text, x, drawY);
+          ctx.fillText(seg.text, penX, y);
         }
-        x += seg.w;
-      }
+      });
     }
     lineTop += line.height;
   }
@@ -5051,16 +5331,73 @@ function fillAndStroke(
   shape: ShapeInfo,
   width: number,
   height: number,
+  cs: number,
 ): void {
+  fillShape(ctx, shape, width, height, cs);
+  strokeShapePath(ctx, shape, width, height, cs);
+}
+
+/** Excel's printed DrawingML pattern stays on the page axes through shape
+ * rotation, reflection and a rotated group. The fill itself is phased from
+ * the unrotated shape anchor. Counter-transform only the pattern coordinates;
+ * the shape geometry continues to follow the authored transform. The six
+ * baseline/rotation/flip/group controls all exported an axis-aligned 8 pt PDF
+ * tile, including the rotated and reflected cases. */
+function axisAlignedPatternTransform(
+  shape: ShapeInfo,
+  width: number,
+  height: number,
+): DOMMatrix2DInit | undefined {
+  if (shape.rot === 0 && !shape.flipH && !shape.flipV) return undefined;
+  const angle = shape.rot * Math.PI / 180;
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  const fx = shape.flipH ? -1 : 1;
+  const fy = shape.flipV ? -1 : 1;
+  // Inverse of the local centre rotation/reflection used by drawShape.
+  const a = fx * cosine;
+  const b = -fy * sine;
+  const c = fx * sine;
+  const d = fy * cosine;
+  const cx = width / 2;
+  const cy = height / 2;
+  return { a, b, c, d, e: cx - a * cx - c * cy, f: cy - b * cx - d * cy };
+}
+
+/** Resolve once per shape, including all fill-bearing custom subpaths. */
+function resolveSpreadsheetShapeFill(
+  ctx: CanvasRenderingContext2D,
+  shape: ShapeInfo,
+  width: number,
+  height: number,
+  cs: number,
+): ReturnType<typeof resolveFill> {
   const fill = shape.fill ?? (shape.fillColor
     ? { fillType: 'solid' as const, color: shape.fillColor }
     : null);
-  const paint = resolveFill(fill, ctx, 0, 0, width, height, shape.rot);
-  if (paint) {
-    ctx.fillStyle = paint;
-    ctx.fill();
-  }
-  strokeShapePath(ctx, shape, width, height);
+  // Excel's direct PDF export uses the same 8 pt tile artwork and cell size
+  // as PowerPoint, but its print pattern matrix starts at each shape's X and
+  // an 8 pt grid measured from the PDF page bottom. The sheet viewer has no
+  // print-page origin, so its phase is anchored to this local shape frame.
+  // One point is 4/3 CSS pixels at native zoom; cellScale changes the sheet
+  // coordinate system without an additional canvas scale for shape painting.
+  return resolveFill(
+    fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
+    axisAlignedPatternTransform(shape, width, height),
+    (target, x, y, w, h) => appendSpreadsheetShapeOutline(target, shape, x, y, w, h),
+  );
+}
+
+/** Fill the current path; reuse one raster across a custom shape's subpaths. */
+function fillShape(
+  ctx: CanvasRenderingContext2D, shape: ShapeInfo,
+  width: number, height: number, cs: number,
+  paint = resolveSpreadsheetShapeFill(ctx, shape, width, height, cs),
+): boolean {
+  if (!paint) return false;
+  ctx.fillStyle = paint;
+  ctx.fill();
+  return true;
 }
 
 function shapeStroke(shape: ShapeInfo): Stroke | null {
@@ -5086,12 +5423,21 @@ function strokeShapePath(
   shape: ShapeInfo,
   width: number,
   height: number,
+  cs: number,
 ): void {
   const stroke = shapeStroke(shape);
   if (!stroke) return;
   applyStroke(ctx, stroke, 1 / EMU_PER_PX);
+  // Match DOCX/PPTX stroke hosts: use the authored box, not the fill-bearing
+  // silhouette (which excludes decorative paths that may still be stroked).
+  // Shade coordinates use that host box; raster coverage comes from the
+  // recorded stroke path, including its actual transformed caps and joins.
   if (stroke.fill) {
-    const paint = resolveFill(stroke.fill, ctx, 0, 0, width, height, shape.rot);
+    const paint = resolveFill(
+      stroke.fill, ctx, 0, 0, width, height, shape.rot, PT_TO_PX * cs,
+      axisAlignedPatternTransform(shape, width, height),
+      undefined, currentStrokeBounds(ctx),
+    );
     if (paint) ctx.strokeStyle = paint;
   }
   ctx.stroke();
@@ -5454,8 +5800,13 @@ function renderCharts(
       0,
       threeD,
       regionMap,
-      fill => loadedImages?.get(chartImageFillKey(fill)),
+      loadedImages ? chartImageFillStoreLookup(loadedImages) : undefined,
       chartEx,
+      // Excel PDF controls at 75/100/200% view zoom and two scroll positions
+      // retain the same page-grid tile matrix. Moving the chart 5 pt moves its
+      // fill rectangle but leaves that matrix fixed. Keep the chart pattern on
+      // the viewport grid (the existing main policy), while the CTM above
+      // scales each cell with worksheet zoom on screen.
     );
     ctx.restore();
     ctx.restore();

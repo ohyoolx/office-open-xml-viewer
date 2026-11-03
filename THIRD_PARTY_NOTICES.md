@@ -1,7 +1,7 @@
 # Third-Party Notices
 
 `@silurus/ooxml` is MIT-licensed (see [LICENSE](./LICENSE)). It bundles the
-third-party components listed below, none of which are copyleft. This file
+third-party components listed below. This file
 is included in the npm tarball so it travels with every install.
 
 ## JavaScript / bundled asset
@@ -23,7 +23,7 @@ claim.
 
 The optional equation-rendering engine (`@silurus/ooxml/math`, opt-in —
 see the [README's "Rendering equations" section](./README.md#rendering-equations))
-pre-bundles two Apache-2.0 packages into a single ~3 MB asset
+pre-bundles two Apache-2.0 packages into a single ~4 MB asset
 (`packages/core/assets/mathjax-stix2.js`, built by
 [`packages/core/build/build-mathjax.mjs`](./packages/core/build/build-mathjax.mjs)).
 It ships in the npm tarball but is only fetched by a consuming app at
@@ -63,10 +63,11 @@ package — noted here for completeness only.
 
 ## Rust / WebAssembly
 
-The three parser crates (`docx-parser`, `pptx-parser`, `xlsx-parser`) and
-their shared `ooxml-common` crate compile to the `*_parser_bg.wasm` binaries
-shipped in `dist/`. Their `wasm32-unknown-unknown` dependency graph is
-identical across all three crates (verified with `cargo license
+The three parser crates (`docx-parser`, `pptx-parser`, `xlsx-parser`), their
+shared `ooxml-common` crate compile to the WASM binaries shipped in `dist/`.
+The separate `@silurus/ooxml-legacy-office` companion ships its own readers and
+notices. The parser crates' `wasm32-unknown-unknown` dependency graph is identical across all
+three crates (verified with `cargo license
 --filter-platform wasm32-unknown-unknown`) and consists entirely of
 permissively-licensed crates — no copyleft (GPL/LGPL/AGPL) dependencies:
 
@@ -120,7 +121,7 @@ Unicode copyright header; not part of the npm tarball):
   Vertical_Orientation, UCD 17.0.0)
 - `packages/docx/scripts/ArabicShaping.txt` (Joining_Type / Joining_Group,
   UCD 17.0.0)
-- `packages/docx/scripts/DerivedJoiningType.txt` (UCD 17.0.0)
+- `packages/core/scripts/DerivedJoiningType.txt` (UCD 17.0.0)
 
 Shipped in `dist/` as UCD-derived data compiled from the above and from
 `LineBreak.txt` / `DerivedGeneralCategory.txt` / `EastAsianWidth.txt`

@@ -1,15 +1,7 @@
 import type { DocxTextRunInfo } from './renderer';
 import { overlayPercent, type HyperlinkTarget } from '@silurus/ooxml-core';
 import { tateChuYokoOverlayScale } from './tate-chu-yoko-overlay';
-
-function setSelectionData(element: HTMLElement, key: string, value?: string): void {
-  if (element.dataset) {
-    if (value === undefined) delete element.dataset[key];
-    else element.dataset[key] = value;
-  } else if (value !== undefined) {
-    element.setAttribute?.(`data-${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`, value);
-  }
-}
+import { setSelectionData } from '@silurus/ooxml-core/internal/selection-data';
 
 /**
  * Build the transparent text-selection overlay for a rendered docx page: one
@@ -117,6 +109,13 @@ export function buildDocxTextLayer(
     const letterSpacing = run.letterSpacingPx !== undefined
       ? `${run.letterSpacingPx}px`
       : '0';
+    // A Word-fitted terminal space shortens the retained run, but the browser
+    // still lays out the transparent U+0020 at its natural advance. Clip only
+    // that run's hit box so it cannot cover the following run/link. Keep the
+    // width percentage-based like its position under responsive canvas scaling.
+    const compressedHitBox = run.trailingSpaceCompressionPx !== undefined
+      ? `width:${overlayPercent(run.w, cssWidth)};overflow:hidden;`
+      : '';
     // Position the span as a % of the page's intended CSS box so it tracks the
     // canvas's actual rendered size under external CSS scaling. `font` /
     // `line-height` stay px (the glyph metrics of the transparent hit text laid
@@ -127,6 +126,7 @@ export function buildDocxTextLayer(
       `position:absolute;` +
       `left:${overlayPercent(run.x, cssWidth)};top:${overlayPercent(run.y, cssHeight)};` +
       `font:${run.font};line-height:${run.h}px;letter-spacing:${letterSpacing};` +
+      compressedHitBox +
       transform +
       `white-space:pre;color:transparent;cursor:${cursor};pointer-events:all;`;
     if (link && onHyperlinkClick) {

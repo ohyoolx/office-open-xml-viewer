@@ -5,6 +5,7 @@
 //! path commands once; format parsers only adapt the result to their existing
 //! wire models.
 
+use crate::xml_node::{attr_finite_f64, child};
 use std::collections::HashMap;
 
 const FULL_CIRCLE: f64 = 21_600_000.0;
@@ -22,6 +23,12 @@ pub struct CustomPath {
     pub width: f64,
     /// Effective path coordinate-system height.
     pub height: f64,
+    /// `a:path@fill` (ECMA-376 20.1.9.15, ST_PathFillMode 20.1.10.37):
+    /// `none`, `lighten`, `lightenLess`, `darken` or `darkenLess`. `None` is
+    /// the default `norm` (and any unrecognized value).
+    pub fill: Option<String>,
+    /// `a:path@stroke`, default true.
+    pub stroke: bool,
     pub commands: Vec<PathCommand>,
 }
 
@@ -57,19 +64,6 @@ pub enum PathCommand {
         sw_ang: f64,
     },
     Close,
-}
-
-fn child<'a, 'input>(
-    node: roxmltree::Node<'a, 'input>,
-    name: &str,
-) -> Option<roxmltree::Node<'a, 'input>> {
-    node.children()
-        .find(|child| child.is_element() && child.tag_name().name() == name)
-}
-
-fn attr_f64(node: roxmltree::Node<'_, '_>, name: &str) -> Option<f64> {
-    let value = node.attribute(name)?.parse::<f64>().ok()?;
-    value.is_finite().then_some(value)
 }
 
 fn resolve(token: &str, env: &HashMap<String, f64>) -> Option<f64> {
@@ -134,19 +128,23 @@ fn guide_environment(
             .children()
             .find(|node| node.is_element() && node.tag_name().name() == "path")
     });
-    let width = if shape_width > 0.0 {
+    // ECMA-376 §20.1.9.11 / §20.1.10.56: built-in guides describe the shape extent,
+    // including zero (ST_PositiveCoordinate). The path coordinate system is
+    // an independent normalization denominator; do not substitute it for a
+    // valid zero shape axis or ss/hc/vc will move degenerate stroked paths.
+    let width = if shape_width.is_finite() && shape_width >= 0.0 {
         shape_width
     } else {
         first_path
-            .and_then(|path| attr_f64(path, "w"))
+            .and_then(|path| attr_finite_f64(&path, "w"))
             .unwrap_or(1.0)
             .max(1.0)
     };
-    let height = if shape_height > 0.0 {
+    let height = if shape_height.is_finite() && shape_height >= 0.0 {
         shape_height
     } else {
         first_path
-            .and_then(|path| attr_f64(path, "h"))
+            .and_then(|path| attr_finite_f64(&path, "h"))
             .unwrap_or(1.0)
             .max(1.0)
     };
@@ -264,10 +262,10 @@ pub fn parse_custom_geometry(
         .children()
         .filter(|node| node.is_element() && node.tag_name().name() == "path")
         .map(|path| {
-            let width = attr_f64(path, "w")
+            let width = attr_finite_f64(&path, "w")
                 .filter(|value| *value > 0.0)
                 .unwrap_or(shape_width.max(1.0));
-            let height = attr_f64(path, "h")
+            let height = attr_finite_f64(&path, "h")
                 .filter(|value| *value > 0.0)
                 .unwrap_or(shape_height.max(1.0));
             let commands = path
@@ -275,9 +273,22 @@ pub fn parse_custom_geometry(
                 .filter(|node| node.is_element())
                 .filter_map(|node| parse_command(node, &env))
                 .collect();
+            let fill = path
+                .attribute("fill")
+                .filter(|mode| {
+                    matches!(
+                        *mode,
+                        "none" | "lighten" | "lightenLess" | "darken" | "darkenLess"
+                    )
+                })
+                .map(str::to_owned);
+            // xsd:boolean
+            let stroke = !matches!(path.attribute("stroke"), Some("0" | "false"));
             CustomPath {
                 width,
                 height,
+                fill,
+                stroke,
                 commands,
             }
         })
@@ -313,6 +324,34 @@ mod tests {
                     x: 75.0,
                     y: 0.0,
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn path_fill_mode_and_stroke_flags_are_retained() {
+        let xml = r#"<custGeom><pathLst>
+          <path w="1" h="1"/>
+          <path w="1" h="1" fill="none" stroke="0"/>
+          <path w="1" h="1" fill="darkenLess" stroke="true"/>
+          <path w="1" h="1" fill="norm" stroke="false"/>
+          <path w="1" h="1" fill="bogus"/>
+        </pathLst></custGeom>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let geometry = parse_custom_geometry(doc.root_element(), 1.0, 1.0);
+        let flags: Vec<_> = geometry
+            .paths
+            .iter()
+            .map(|p| (p.fill.as_deref(), p.stroke))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (None, true),
+                (Some("none"), false),
+                (Some("darkenLess"), true),
+                (None, false),
+                (None, true),
             ]
         );
     }

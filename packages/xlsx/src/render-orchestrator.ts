@@ -1,3 +1,4 @@
+import { decodeSvgBlobOnMainThread } from '@silurus/ooxml-core/worker';
 import type { CjkLang } from '@silurus/ooxml-core';
 import {
   defaultDpr,
@@ -15,10 +16,15 @@ import {
   metafileRasterSize,
   sourceRasterTargetSize,
   isOoxmlDecodedImageLimitError,
+  OoxmlResourceLimitError,
+  OoxmlError,
+  blipEffectsCoverageReach,
+  srcRectHasVisibleArea,
   isTiffDecodeError,
   isOptionalImageCodecUnavailableError,
   EMU_PER_PT,
   EMU_PER_PX,
+  PT_TO_PX,
   type MathRenderer,
   type ChartThreeDRenderer,
   type ChartRegionMapRenderer,
@@ -26,10 +32,17 @@ import {
   type TiffRenderer,
   type SrcRect,
   type Duotone,
+  type BlipPixelEffects,
   type OffscreenFactory,
   type SvgBlobDecoder,
   type ImageResourceOptions,
   chartImageFillKey,
+  chartImageFillNeedsRenderedSize,
+  chartFillRenderedSizeKey,
+  collectChartFillRenderedSizes,
+  chartImageFillStoreLookup,
+  assertChartFillRenderedSizeCount,
+  chartImageFillPixelTransform,
   chartImageFillUsageSize,
   collectChartImageFillUsages,
   collectChartImageFillUsagesForCharts,
@@ -39,9 +52,15 @@ import {
 import type { ParsedWorkbook, Worksheet, ViewportRange, RenderViewportOptions } from './types.js';
 import {
   renderViewport,
+  bindXlsxOfficeFontRoutes,
+  pinXlsxGridGeometry,
   prepareWorksheetMath,
   worksheetHasUncachedMath,
   imageCacheKey,
+  imagePixelTransform,
+  imageAnchorEffectFrame,
+  groupLeafEffectFrame,
+  blipEffectFramePt,
   getGridGeometryForWorksheet,
   applyAutoRowHeights,
   hasPreparedAutoRowHeights,
@@ -49,16 +68,20 @@ import {
   HEADER_W,
   HEADER_H,
 } from './renderer.js';
-import { GridGeometry, type GridAxisGeometry } from './internal/grid-geometry.js';
-import { usesNativeOneCellExtent } from './internal/cell-anchor-geometry.js';
+import { GridGeometry } from './internal/grid-geometry.js';
+import { inheritWorksheetSizeContext } from './internal/worksheet-size-context.js';
+import type { CellAnchorSizeFacts } from './internal/cell-anchor-geometry.js';
+import { resolveWorksheetAnchorRect } from './internal/initial-anchor-sizes.js';
+import { rotatedImageBounds } from './internal/image-anchor-transform.js';
 import {
   clearOptionalImageUnavailable,
   markOptionalImageUnavailable,
 } from './internal/optional-image-fallback.js';
+import { getWorksheetPolicy } from './worksheet-policy-context.js';
 
 /** Internal viewer-to-renderer commit latch. It is intentionally not re-exported
  * from the package API: standalone renderer callers do not own viewer lifecycle. */
-export const XLSX_RENDER_COMMIT_GUARD: unique symbol = Symbol('xlsx-render-commit-guard');
+const XLSX_RENDER_COMMIT_GUARD: unique symbol = Symbol('xlsx-render-commit-guard');
 
 type GuardedRenderViewportOptions = RenderViewportOptions & {
   readonly [XLSX_RENDER_COMMIT_GUARD]?: () => boolean;
@@ -89,10 +112,11 @@ interface ImageRef {
    *  metafile, scales the raster up to the full picture frame so the fractional
    *  crop lands correctly (see `metafileRasterSize`). */
   srcRect?: SrcRect | null;
-  /** The picture's `<a:duotone>` recolour (§20.1.8.23), when present. The base
-   *  bitmap is decoded, then recoloured along the `clr1`→`clr2` ramp; the result
-   *  is cached under {@link imageCacheKey}(imagePath, duotone). */
-  duotone?: Duotone | null;
+  /** The picture's decode-time pixel transform: its ordered CT_Blip effects
+   *  (§20.1.8.13) or a lone `<a:duotone>` recolour (§20.1.8.23). The base
+   *  bitmap is decoded, then transformed once; the result is cached under
+   *  {@link imageCacheKey}(imagePath, transform). */
+  duotone?: Duotone | BlipPixelEffects | null;
   /** Chart marker effects are authored paint. If the pixel pipeline cannot
    * apply them, omit the marker instead of substituting the original image. */
   failClosedOnDuotoneFailure?: boolean;
@@ -162,18 +186,8 @@ function setImageRef(refs: Map<string, ImageRef>, key: string, ref: ImageRef): v
   refs.set(key, prior ? mergeImageRef(prior, ref) : ref);
 }
 
-interface CellAnchorRange {
-  fromCol: number;
-  fromColOff: number;
-  fromRow: number;
-  fromRowOff: number;
-  toCol: number;
-  toColOff: number;
-  toRow: number;
-  toRowOff: number;
-  editAs?: string;
-  nativeExtCx?: number;
-  nativeExtCy?: number;
+interface CellAnchorRange extends CellAnchorSizeFacts {
+  rotation?: number;
 }
 
 function anchorDisplaySize(
@@ -184,17 +198,30 @@ function anchorDisplaySize(
 ): { width: number; height: number } | null {
   const axes = geometry ?? getGridGeometryForWorksheet(ws);
   const { col, row } = axes.axesAtScale(scale);
-  const marker = (axis: GridAxisGeometry, index: number, offset: number) =>
-    axis.offsetOf(index + 1) + (offset * scale) / EMU_PER_PX;
-  const fromX = marker(col, anchor.fromCol, anchor.fromColOff);
-  const fromY = marker(row, anchor.fromRow, anchor.fromRowOff);
-  const toX = usesNativeOneCellExtent(anchor)
-    ? fromX + ((anchor.nativeExtCx as number) * scale) / EMU_PER_PX
-    : marker(col, anchor.toCol, anchor.toColOff);
-  const toY = usesNativeOneCellExtent(anchor)
-    ? fromY + ((anchor.nativeExtCy as number) * scale) / EMU_PER_PX
-    : marker(row, anchor.toRow, anchor.toRowOff);
-  return toX > fromX && toY > fromY ? { width: toX - fromX, height: toY - fromY } : null;
+  // Decode sizing uses the same display rectangle as paint and hit-testing.
+  const rect = resolveWorksheetAnchorRect(ws, anchor, col, row, scale);
+  return rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : null;
+}
+
+/** Effect reach per side as a fraction of the anchor rectangle, or null
+ * when it cannot be bounded statically (see blipEffectsCoverageReach). */
+type EffectCullReach = { readonly x: number; readonly y: number } | null;
+const NO_EFFECT_REACH: EffectCullReach = { x: 0, y: 0 };
+
+function chainCullReach(
+  effects: readonly import('@silurus/ooxml-core').BlipEffect[] | undefined,
+  leafCx: number, leafCy: number, anchorCx: number, anchorCy: number,
+): EffectCullReach {
+  if (!effects?.length) return NO_EFFECT_REACH;
+  const reach = blipEffectsCoverageReach(effects, leafCx, leafCy);
+  if (reach === null) return null;
+  if (reach.x === 0 && reach.y === 0) return NO_EFFECT_REACH;
+  if (!(anchorCx > 0 && anchorCy > 0)) return null;
+  return { x: reach.x / anchorCx, y: reach.y / anchorCy };
+}
+
+function maxCullReach(left: EffectCullReach, right: EffectCullReach): EffectCullReach {
+  return left === null || right === null ? null : { x: Math.max(left.x, right.x), y: Math.max(left.y, right.y) };
 }
 
 function anchorMayIntersectViewport(
@@ -209,23 +236,26 @@ function anchorMayIntersectViewport(
     readonly freezeRows: number;
     readonly freezeCols: number;
   },
+  effectReach: EffectCullReach = NO_EFFECT_REACH,
 ): boolean {
-  if (!viewport) return true;
+  // Tagged acquisition facts share paint's validity policy even for a whole
+  // sheet preload. Preserve the historical eager preload for untagged models.
+  // A CT_Blip chain that can paint outside its rectangle (blur grow, glow,
+  // shadow, reflection, offset) is culled by its conservative reach; one whose
+  // reach cannot be bounded statically is acquired without viewport culling.
+  if (!viewport || effectReach === null) return anchor.anchorTag === undefined
+    || anchorDisplaySize(anchor, ws, geometry, frame?.scale ?? 1) !== null;
   const axes = geometry ?? getGridGeometryForWorksheet(ws);
   const scale = frame?.scale ?? 1;
   const { col, row } = axes.axesAtScale(scale);
-  const marker = (axis: GridAxisGeometry, index: number, offset: number) =>
-    axis.offsetOf(index + 1) + (offset * scale) / EMU_PER_PX;
-  const fromX = marker(col, anchor.fromCol, anchor.fromColOff);
-  const fromY = marker(row, anchor.fromRow, anchor.fromRowOff);
-  const useNativeExtent = usesNativeOneCellExtent(anchor);
-  const toX = useNativeExtent
-    ? fromX + ((anchor.nativeExtCx as number) * scale) / EMU_PER_PX
-    : marker(col, anchor.toCol, anchor.toColOff);
-  const toY = useNativeExtent
-    ? fromY + ((anchor.nativeExtCy as number) * scale) / EMU_PER_PX
-    : marker(row, anchor.toRow, anchor.toRowOff);
-  if (toX <= fromX || toY <= fromY) return false;
+  // Culling uses the same display rectangle as paint (single resolver).
+  const rect = resolveWorksheetAnchorRect(ws, anchor, col, row, scale);
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  const reachX = rect.width * effectReach.x, reachY = rect.height * effectReach.y;
+  const bounds = rotatedImageBounds(
+    { x: rect.x - reachX, y: rect.y - reachY, width: rect.width + 2 * reachX, height: rect.height + 2 * reachY },
+    anchor.rotation,
+  );
   const effectiveFreeze = frame
     ? axes.effectiveFrozenBands({
         scale,
@@ -250,14 +280,14 @@ function anchorMayIntersectViewport(
       || (low < scrollEnd && high > scrollStart);
   };
   return intersects(
-    fromX,
-    toX,
+    bounds.x,
+    bounds.x + bounds.width,
     col.offsetOf(effectiveFreeze.cols + 1),
     col.offsetOf(viewport.col),
     col.offsetOf(viewport.col + viewport.cols),
   ) && intersects(
-    fromY,
-    toY,
+    bounds.y,
+    bounds.y + bounds.height,
     row.offsetOf(effectiveFreeze.rows + 1),
     row.offsetOf(viewport.row),
     row.offsetOf(viewport.row + viewport.rows),
@@ -274,7 +304,7 @@ function anchorMayIntersectViewport(
  *  because the renderer's crop math needs the decoded bitmap's native pixel grid
  *  (an SVG element has none).
  *
- *  All three decode paths go through the SAME per-`fetchImage` core caches that
+ *  All decode paths go through the SAME per-`fetchImage` core caches that
  *  docx and pptx use (issue #781), so xlsx no longer keeps its own owned bitmap
  *  map:
  *   - raster/metafile (+ any `<a:duotone>` recolour, §20.1.8.23) →
@@ -287,6 +317,8 @@ function anchorMayIntersectViewport(
  *   - SVG vector original → `getCachedSvgImageByPath` (decodes to an
  *     `HTMLImageElement`, because `createImageBitmap` cannot rasterize SVG in
  *     every browser).
+ *   - SVG-only picture with duotone → bounded host/worker SVG rasterization,
+ *     followed by the shared bitmap duotone cache and pixel transform.
  *  Bytes are fetched lazily by zip path through `fetchImage` (twin of
  *  pptx/docx's `fetchImage`) instead of being inlined as base64; the decoded
  *  bitmaps are owned by those shared caches (LRU-bounded, closed on eviction and
@@ -303,7 +335,7 @@ export async function decodeImageSource(
   widthPt = 0,
   heightPt = 0,
   srcRect: SrcRect | null = null,
-  duotone: Duotone | null = null,
+  duotone: Duotone | BlipPixelEffects | null = null,
   offscreenFactory?: OffscreenFactory,
   failClosedOnDuotoneFailure = false,
   tiff?: TiffRenderer,
@@ -312,14 +344,15 @@ export async function decodeImageSource(
   plannedPixelLimit?: number,
 ): Promise<CanvasImageSource | null> {
   const dataIsSvg = mimeType === 'image/svg+xml';
-  // SVG pixels are not exposed to the shared bitmap effect pipeline. Without
-  // a raster twin, drawing the original SVG would silently discard duotone.
-  if (dataIsSvg && duotone) return null;
   // A cropped metafile must rasterize at its FULL picture frame, not the visible
   // sub-rect, so the fractional crop lands correctly; raster blips and uncropped
   // metafiles pass the box through unchanged. The shared base cache retains
   // exact required-resolution variants and reuses a larger sufficient one.
-  const sized = metafileRasterSize(mimeType, srcRect, widthPt, heightPt);
+  // An ordered chain's caller already supplies the full source frame
+  // (blipEffectFramePt), which is also the cropped metafile's raster frame.
+  const sized = duotone && 'effects' in duotone
+    ? (srcRect && !srcRectHasVisibleArea(srcRect) ? null : { widthPt, heightPt })
+    : metafileRasterSize(mimeType, srcRect, widthPt, heightPt);
   if (!sized) return null;
   const decodeRaster = (): Promise<ImageBitmap | null> =>
     getCachedDuotoneBitmapByPath(imagePath, mimeType, duotone, fetchImage, {
@@ -328,6 +361,13 @@ export async function decodeImageSource(
       offscreenFactory,
       failClosedOnDuotoneFailure,
       tiff,
+      // ECMA-376 §20.1.8.23 applies to picture pixels regardless of source
+      // encoding. SVG-only blips first acquire a readable raster via the same
+      // host decoder used by workers, then share the raster effect cache,
+      // pixel budgets and teardown. A raster twin still owns effects when present.
+      // Also forwarded for raster pictures: a nested CT_Blip image fill
+      // (fillOverlay/fill) may reference an SVG that needs the same bridge.
+      svgDecoder: svgDecoder ?? (typeof Image !== 'undefined' ? decodeSvgBlobOnMainThread : undefined),
       ...(target ?? {}),
       ...(plannedPixelLimit ? { maxRetainedPixels: plannedPixelLimit } : {}),
     });
@@ -338,16 +378,17 @@ export async function decodeImageSource(
     // No crop: prefer the vector original; fall back to the raster on decode
     // failure (or, when `imagePath` is itself the SVG, the SVG decoder again).
     // A cropped picture skips this branch so the crop math (below, in the
-    // renderer) runs on the raster bitmap's native pixel dimensions. §20.1.8.23
-    // duotone applies only to the raster fallback — an SVG vector original has no
-    // readable pixel grid (matches docx/pptx).
+    // renderer) runs on the raster bitmap's native pixel dimensions.
     try {
       return await getCachedSvgImageByPath(blip.svgImagePath, fetchImage, {
         ...target,
         maxRetainedPixels: plannedPixelLimit,
         workerDecoder: svgDecoder,
       });
-    } catch {
+    } catch (error) {
+      // Archive governance failures terminate the render; only content/codec
+      // failures may select the authored raster twin.
+      if (error instanceof OoxmlResourceLimitError || isOoxmlDecodedImageLimitError(error)) throw error;
       return dataIsSvg
         ? getCachedSvgImageByPath(imagePath, fetchImage, {
             ...target,
@@ -357,6 +398,7 @@ export async function decodeImageSource(
         : decodeRaster();
     }
   }
+  if (dataIsSvg && duotone) return decodeRaster();
   if (dataIsSvg) {
     // svg-only picture with no separate `svgImagePath` field (defensive): the
     // raster decoder (createImageBitmap) can't rasterize SVG.
@@ -412,6 +454,11 @@ export async function prefetchImages(
     effectiveDpr?: number;
     svgDecoder?: SvgBlobDecoder;
     imageResources?: ImageResourceOptions;
+    /** Chart modules the paint uses; the per-rendered-size preparation pass
+     * must lay charts out exactly as the paint will. */
+    threeD?: ChartThreeDRenderer;
+    regionMap?: ChartRegionMapRenderer;
+    chartEx?: ChartExRenderer;
   },
 ): Promise<void> {
   // This map is only the synchronous lookup for the current frame. Never keep
@@ -440,22 +487,35 @@ export async function prefetchImages(
         opts?.viewport,
         geometry,
         frame,
+        (effectFrame => chainCullReach(img.blipEffects, effectFrame.cx, effectFrame.cy,
+          effectFrame.cx, effectFrame.cy))(imageAnchorEffectFrame(img)),
       )) continue;
+      const display = anchorDisplaySize(img, ws, geometry, opts?.cellScale ?? 1);
       // Key by (path + duotone colours) so a recoloured picture is looked up
       // separately from the raw blip (§20.1.8.23).
-      setImageRef(refs, imageCacheKey(img.imagePath, img.duotone), {
+      const effectFrame = imageAnchorEffectFrame(img);
+      const transform = imagePixelTransform(img, effectFrame);
+      // CT_Blip spatial effects are evaluated on the authored physical frame
+      // (see blipEffectFramePt); plain and duotone pictures keep display sizing.
+      const physical = img.blipEffects?.length ? blipEffectFramePt(effectFrame) : null;
+      setImageRef(refs, imageCacheKey(img.imagePath, transform, effectFrame), {
         imagePath: img.imagePath,
         mimeType: img.mimeType,
         svgImagePath: img.svgImagePath,
-        // Saved EMU extent → pt sizes a metafile raster (0 ⇒ decoder fallback).
-        widthPt: img.nativeExtCx > 0 ? img.nativeExtCx / EMU_PER_PT : 0,
-        heightPt: img.nativeExtCy > 0 ? img.nativeExtCy / EMU_PER_PT : 0,
+        // Tagged placement and WMF/EMF raster preparation share the resolved
+        // display size, including a retained viewer reference. Untagged models
+        // preserve native sizing; decodeImageSource expands crop once.
+        widthPt: physical ? physical.widthPt : img.anchorTag !== undefined
+          ? (display?.width ?? 0) * (EMU_PER_PX / EMU_PER_PT)
+          : img.nativeExtCx > 0 ? img.nativeExtCx / EMU_PER_PT : 0,
+        heightPt: physical ? physical.heightPt : img.anchorTag !== undefined
+          ? (display?.height ?? 0) * (EMU_PER_PX / EMU_PER_PT)
+          : img.nativeExtCy > 0 ? img.nativeExtCy / EMU_PER_PT : 0,
         // An `<a:srcRect>` crop forces the raster decode (native pixel grid)
         // and, for a metafile, the full-frame raster size.
         srcRect: img.srcRect ?? null,
-        duotone: img.duotone ?? null,
+        duotone: transform,
         ...(() => {
-          const display = anchorDisplaySize(img, ws, geometry, opts?.cellScale ?? 1);
           const target = display && opts?.effectiveDpr
             ? sourceRasterTargetSize(
                 display.width * opts.effectiveDpr,
@@ -476,22 +536,34 @@ export async function prefetchImages(
         opts?.viewport,
         geometry,
         frame,
+        grp.shapes.reduce<EffectCullReach>((reach, shape) => shape.geom?.type === 'image'
+          ? maxCullReach(reach, chainCullReach(shape.geom.blipEffects, grp.nativeExtCx * shape.w,
+            grp.nativeExtCy * shape.h, grp.nativeExtCx, grp.nativeExtCy))
+          : reach, NO_EFFECT_REACH),
       )) continue;
       for (const shape of grp.shapes) {
         if (shape.geom.type === 'image') {
-          setImageRef(refs, imageCacheKey(shape.geom.imagePath, shape.geom.duotone), {
+          const display = anchorDisplaySize(grp, ws, geometry, opts?.cellScale ?? 1);
+          const effectFrame = groupLeafEffectFrame(grp, shape);
+          const transform = imagePixelTransform(shape.geom, effectFrame);
+          const physical = shape.geom.blipEffects?.length ? blipEffectFramePt(effectFrame) : null;
+          setImageRef(refs, imageCacheKey(shape.geom.imagePath, transform, effectFrame), {
             imagePath: shape.geom.imagePath,
             mimeType: shape.geom.mimeType,
             svgImagePath: shape.geom.svgImagePath,
-            // Group's saved EMU extent scaled by the leaf's normalized w/h → pt.
-            widthPt: grp.nativeExtCx > 0 ? (grp.nativeExtCx * shape.w) / EMU_PER_PT : 0,
-            heightPt: grp.nativeExtCy > 0 ? (grp.nativeExtCy * shape.h) / EMU_PER_PT : 0,
+            // Resolve the group's display extent, then apply the existing
+            // normalized leaf transform. Crop expansion remains in the decoder.
+            widthPt: physical ? physical.widthPt : grp.anchorTag !== undefined
+              ? (display?.width ?? 0) * shape.w * (EMU_PER_PX / EMU_PER_PT)
+              : grp.nativeExtCx > 0 ? (grp.nativeExtCx * shape.w) / EMU_PER_PT : 0,
+            heightPt: physical ? physical.heightPt : grp.anchorTag !== undefined
+              ? (display?.height ?? 0) * shape.h * (EMU_PER_PX / EMU_PER_PT)
+              : grp.nativeExtCy > 0 ? (grp.nativeExtCy * shape.h) / EMU_PER_PT : 0,
             // A crop forces the raster decode (native pixel grid for the crop)
             // and, for a metafile, the full-frame raster size.
             srcRect: shape.geom.srcRect ?? null,
-            duotone: shape.geom.duotone ?? null,
+            duotone: transform,
             ...(() => {
-              const display = anchorDisplaySize(grp, ws, geometry, opts?.cellScale ?? 1);
               const target = display && opts?.effectiveDpr
                 ? sourceRasterTargetSize(
                     display.width * shape.w * opts.effectiveDpr,
@@ -517,6 +589,8 @@ export async function prefetchImages(
       usage: ChartImageFillUsage;
       size: ChartImageFillUsageSize;
     }>;
+    displayWidth: number;
+    displayHeight: number;
   }> = [];
   for (const chart of charts) {
     if (!anchorMayIntersectViewport(
@@ -561,7 +635,8 @@ export async function prefetchImages(
       sizedUsages.push({ usage, size });
     }
     if (!sizesAreValid) continue;
-    chartDescriptors.push({ chart, frame: chartFrame, usages: sizedUsages });
+    chartDescriptors.push({ chart, frame: chartFrame, usages: sizedUsages,
+      displayWidth: display.width, displayHeight: display.height });
   }
   const allowedChartUsages = collectChartImageFillUsagesForCharts(
     chartDescriptors.map(({ chart }) => chart.chart),
@@ -570,7 +645,7 @@ export async function prefetchImages(
       chartDescriptors[chartIndex]!.frame,
     ) != null,
   );
-  const chartEntries = new Map<string, {
+  type ChartEntry = {
     fill: ReturnType<typeof collectChartImageFillUsages>[number]['fill'];
     widthPt: number;
     heightPt: number;
@@ -578,10 +653,14 @@ export async function prefetchImages(
     targetHeightPx?: number;
     preserveNaturalSize: boolean;
     hasSourceCrop: boolean;
-  }>();
+    renderedSize?: import('@silurus/ooxml-core').ChartFillRenderedSize;
+  };
+  const chartEntries = new Map<string, ChartEntry>();
   for (const usage of allowedChartUsages) {
     const { fill } = usage;
-    const key = chartImageFillKey(fill);
+    // Size-dependent chains are prepared per rendered size below.
+    if (chartImageFillNeedsRenderedSize(fill)) continue;
+    const key = chartFillRenderedSizeKey(fill);
     chartEntries.set(key, {
       fill,
       widthPt: 0,
@@ -590,10 +669,40 @@ export async function prefetchImages(
       hasSourceCrop: usage.hasSourceCrop,
     });
   }
+  const admittedChartFills = new Set(allowedChartUsages.map(({ fill }) => chartImageFillKey(fill)));
+  // A stretched fill whose chain is measured in physical units is evaluated
+  // per rendered size: a preparation pass of the same chart paint (natural
+  // 96-DPI space, see renderAnchoredCharts) records each distinct size.
+  // Returns the keys this round added.
+  const prepareRenderedSizes = (resolved?: import('@silurus/ooxml-core').ChartImageLookup): string[] => {
+    const added: string[] = [];
+    const scale = opts?.cellScale ?? 1;
+    for (const descriptor of chartDescriptors) {
+      for (const { fill, occurrence } of collectChartFillRenderedSizes(
+        descriptor.chart.chart,
+        { x: 0, y: 0, w: descriptor.displayWidth / scale, h: descriptor.displayHeight / scale },
+        PT_TO_PX, 0, opts?.threeD, opts?.regionMap, opts?.chartEx, resolved,
+      )) {
+        if (!admittedChartFills.has(chartImageFillKey(fill))) continue;
+        const key = chartFillRenderedSizeKey(fill, undefined, occurrence);
+        if (chartEntries.has(key)) continue;
+        chartEntries.set(key, {
+          fill, widthPt: occurrence.widthPt, heightPt: occurrence.heightPt,
+          preserveNaturalSize: true, hasSourceCrop: fill.srcRect != null, renderedSize: occurrence,
+        });
+        added.push(key);
+      }
+    }
+    // The per-render ceiling covers every prepared chart source.
+    assertChartFillRenderedSizeCount(chartEntries.size);
+    return added;
+  };
+  prepareRenderedSizes();
   for (const descriptor of chartDescriptors) {
     for (const { usage, size } of descriptor.usages) {
       const { fill } = usage;
-      const key = chartImageFillKey(fill);
+      if (chartImageFillNeedsRenderedSize(fill)) continue;
+      const key = chartFillRenderedSizeKey(fill);
       const prior = chartEntries.get(key);
       if (!prior) continue;
       const preserveNaturalSize = prior.preserveNaturalSize || usage.preserveNaturalSize;
@@ -616,24 +725,27 @@ export async function prefetchImages(
       });
     }
   }
-  for (const [key, entry] of chartEntries) {
-    const { fill, widthPt, heightPt, targetWidthPx, targetHeightPx, hasSourceCrop } = entry;
+  const setChartImageRef = (key: string, entry: ChartEntry) => {
+    const { fill, widthPt, heightPt, targetWidthPx, targetHeightPx, hasSourceCrop, renderedSize } = entry;
     setImageRef(refs, key, {
       imagePath: fill.imagePath,
       mimeType: fill.mimeType,
       svgImagePath: fill.svgImagePath,
-      widthPt,
-      heightPt,
+      // A per-size chain is evaluated on its rendered frame; any other chain
+      // samples the source grid at the fill DPI, both at native size.
+      widthPt: renderedSize ? renderedSize.widthPt : fill.blipEffects?.length ? 0 : widthPt,
+      heightPt: renderedSize ? renderedSize.heightPt : fill.blipEffects?.length ? 0 : heightPt,
       // A zero-inset sentinel forces the raster SVG twin without applying crop
       // twice: widthPt/heightPt already contain the post-crop metafile maxima.
       srcRect: hasSourceCrop ? { l: 0, t: 0, r: 0, b: 0 } : null,
-      duotone: fill.duotone ?? null,
+      duotone: chartImageFillPixelTransform(fill, undefined, renderedSize),
       failClosedOnDuotoneFailure: true,
-      ...(targetWidthPx && targetHeightPx
+      ...(targetWidthPx && targetHeightPx && !fill.blipEffects?.length
         ? { targetWidthPx, targetHeightPx }
         : {}),
     });
-  }
+  };
+  for (const [key, entry] of chartEntries) setChartImageRef(key, entry);
   if (refs.size === 0) return;
   const policy = normalizeImageResourceOptions(opts?.imageResources);
   const demands = (await Promise.all([...refs].map(async ([key, ref]) => {
@@ -657,7 +769,10 @@ export async function prefetchImages(
       ref.imagePath,
       ref.mimeType,
       fetch,
-    ).catch(() => null);
+    ).catch((error: unknown) => {
+      if (error instanceof OoxmlResourceLimitError || isOoxmlDecodedImageLimitError(error)) throw error;
+      return null;
+    });
     if (!inspection?.dimensions
       || !isDecodeTargetResizableRasterFormat(inspection.format, opts?.tiff !== undefined)) return null;
     return {
@@ -686,13 +801,12 @@ export async function prefetchImages(
     ref.targetHeightPx = target?.height;
     ref.plannedPixelLimit = target?.maxRetainedPixels;
   }
-  await Promise.all(
-    [...refs.entries()].map(async ([key, ref]) => {
+  const decodeRef = async ([key, ref]: [string, ImageRef]) => {
       try {
         // The §20.1.8.23 duotone recolour is applied inside the shared decode
         // (getCachedDuotoneBitmapByPath) and cached under a colour-suffixed key,
-        // so the per-frame draw stays synchronous. Only raster/bitmap sources are
-        // recoloured — an SVG element (vector blip) has no readable pixel grid.
+        // so the per-frame draw stays synchronous. SVG-only sources are
+        // rasterized before entering that same pixel transform.
         const src = await decodeImageSource(
           ref.imagePath,
           ref.mimeType,
@@ -720,7 +834,11 @@ export async function prefetchImages(
           markOptionalImageUnavailable(imageCache, key, 'tiff');
           return;
         }
-        if (isOoxmlDecodedImageLimitError(error)) throw error;
+        // Lazy extraction has the same terminal policy as image decode budgets.
+        // An authored CT_Blip chain that cannot be evaluated is a typed,
+        // terminal diagnostic too: never a silently missing picture.
+        if (error instanceof OoxmlResourceLimitError || isOoxmlDecodedImageLimitError(error)
+          || (error instanceof OoxmlError && error.code === 'unsupported-image-effect')) throw error;
         // Transient failure: DELETE any prior lookup entry rather than leaving
         // it. A prior entry is re-resolved precisely because its shared-cache
         // backing may be gone (LRU-evicted and GPU-closed); when the re-resolve
@@ -728,8 +846,18 @@ export async function prefetchImages(
         // skips only a missing/falsy source — it would draw a closed one.
         imageCache.delete(key);
       }
-    }),
-  );
+  };
+  await Promise.all([...refs.entries()].map(decodeRef));
+  // Occurrences derived from a decoded source's own frame (3-D plain-stack
+  // repetitions) are recorded once that source is known; each round repeats
+  // the paint with every source decoded so far. Rendered-size sources keep
+  // their native grid, so no display target is planned for them.
+  for (;;) {
+    const added = prepareRenderedSizes(chartImageFillStoreLookup(imageCache, undefined, false));
+    if (added.length === 0) break;
+    for (const key of added) setChartImageRef(key, chartEntries.get(key)!);
+    await Promise.all(added.map(key => decodeRef([key, refs.get(key)!])));
+  }
 }
 
 export interface RenderDeps {
@@ -743,7 +871,10 @@ export interface RenderDeps {
   tiff?: TiffRenderer;
 }
 
-const autoHeightProjectionCache = new WeakMap<Worksheet, Worksheet>();
+const autoHeightProjectionCache = new WeakMap<Worksheet, {
+  projection: Worksheet;
+  sourceGeometry: GridGeometry;
+}>();
 
 export function worksheetWithAutoRowHeights(
   ctx: CanvasRenderingContext2D,
@@ -752,24 +883,36 @@ export function worksheetWithAutoRowHeights(
   cjkFallback?: CjkLang,
 ): Worksheet {
   if (hasPreparedAutoRowHeights(source)) return source;
+  const sourceGeometry = getGridGeometryForWorksheet(source);
   const cached = autoHeightProjectionCache.get(source);
-  if (cached) return cached;
+  // Only reuse the projection if the source is still bound to the same policy
+  // it was built under. After an internal rebind, rebuild via
+  // inheritSheetRenderCache so the new limits are validated.
+  // Size edits (including CSS-only intent changes) and Normal-font rebinds
+  // invalidate source geometry. A cached row-height clone must follow that
+  // revision too, or it would wrap/paint with the previous column widths.
+  if (cached && cached.sourceGeometry === sourceGeometry
+    && getWorksheetPolicy(cached.projection) === getWorksheetPolicy(source)) return cached.projection;
   const projection: Worksheet = {
     ...source,
     rowHeights: { ...source.rowHeights },
   };
+  // This is a fresh row-height projection: preserve view-only column pixel
+  // intent before geometry/wrapping. Render-cache inheritance also runs after
+  // worker size overrides, so it must never overwrite their CSS channel.
+  inheritWorksheetSizeContext(source, projection);
   inheritSheetRenderCache(source, projection);
   // The viewer/main realm supplies the authoritative Normal-font MDW used by
   // hit-testing and spacer geometry. Preserve it across the render-local clone
   // so worker/direct auto-fit wraps at the exact same column pixels.
-  const mdw = getGridGeometryForWorksheet(source).maximumDigitWidth;
+  const mdw = sourceGeometry.maximumDigitWidth;
   GridGeometry.forWorksheet(projection, mdw);
   applyAutoRowHeights(ctx, projection, styles, cjkFallback);
   // applyAutoRowHeights invalidates geometry after deriving row sizes; seed the
   // rebuilt row axis with the same authoritative MDW rather than remeasuring in
   // another Canvas realm.
   GridGeometry.forWorksheet(projection, mdw);
-  autoHeightProjectionCache.set(source, projection);
+  autoHeightProjectionCache.set(source, { projection, sourceGeometry });
   return projection;
 }
 
@@ -818,6 +961,8 @@ async function renderWorksheetViewportLeased(
   const styles = deps.styles;
   const measurementCtx = target.getContext('2d') as CanvasRenderingContext2D | null;
   if (!measurementCtx) throw new Error('XLSX render target does not provide a 2-D canvas context');
+  bindXlsxOfficeFontRoutes(measurementCtx, deps.ws, opts.officeFontRoutes, opts.googleSubstitutes === true);
+  pinXlsxGridGeometry(deps.ws, opts.authoritativeMdw);
   const ws = deps.ws.isDialogSheet
     ? deps.ws
     : worksheetWithAutoRowHeights(measurementCtx, deps.ws, styles, deps.cjkFallback);
@@ -857,6 +1002,9 @@ async function renderWorksheetViewportLeased(
       effectiveDpr,
       svgDecoder,
       imageResources: opts.imageResources,
+      threeD: deps.threeD,
+      regionMap: deps.regionMap,
+      chartEx: deps.chartEx,
     });
   }
 

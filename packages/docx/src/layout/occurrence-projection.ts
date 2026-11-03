@@ -107,11 +107,14 @@ function translateOccurrenceGeometry<T extends ParagraphLayout | TableLayout>(
       return prior.value;
     }
     const translatedBase = translateCompleteParagraphLayout(paragraph, delta);
-    const translated = Object.freeze({
+    // Left mutable: the projection snapshot freezes every node it allocated
+    // and skips only frozen aliases of the retained root, so a shallowly
+    // frozen new node here would leave its translated children unfrozen.
+    const translated: ParagraphLayout = {
       ...translatedBase,
       ...(paragraph.sectionFlowOwnership === undefined
         ? {} : { sectionFlowOwnership: paragraph.sectionFlowOwnership }),
-    });
+    };
     paragraphMemo.set(paragraph, { key, value: translated });
     return translated;
   };
@@ -353,7 +356,11 @@ export function projectBodyOccurrence<T extends ParagraphLayout | TableLayout>(
   }
 
   const projected = projectBlock(translated, options.destination.flowDomainId);
-  const snapshot = snapshotPlainData(projected, 'DOCX body occurrence projection') as T;
+  // Translation and re-keying create new objects wherever geometry, domains or
+  // occurrence IDs differ. An object still aliased from a verified frozen
+  // acquisition root is unchanged source data, so the snapshot may share it.
+  // Mutable fragments and externally supplied layouts take the cloning path.
+  const snapshot = snapshotPlainData(projected, 'DOCX body occurrence projection', retained) as T;
   if (snapshot.kind !== 'table' || retained.kind !== 'table') return snapshot;
   // Pagination fragments rebuild occurrence-local rows, while their acquisition-owned
   // track vector is one canonical geometry value shared by every split occurrence.
