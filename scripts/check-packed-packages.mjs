@@ -28,8 +28,13 @@ try {
     }
     tarballs.push(join(scratch, packed[0].filename));
   }
-  await writeFile(join(scratch, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
-  run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', ...tarballs]);
+  // Install the private fork under the public import name, as consumers do.
+  await writeFile(join(scratch, 'package.json'), JSON.stringify({
+    private: true,
+    type: 'module',
+    dependencies: { '@silurus/ooxml': `file:${tarballs[0]}` },
+  }));
+  run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', tarballs[1]]);
   // Fixture bundling is test setup only; the consumer itself resolves exclusively
   // from its installed packages. Extension aliases support the TS fixture imports.
   const fixtureEntry = join(scratch, 'fixtures.ts');
