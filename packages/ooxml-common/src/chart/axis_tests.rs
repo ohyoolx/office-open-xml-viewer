@@ -929,13 +929,11 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(
-                model
-                    .plot_groups
-                    .unwrap()
-                    .iter()
-                    .all(|g| g.value_axis == "unresolved")
-            );
+            assert!(model
+                .plot_groups
+                .unwrap()
+                .iter()
+                .all(|g| g.value_axis == "unresolved"));
         }
     }
 
