@@ -5,6 +5,11 @@ semantic versioning. While the major version is zero, minor releases may contain
 explicitly documented breaking changes; patch releases remain compatible with
 the corresponding minor release.
 
+## 0.89.7-jiyu.2 — 2026-11-23
+
+Render gradient fills on PowerPoint text runs in the browser preview, including
+runs split across fonts. Main-thread and worker rendering use the same fill.
+
 ## 0.89.7-jiyu.1 — 2026-11-03
 
 Integrate upstream v0.89.7 into the private distribution. Preserve the fork's
