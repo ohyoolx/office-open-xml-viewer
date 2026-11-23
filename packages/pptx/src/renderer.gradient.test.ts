@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { Stroke, TableElement } from './types.js';
-import { applyStroke, renderTable, resolveShapeFill } from './renderer.js';
+import type { Stroke, TableElement, TextBody } from './types.js';
+import { applyStroke, renderTable, renderTextBody, resolveShapeFill } from './renderer.js';
 
 function recordingContext() {
   const linear: number[][] = [];
@@ -57,6 +57,32 @@ describe('PPTX DrawingML gradient projection', () => {
 
     expect(linear).toHaveLength(1);
     expect(ctx.strokeStyle).toBe(gradient);
+  });
+
+  it('paints a gradient text run across font slots and keeps the adjacent solid run separate', () => {
+    const { ctx, gradient, linear } = recordingContext();
+    const paints: Array<[string, typeof ctx.fillStyle]> = [];
+    Object.assign(ctx, {
+      save() {}, restore() {}, translate() {}, beginPath() {}, rect() {}, clip() {},
+      measureText: (text: string) => ({ width: text.length * 10, actualBoundingBoxAscent: 8 }),
+      fillText: (text: string) => paints.push([text, ctx.fillStyle]),
+    });
+    const run = {
+      type: 'text', bold: false, italic: false, underline: false, strikethrough: false,
+      fontSize: 20, fontFamily: 'Arial', fontFamilyEa: 'SimSun',
+    } as const;
+    const body = {
+      paragraphs: [{ alignment: 'l', marL: 0, marR: 0, indent: 0, lvl: 0, bullet: { type: 'none' }, runs: [
+        { ...run, text: 'AB中', glyphFill: { fillType: 'gradient', gradType: 'linear', angle: 0,
+          stops: [{ position: 0, color: 'FF0000' }, { position: 1, color: '0000FF' }] } },
+        { ...run, text: 'C', color: '008000' },
+      ] }],
+      defaultFontSize: 20, lIns: 0, rIns: 0, tIns: 0, bIns: 0, verticalAnchor: 't',
+    } as TextBody;
+    renderTextBody(ctx, body, 0, 0, 200, 100, 1 / 12700, null);
+    expect(paints).toEqual([['AB', gradient], ['中', gradient], ['C', 'rgba(0,128,0,1)']]);
+    expect(linear).toHaveLength(1);
+    expect(linear[0][2] - linear[0][0]).toBeCloseTo(30);
   });
 
   it('uses the complete gradient paint for table cells', () => {

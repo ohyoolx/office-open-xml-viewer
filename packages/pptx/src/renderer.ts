@@ -1006,6 +1006,7 @@ type LayoutSegment = {
   drawSizePx?: number;
   color: string;
   patternFill?: Extract<Fill, { fillType: 'pattern' }>;
+  gradientFill?: Extract<Fill, { fillType: 'gradient' }>;
   noFill?: boolean;
   underline: boolean;
   /** OOXML rPr @u value when not the default "sng": "dbl"/"dotted"/"wavy"/etc. */
@@ -1868,6 +1869,8 @@ export function paragraphInputRuns(
       // PowerPoint's default hyperlink theme colour masks pattFill. Reapplying
       // the text fill writes hlinkClr="tx" and restores the authored pattern.
       patternFill: run.hyperlink && !run.hyperlinkUsesTextFill ? undefined : run.patternFill,
+      gradientFill: run.glyphFill?.fillType === 'gradient' && (!run.hyperlink || run.hyperlinkUsesTextFill)
+        ? run.glyphFill : undefined,
       noFill: run.noFill,
       underline: run.underline || run.hyperlink !== undefined,
       underlineStyle: run.underlineStyle,
@@ -1963,6 +1966,7 @@ export function paragraphInputRuns(
 
   const sameStyle = (a: LayoutSegment, b: LayoutSegment): boolean =>
     a.font === b.font && a.color === b.color && a.patternFill === b.patternFill
+    && a.gradientFill === b.gradientFill && (!a.gradientFill || a.sourceRunId === b.sourceRunId)
     && a.noFill === b.noFill && a.sizePx === b.sizePx
     && a.drawSizePx === b.drawSizePx && a.underline === b.underline
     && a.underlineStyle === b.underlineStyle
@@ -5979,6 +5983,11 @@ export function renderTextBody(
       // the two segments in VISUAL order, even when bidi reverses them.
       return after.leadingLetterSpacingPx ?? 0;
     };
+    // DrawingML rPr/gradFill belongs to a text run. Layout may split that run
+    // at font or justification boundaries. Share one paint across its visible
+    // pieces on the line so the gradient does not restart at each boundary.
+    let gradientEnd = 0;
+    let gradient: { paint: TextPaint; resolve: (target: CanvasRenderingContext2D) => TextPaint } | undefined;
     const segCount = segs.length;
     for (let vi = 0; vi < segCount; vi++) {
       const li = visual ? visual.order[vi] : vi;
@@ -6017,7 +6026,36 @@ export function renderTextBody(
       // baseline shift: OOXML baseline in thousandths of a point; positive = superscript (up)
       const baselineShift = seg.baseline ? -(seg.baseline / 100000) * seg.sizePx : 0;
       const segBaseline = referenceY + (seg.fontAlgnOffsetPx ?? 0) + baselineShift;
-      const glyphPaint = resolveSegmentTextPaint(ctx, seg, penX, segBaseline, scale);
+      if (gradient && vi >= gradientEnd) gradient = undefined;
+      const fill = seg.gradientFill;
+      if (fill && !gradient) {
+        let width = 0;
+        let ascent = 0;
+        let descent = 0;
+        for (gradientEnd = vi; gradientEnd < segCount; gradientEnd++) {
+          const index = visual ? visual.order[gradientEnd] : gradientEnd;
+          const piece = segs[index];
+          if (piece.sourceRunId !== seg.sourceRunId || piece.gradientFill !== seg.gradientFill
+              || piece.isTab || piece.math) break;
+          if (gradientEnd > vi) {
+            width += visualBoundarySpacing(visual ? visual.order[gradientEnd - 1] : gradientEnd - 1, index);
+          }
+          ctx.font = piece.font;
+          const metrics = ctx.measureText(piece.text);
+          ascent = Math.max(ascent, metrics.actualBoundingBoxAscent || 0);
+          descent = Math.max(descent, metrics.actualBoundingBoxDescent || 0);
+          width += measureTextAdvance(ctx, piece.text, piece.letterSpacingPx ?? 0)
+            + (piece.splitBefore?.length ?? 0) * (piece.perGap ?? 0) + (piece.jext ?? 0);
+        }
+        ctx.font = seg.font;
+        const left = penX;
+        const top = segBaseline - ascent;
+        const height = ascent + descent || drawSizePx;
+        const resolve = (target: CanvasRenderingContext2D) =>
+          resolveFillCore(fill, target, left, top, width, height, shapeRotation) ?? seg.color;
+        gradient = { paint: resolve(ctx), resolve };
+      }
+      const glyphPaint = gradient?.paint ?? resolveSegmentTextPaint(ctx, seg, penX, segBaseline, scale);
       ctx.fillStyle = glyphPaint;
       const ls = seg.letterSpacingPx ?? 0;
 
@@ -6202,7 +6240,8 @@ export function renderTextBody(
             ctx,
             (target) => {
               target.font = seg.font;
-              target.fillStyle = resolveSegmentTextPaint(target, seg, penX, segBaseline, scale);
+              target.fillStyle = gradient?.resolve(target)
+                ?? resolveSegmentTextPaint(target, seg, penX, segBaseline, scale);
               drawRun(target, 'fill');
             },
             bbox,
