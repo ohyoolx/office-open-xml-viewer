@@ -7288,6 +7288,53 @@ describe('bar chart authored layout and fills', () => {
     expect(points[0].y).toBeGreaterThan(points[1].y);
   });
 
+  it('aligns columns and a secondary line with a hidden duplicate category axis', () => {
+    const categories = ['A', 'B', 'C'];
+    const axis = { min: null, max: null, title: null, hidden: true,
+      lineHidden: false, majorTickMark: 'out' } as const;
+    const chart = baseModel({
+      categories,
+      series: [
+        series({ seriesType: 'bar', values: [40, 80, 100] }),
+        series({
+          seriesType: 'line', categories, values: [0.1, 0.3, 0.2],
+          useSecondaryAxis: true, markerSymbol: 'circle', showMarker: true,
+        }),
+      ],
+      secondaryCatAxis: axis,
+      secondaryValAxis: { ...axis, hidden: false, min: 0, max: 0.4, formatCode: '0%' },
+      plotGroups: [
+        plotGroup('bar', 0, 1, { categoryAxis: 'unresolved', axisIds: ['1', '2'],
+          barDirection: 'col', grouping: 'clustered' }),
+        plotGroup('line', 1, 1, { categoryAxis: 'unresolved', axisIds: ['3', '4'],
+          grouping: 'standard', valueAxis: 'secondary' }),
+      ],
+    });
+    const draw = (model: ChartModel) => {
+      const rec = recordingCtx();
+      renderChart(rec.ctx, model, RECT, 1);
+      return rec;
+    };
+    const reference = draw({ ...chart, secondaryCatAxis: null,
+      plotGroups: chart.plotGroups!.map(group => ({ ...group, categoryAxis: 'primary' })),
+    });
+    const actual = draw(chart);
+    expect(actual.texts.map(t => t.text)).toContain('40%');
+    expect(actual.texts).toEqual(reference.texts);
+    expect(actual.arcs).toHaveLength(3);
+    expect(actual.arcs).toEqual(reference.arcs);
+    expect(actual.rects).toEqual(reference.rects);
+
+    for (const distinct of [
+      { secondaryCatAxis: { ...axis, hidden: false } },
+      { secondaryCatAxis: { ...axis, orientation: 'maxMin' } },
+      { series: [chart.series[0], { ...chart.series[1], categories: ['C', 'B', 'A'] }] },
+      { plotGroups: [chart.plotGroups![0], { ...chart.plotGroups![1], axisIds: ['1', '4'] }] },
+    ]) {
+      expect(draw({ ...chart, ...distinct }).texts.map(t => t.text)).toContain('Unsupported chart');
+    }
+  });
+
   it('retains an Office-authored horizontal bar/scatter overlay with ambiguous bottom axes', () => {
     const rec = recordingCtx();
     const hiddenAxis = {

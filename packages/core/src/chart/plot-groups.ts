@@ -104,6 +104,28 @@ export function classicPlotDispatch(chart: ChartModel): ClassicPlotDispatch {
     }
     return 'unsupported';
   }
+  // Some column/line combos declare two bottom category axes, hiding the
+  // line's copy. Both series then use identical category centers while the
+  // line still needs its own (independently resolved) numeric scale.
+  const [columns, line] = groups;
+  const hiddenCat = chart.secondaryCatAxis;
+  if (groups.length === 2 && columns.kind === 'bar' && columns.barDirection === 'col'
+    && columns.grouping === 'clustered' && columns.valueAxis === 'primary'
+    && line.kind === 'line' && line.grouping === 'standard' && line.valueAxis === 'secondary'
+    && groups.every(group => group.categoryAxis === 'unresolved' && group.seriesAxis === 'none')
+    && columns.axisIds?.length === 2 && line.axisIds?.length === 2
+    && new Set([...columns.axisIds, ...line.axisIds]).size === 4
+    && hiddenCat?.hidden && !chart.catAxisHidden && !chart.catAxisIsDate
+    && (hiddenCat.orientation ?? 'minMax') === (chart.catAxisOrientation ?? 'minMax')
+    && hiddenCat.min == null && hiddenCat.max == null && hiddenCat.logBase == null
+    && chart.catAxisMin == null && chart.catAxisMax == null && chart.catAxisLogBase == null
+    && chart.categories.length > 0 && chart.series.every((series, index) =>
+      (series.useSecondaryAxis === true) === (index >= line.seriesStart)
+      && series.values.length === chart.categories.length
+      && (series.categories == null || (series.categories.length === chart.categories.length
+        && series.categories.every((label, i) => label === chart.categories[i]))))) {
+    return 'bar-combo';
+  }
   if (groups.some(group => group.categoryAxis === 'unresolved'
     || group.valueAxis === 'unresolved' || group.seriesAxis === 'unresolved')) {
     return 'unsupported';
