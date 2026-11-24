@@ -5,6 +5,11 @@ semantic versioning. While the major version is zero, minor releases may contain
 explicitly documented breaking changes; patch releases remain compatible with
 the corresponding minor release.
 
+## 0.89.7-jiyu.3 — 2026-11-24
+
+Render column and line combinations with a hidden duplicate category axis and
+independent primary and secondary value scales.
+
 ## 0.89.7-jiyu.2 — 2026-11-23
 
 Render gradient fills on PowerPoint text runs in the browser preview, including
